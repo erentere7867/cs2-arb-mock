@@ -68,7 +68,7 @@ pub struct StrategyStats {
     pub open_positions: u32,
     /// Cost basis (including entry fees) of positions still open at the end.
     pub open_cost_basis: Money,
-    /// Open positions marked at the best net-of-seller-fee quote, minus cost basis.
+    /// Open positions marked at the best fresh net-of-seller-fee quote, minus cost basis.
     pub unrealized_pnl: Money,
     /// `net_pnl + unrealized_pnl`.
     pub total_pnl: Money,

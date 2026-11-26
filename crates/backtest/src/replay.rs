@@ -36,6 +36,43 @@ impl QuoteKey {
     }
 }
 
+fn quotes_for_key<'a: 'b, 'b>(
+    latest: &'a HashMap<QuoteKey, PriceSnapshot>,
+    item: &'b ItemId,
+    float_bucket: Option<FloatBucket>,
+) -> impl Iterator<Item = &'a PriceSnapshot> + 'b {
+    PLATFORMS.into_iter().filter_map(move |platform| {
+        latest.get(&QuoteKey {
+            platform,
+            item: item.clone(),
+            float_bucket,
+        })
+    })
+}
+
+fn quote_is_fresh(quote: &PriceSnapshot, now: DateTime<Utc>, max_age: Duration) -> bool {
+    now - quote.observed_at <= max_age
+}
+
+fn best_fresh_exit<'a>(
+    quotes: impl IntoIterator<Item = &'a PriceSnapshot>,
+    now: DateTime<Utc>,
+    max_age: Duration,
+    mut seller_proceeds: impl FnMut(&PriceSnapshot) -> Result<Money>,
+) -> Result<Option<(Platform, &'a PriceSnapshot, Money)>> {
+    let mut best = None;
+    for quote in quotes {
+        if !quote_is_fresh(quote, now, max_age) {
+            continue;
+        }
+        let net = seller_proceeds(quote)?;
+        if best.as_ref().is_none_or(|(_, _, previous)| net > *previous) {
+            best = Some((quote.platform, quote, net));
+        }
+    }
+    Ok(best)
+}
+
 /// When an event became observable.
 pub fn event_time(event: &MarketEvent) -> DateTime<Utc> {
     match event {
@@ -121,10 +158,7 @@ impl<'a> MarketView<'a> {
         item: &ItemId,
         float_bucket: Option<FloatBucket>,
     ) -> Vec<&'a PriceSnapshot> {
-        PLATFORMS
-            .iter()
-            .filter_map(|p| self.latest_quote(*p, item, float_bucket))
-            .collect()
+        quotes_for_key(self.latest, item, float_bucket).collect()
     }
 
     pub fn panic_window_active(&self) -> bool {
@@ -149,17 +183,12 @@ impl<'a> MarketView<'a> {
         float_bucket: Option<FloatBucket>,
         quantity: u32,
     ) -> Result<Option<(Platform, &'a PriceSnapshot, Money)>> {
-        let mut best: Option<(Platform, &'a PriceSnapshot, Money)> = None;
-        for quote in self.quotes_for(item, float_bucket) {
-            if self.now - quote.observed_at > self.max_quote_age {
-                continue;
-            }
-            let net = self.seller_proceeds(quote, quantity)?;
-            if best.as_ref().is_none_or(|(_, _, b)| net > *b) {
-                best = Some((quote.platform, quote, net));
-            }
-        }
-        Ok(best)
+        best_fresh_exit(
+            quotes_for_key(self.latest, item, float_bucket),
+            self.now,
+            self.max_quote_age,
+            |quote| self.seller_proceeds(quote, quantity),
+        )
     }
 
     pub(crate) fn seller_proceeds(&self, quote: &PriceSnapshot, quantity: u32) -> Result<Money> {
@@ -334,7 +363,7 @@ impl<F: FillModel> Backtester<F> {
                 }
             }
             for book in &mut books {
-                let equity = self.equity(book, &latest)?;
+                let equity = self.equity(book, &latest, now)?;
                 book.equity.push(equity);
             }
             steps += 1;
@@ -369,7 +398,7 @@ impl<F: FillModel> Backtester<F> {
         let Some(quote) = latest.get(&key) else {
             return Ok(Err("no quote for platform, item and float bucket".into()));
         };
-        if now - quote.observed_at > self.config.max_quote_age {
+        if !quote_is_fresh(quote, now, self.config.max_quote_age) {
             return Ok(Err("quote is stale".into()));
         }
         if order.side == OrderSide::Sell {
@@ -500,42 +529,54 @@ impl<F: FillModel> Backtester<F> {
         Ok(())
     }
 
-    /// Mark value (best net-of-fee exit) of a lot; cost basis when no quote exists.
-    fn mark(&self, lot: &Lot, latest: &HashMap<QuoteKey, PriceSnapshot>) -> Result<Money> {
-        let mut best: Option<Money> = None;
-        for platform in PLATFORMS {
-            let key = QuoteKey {
-                platform,
-                item: lot.position.item.clone(),
-                float_bucket: lot.position.float_bucket,
-            };
-            if let Some(quote) = latest.get(&key) {
-                let net = self.fill_model.seller_proceeds(
+    /// Mark value (best fresh net-of-fee exit), or cost basis without a fresh quote.
+    fn mark(
+        &self,
+        lot: &Lot,
+        latest: &HashMap<QuoteKey, PriceSnapshot>,
+        now: DateTime<Utc>,
+    ) -> Result<Money> {
+        let pos = &lot.position;
+        let best = best_fresh_exit(
+            quotes_for_key(latest, &pos.item, pos.float_bucket),
+            now,
+            self.config.max_quote_age,
+            |quote| {
+                self.fill_model.seller_proceeds(
                     quote.price,
-                    lot.position.quantity,
-                    self.config.fees.get(platform),
-                )?;
-                best = Some(best.map_or(net, |b| b.max(net)));
-            }
-        }
-        Ok(best.unwrap_or(lot.position.cost_basis))
+                    pos.quantity,
+                    self.config.fees.get(quote.platform),
+                )
+            },
+        )?;
+        Ok(best.map_or(pos.cost_basis, |(_, _, net)| net))
     }
 
-    fn unrealized(&self, book: &Book, latest: &HashMap<QuoteKey, PriceSnapshot>) -> Result<Money> {
+    fn unrealized(
+        &self,
+        book: &Book,
+        latest: &HashMap<QuoteKey, PriceSnapshot>,
+        now: DateTime<Utc>,
+    ) -> Result<Money> {
         book.lots.iter().try_fold(Money(0), |acc, lot| {
             acc.checked_add(
-                self.mark(lot, latest)?
+                self.mark(lot, latest, now)?
                     .checked_sub(lot.position.cost_basis)?,
             )
         })
     }
 
-    fn equity(&self, book: &Book, latest: &HashMap<QuoteKey, PriceSnapshot>) -> Result<Money> {
+    fn equity(
+        &self,
+        book: &Book,
+        latest: &HashMap<QuoteKey, PriceSnapshot>,
+        now: DateTime<Utc>,
+    ) -> Result<Money> {
         let realized = book
             .trades
             .iter()
             .try_fold(Money(0), |acc, t| acc.checked_add(t.net_pnl))?;
-        realized.checked_add(self.unrealized(book, latest)?)
+        realized.checked_add(self.unrealized(book, latest, now)?)
     }
 
     fn build_report(
@@ -554,7 +595,10 @@ impl<F: FillModel> Backtester<F> {
         let (mut submitted, mut filled, mut rejected) = (0u32, 0u32, 0u32);
 
         for (strategy, book) in strategies.iter().zip(books) {
-            let unrealized = self.unrealized(book, latest)?;
+            let unrealized = match window.end {
+                Some(now) => self.unrealized(book, latest, now)?,
+                None => Money(0),
+            };
             let open_basis = book
                 .lots
                 .iter()
@@ -1000,7 +1044,7 @@ mod tests {
             entry_fee: Money(0),
         };
         let replay = Backtester::with_fill_model(BacktestConfig::new(fees.clone()), model);
-        assert_eq!(replay.mark(&lot, &latest).unwrap(), Money(2000));
+        assert_eq!(replay.mark(&lot, &latest, t(0)).unwrap(), Money(2000));
     }
 
     #[test]
@@ -1152,6 +1196,24 @@ mod tests {
             .unwrap();
         assert_eq!(report.window.steps, 3);
         assert_eq!(report.strategies[0].orders_submitted, 0);
+    }
+
+    #[test]
+    fn expired_high_quote_does_not_mask_drawdown_or_inflate_final_mark() {
+        let snapshots = [
+            snap(Platform::CsFloat, 0, 1000),
+            snap(Platform::Skinport, 0, 2000),
+            snap(Platform::CsFloat, 2, 600),
+        ];
+        let (report, log) = run_scripted(
+            &snapshots,
+            &[],
+            vec![(0, order(OrderSide::Buy, Platform::CsFloat, 1, 1000, 0))],
+        );
+        assert_eq!(log.fills.len(), 1);
+        assert_eq!(report.totals.unrealized_pnl, Money(-422)); // 588 net exit − 1010 entry
+        assert_eq!(report.totals.final_equity, Money(-422));
+        assert_eq!(report.totals.max_drawdown, Money(1252)); // 1840 initial mark − 588
     }
 
     #[test]

@@ -104,6 +104,8 @@ async fn signs_after_quota_admission() {
             self.0.advance(chrono::Duration::minutes(3));
             Ok(())
         }
+
+        fn on_response(&self, _: &Endpoint, _: u16, _: Option<std::time::Duration>) {}
     }
 
     let server = MockServer::start().await;

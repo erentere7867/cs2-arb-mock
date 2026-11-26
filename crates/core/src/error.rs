@@ -10,6 +10,8 @@ pub enum Error {
     RateLimited { retry_after: std::time::Duration },
     #[error("network request failed: {0}")]
     Network(String),
+    #[error("{endpoint} returned HTTP {status}")]
+    HttpStatus { endpoint: &'static str, status: u16 },
     #[error("storage operation failed: {0}")]
     Storage(String),
     #[error("{0} is not implemented yet")]

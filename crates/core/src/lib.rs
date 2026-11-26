@@ -1,11 +1,13 @@
 //! Shared contracts for a mock-only market simulator. No marketplace API can place orders.
 
+mod clock;
 mod error;
 mod event;
 mod execution;
 mod fees;
 mod market;
 
+pub use clock::{Clock, ManualClock, SystemClock};
 pub use error::{Error, Result};
 pub use event::{MarketEvent, CS2_APP_ID};
 pub use execution::{Fill, Order, OrderSide, Position, SimulationMode};

@@ -40,3 +40,24 @@ window_seconds = 1
 [retry]
 base_seconds = 1
 cap_seconds = 300
+
+[events]
+poll_interval_secs = 120
+window_duration_secs = 345600
+trigger_branches = ["staging", "prerelease"]
+
+[spread]
+annual_opportunity_rate_pct = 10.0
+hold_days = 7
+min_net_profit = 50
+
+[dip]
+lookback_days = 30
+k_sigma = 2.0
+require_verified_sales = true
+
+[risk]
+max_position_notional = 10000
+max_item_exposure = 25000
+max_total_exposure = 100000
+daily_drawdown_cap = 10000

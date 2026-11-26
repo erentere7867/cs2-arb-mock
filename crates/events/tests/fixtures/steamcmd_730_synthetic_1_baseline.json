@@ -1,0 +1,29 @@
+{
+  "status": "success",
+  "data": {
+    "730": {
+      "_change_number": 41480785,
+      "appid": "730",
+      "depots": {
+        "privatebranches": "1",
+        "branches": {
+          "public": {
+            "buildid": "26879581",
+            "timebuildupdated": "1795474308",
+            "timeupdated": "1795474817"
+          },
+          "staging": {
+            "buildid": "26900000",
+            "description": "synthetic",
+            "pwdrequired": "1",
+            "timebuildupdated": "1795500000",
+            "timeupdated": "1795500000"
+          },
+          "1.42.0.1": {
+            "buildid": "26879581"
+          }
+        }
+      }
+    }
+  }
+}

@@ -4,3 +4,5 @@
 *.db-wal
 .env
 .env.*
+/target-*/
+/reports/

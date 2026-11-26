@@ -196,7 +196,7 @@ pub fn parse_listings(
 pub fn parse_sales(body: &[u8], item: &ItemId, since: DateTime<Utc>) -> Result<Vec<Sale>> {
     let raw: Vec<RawSale> = parse_json("csfloat sales history", body)?;
     let mut out = Vec::new();
-    for (index, row) in raw.into_iter().enumerate() {
+    for row in raw {
         if row.item.market_hash_name != item.market_hash_name
             || row.sold_at < since
             || !float_matches_tier(item, row.item.float_value)
@@ -205,7 +205,10 @@ pub fn parse_sales(body: &[u8], item: &ItemId, since: DateTime<Utc>) -> Result<V
         }
         let id = match &row.id {
             Some(id) => format!("csfloat:{}", id_string(id)),
-            None => format!("csfloat:sale:{}:{index}", row.sold_at.timestamp()),
+            None => format!(
+                "csfloat:sale:{}:{}:{:?}",
+                row.sold_at, row.price, row.item.float_value
+            ),
         };
         out.push(Sale {
             id,

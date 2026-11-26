@@ -11,6 +11,29 @@ use serde_json::json;
 use wiremock::matchers::{method, path, query_param};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
+#[test]
+fn last_sale_identity_survives_a_newer_row() {
+    use cs2_arb_markets::dmarket::parse_last_sales;
+
+    let older = json!({"price": "1.00", "date": "1748779198"});
+    let newer = json!({"price": "2.00", "date": "1748779199"});
+    let since = t0() - chrono::Duration::days(1);
+    let before = parse_last_sales(
+        json!({"sales": [older.clone()]}).to_string().as_bytes(),
+        &redline(),
+        since,
+    )
+    .unwrap();
+    let after = parse_last_sales(
+        json!({"sales": [newer, older]}).to_string().as_bytes(),
+        &redline(),
+        since,
+    )
+    .unwrap();
+    assert_eq!(before[0].id, after[0].id);
+    assert_ne!(after[0].id, after[1].id);
+}
+
 const FIXTURE_SEED: [u8; 32] = [42; 32];
 
 fn hex_encode(bytes: &[u8]) -> String {

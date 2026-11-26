@@ -364,7 +364,7 @@ fn convert_last_sales(
     since: DateTime<Utc>,
 ) -> Result<Vec<Sale>> {
     let mut out = Vec::new();
-    for (index, sale) in rows.into_iter().enumerate() {
+    for sale in rows {
         let sold_at = sale_timestamp(&sale)?;
         let ts = sold_at.timestamp();
         if sold_at < since {
@@ -385,9 +385,10 @@ fn convert_last_sales(
         }
         out.push(Sale {
             id: format!(
-                "dmarket:{}:{ts}:{}:{index}",
+                "dmarket:{}:{ts}:{}:{}",
                 sale.tx_operation_type.as_deref().unwrap_or("sale"),
-                price.0
+                price.0,
+                serde_json::Value::from(sale.offer_attributes.unwrap_or_default())
             ),
             platform: Platform::DMarket,
             item: item.clone(),

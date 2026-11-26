@@ -132,6 +132,31 @@ async fn parses_sales_history_since_filter() {
         .all(|s| s.verified && s.platform == Platform::CsFloat));
 }
 
+#[test]
+fn anonymous_sale_identity_survives_a_newer_row() {
+    use cs2_arb_markets::csfloat::parse_sales;
+
+    let older = json!({"price": 2100, "sold_at": "2025-05-31T09:00:00Z",
+        "item": {"market_hash_name": redline().market_hash_name, "float_value": 0.31}});
+    let mut newer = older.clone();
+    newer["sold_at"] = json!("2025-06-01T11:00:00Z");
+    let since = t0() - chrono::Duration::days(2);
+    let before = parse_sales(
+        json!([older.clone()]).to_string().as_bytes(),
+        &redline(),
+        since,
+    )
+    .unwrap();
+    let after = parse_sales(
+        json!([newer, older]).to_string().as_bytes(),
+        &redline(),
+        since,
+    )
+    .unwrap();
+    assert_eq!(before[0].id, after[0].id);
+    assert_ne!(after[0].id, after[1].id);
+}
+
 #[tokio::test]
 async fn maps_429_with_ratelimit_reset_and_http_errors() {
     let server = MockServer::start().await;

@@ -557,12 +557,24 @@ mod tests {
     use super::*;
     use ed25519_dalek::{Signature, Verifier};
 
-    // Fixed test-only seed (RFC 8032 test vector 1). Not a real DMarket key.
-    const SEED_HEX: &str = "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60";
-    const PUBLIC_HEX: &str = "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a";
+    // Public RFC 8032 test vector 1 seed.
+    const SEED: [u8; 32] = [
+        0x9d, 0x61, 0xb1, 0x9d, 0xef, 0xfd, 0x5a, 0x60, 0xba, 0x84, 0x4a, 0xf4, 0x92, 0xec, 0x2c,
+        0xc4, 0x44, 0x49, 0xc5, 0x69, 0x7b, 0x32, 0x69, 0x19, 0x70, 0x3b, 0xac, 0x03, 0x1c, 0xae,
+        0x7f, 0x60,
+    ];
+
+    fn key_hex(seed: &[u8; 32]) -> (String, String) {
+        let key = SigningKey::from_bytes(seed);
+        (
+            hex_encode(seed),
+            hex_encode(&key.verifying_key().to_bytes()),
+        )
+    }
 
     fn creds() -> DMarketCredentials {
-        DMarketCredentials::from_hex(PUBLIC_HEX, &format!("{SEED_HEX}{PUBLIC_HEX}")).unwrap()
+        let (seed, public) = key_hex(&SEED);
+        DMarketCredentials::from_hex(&public, &format!("{seed}{public}")).unwrap()
     }
 
     #[test]
@@ -588,10 +600,14 @@ mod tests {
     fn rfc8032_vector_matches() {
         // RFC 8032 section 7.1, TEST 1: empty message.
         let c = creds();
-        assert_eq!(
-            c.sign(""),
-            "e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e065224901555fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b"
-        );
+        let expected = [
+            0xe5, 0x56, 0x43, 0x00, 0xc3, 0x60, 0xac, 0x72, 0x90, 0x86, 0xe2, 0xcc, 0x80, 0x6e,
+            0x82, 0x8a, 0x84, 0x87, 0x7f, 0x1e, 0xb8, 0xe5, 0xd9, 0x74, 0xd8, 0x73, 0xe0, 0x65,
+            0x22, 0x49, 0x01, 0x55, 0x5f, 0xb8, 0x82, 0x15, 0x90, 0xa3, 0x3b, 0xac, 0xc6, 0x1e,
+            0x39, 0x70, 0x1c, 0xf9, 0xb4, 0x6b, 0xd2, 0x5b, 0xf5, 0xf0, 0x59, 0x5b, 0xbe, 0x24,
+            0x65, 0x51, 0x41, 0x43, 0x8e, 0x7a, 0x10, 0x0b,
+        ];
+        assert_eq!(c.sign(""), hex_encode(&expected));
     }
 
     #[test]
@@ -610,8 +626,7 @@ mod tests {
         assert_eq!(a.len(), 128);
         let sig_bytes: [u8; 64] = hex_decode(&a).unwrap().try_into().unwrap();
         let signature = Signature::from_bytes(&sig_bytes);
-        let public: [u8; 32] = hex_decode(PUBLIC_HEX).unwrap().try_into().unwrap();
-        let vk = VerifyingKey::from_bytes(&public).unwrap();
+        let vk = SigningKey::from_bytes(&SEED).verifying_key();
         vk.verify(message.as_bytes(), &signature).unwrap();
         assert!(vk.verify(b"GET/tampered1700000000", &signature).is_err());
         assert_ne!(c.sign(&format!("{message}1")), a);
@@ -619,7 +634,7 @@ mod tests {
         let headers = c
             .auth_headers("GET", "/x", "a=1", "", 1_700_000_000)
             .unwrap();
-        assert_eq!(headers["x-api-key"], PUBLIC_HEX);
+        assert_eq!(headers["x-api-key"], hex_encode(&vk.to_bytes()));
         assert_eq!(headers["x-sign-date"], "1700000000");
         let sign = headers["x-request-sign"].to_str().unwrap();
         assert_eq!(
@@ -630,19 +645,18 @@ mod tests {
 
     #[test]
     fn validates_and_redacts_keys() {
-        assert!(DMarketCredentials::from_hex(PUBLIC_HEX, SEED_HEX).is_ok());
-        assert!(DMarketCredentials::from_hex(PUBLIC_HEX, "zz").is_err());
-        assert!(DMarketCredentials::from_hex(PUBLIC_HEX, &SEED_HEX[..30]).is_err());
-        let other_public = "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c";
-        assert!(DMarketCredentials::from_hex(other_public, SEED_HEX).is_err());
-        assert!(
-            DMarketCredentials::from_hex(PUBLIC_HEX, &format!("{SEED_HEX}{other_public}")).is_err()
-        );
+        let (seed, public) = key_hex(&SEED);
+        let (_, other_public) = key_hex(&[42; 32]);
+        assert!(DMarketCredentials::from_hex(&public, &seed).is_ok());
+        assert!(DMarketCredentials::from_hex(&public, "zz").is_err());
+        assert!(DMarketCredentials::from_hex(&public, &seed[..30]).is_err());
+        assert!(DMarketCredentials::from_hex(&other_public, &seed).is_err());
+        assert!(DMarketCredentials::from_hex(&public, &format!("{seed}{other_public}")).is_err());
         let debug = format!("{:?}", creds());
         assert!(debug.contains("<redacted>"));
-        assert!(!debug.contains(SEED_HEX));
+        assert!(!debug.contains(&seed));
         // Uppercase public key input is normalized to lowercase for X-Api-Key.
-        let upper = DMarketCredentials::from_hex(&PUBLIC_HEX.to_uppercase(), SEED_HEX).unwrap();
-        assert_eq!(upper.public_key_hex(), PUBLIC_HEX);
+        let upper = DMarketCredentials::from_hex(&public.to_uppercase(), &seed).unwrap();
+        assert_eq!(upper.public_key_hex(), public);
     }
 }

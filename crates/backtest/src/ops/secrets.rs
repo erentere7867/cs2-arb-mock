@@ -196,11 +196,11 @@ mod tests {
     use super::*;
 
     const VALUES: [(&str, &str); 5] = [
-        (vars::SKINPORT_CLIENT_ID, "sp-id-SENTINEL-1111"),
-        (vars::SKINPORT_CLIENT_SECRET, "sp-secret-SENTINEL-2222"),
-        (vars::CSFLOAT_API_KEY, "csf-key-SENTINEL-3333"),
-        (vars::DMARKET_PUBLIC_KEY, "dm-pub-SENTINEL-4444"),
-        (vars::DMARKET_SECRET_KEY, "dm-sec-SENTINEL-5555"),
+        (vars::SKINPORT_CLIENT_ID, "test-skinport-id"),
+        (vars::SKINPORT_CLIENT_SECRET, "test-skinport-secret"),
+        (vars::CSFLOAT_API_KEY, "test-csfloat-key"),
+        (vars::DMARKET_PUBLIC_KEY, "test-dmarket-public"),
+        (vars::DMARKET_SECRET_KEY, "test-dmarket-secret"),
     ];
 
     fn fake_env() -> HashMap<String, String> {
@@ -223,22 +223,22 @@ mod tests {
         let secrets = Secrets::from_lookup(|k| env.get(k).cloned());
         assert_eq!(secrets.present_vars(), vars::ALL.to_vec());
         let (id, secret) = secrets.require_skinport().unwrap();
-        assert_eq!(id.expose_secret(), "sp-id-SENTINEL-1111");
-        assert_eq!(secret.expose_secret(), "sp-secret-SENTINEL-2222");
+        assert_eq!(id.expose_secret(), "test-skinport-id");
+        assert_eq!(secret.expose_secret(), "test-skinport-secret");
         assert_eq!(
             secrets.require_csfloat().unwrap().expose_secret(),
-            "csf-key-SENTINEL-3333"
+            "test-csfloat-key"
         );
         let (public, private) = secrets.require_dmarket().unwrap();
-        assert_eq!(public.expose_secret(), "dm-pub-SENTINEL-4444");
-        assert_eq!(private.expose_secret(), "dm-sec-SENTINEL-5555");
+        assert_eq!(public.expose_secret(), "test-dmarket-public");
+        assert_eq!(private.expose_secret(), "test-dmarket-secret");
     }
 
     #[test]
     fn missing_and_empty_values_are_absent_and_errors_do_not_leak() {
         let secrets = Secrets::from_lookup(|k| match k {
             vars::CSFLOAT_API_KEY => Some("   ".into()),
-            vars::DMARKET_PUBLIC_KEY => Some("dm-pub-SENTINEL-4444".into()),
+            vars::DMARKET_PUBLIC_KEY => Some("test-dmarket-public".into()),
             _ => None,
         });
         assert_eq!(secrets.present_vars(), vec![vars::DMARKET_PUBLIC_KEY]);

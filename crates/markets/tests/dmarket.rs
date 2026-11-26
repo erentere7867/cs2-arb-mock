@@ -6,17 +6,22 @@ use common::*;
 use cs2_arb_core::{MarketClient, Money, Platform};
 use cs2_arb_markets::dmarket::{string_to_sign, DMarketClient, DMarketConfig, DMarketCredentials};
 use cs2_arb_markets::NoopGate;
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, SigningKey, Verifier};
 use serde_json::json;
 use wiremock::matchers::{method, path, query_param};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
-const SEED_HEX: &str = "4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb";
-const PUBLIC_HEX: &str = "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c";
+const FIXTURE_SEED: [u8; 32] = [42; 32];
+
+fn hex_encode(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
 
 fn client(server: &MockServer) -> DMarketClient {
-    let creds =
-        DMarketCredentials::from_hex(PUBLIC_HEX, &format!("{SEED_HEX}{PUBLIC_HEX}")).unwrap();
+    let signing_key = SigningKey::from_bytes(&FIXTURE_SEED);
+    let public = hex_encode(&signing_key.verifying_key().to_bytes());
+    let private = hex_encode(&FIXTURE_SEED);
+    let creds = DMarketCredentials::from_hex(&public, &format!("{private}{public}")).unwrap();
     let cfg = DMarketConfig {
         base_url: server.uri(),
         request_timeout: None,
@@ -35,7 +40,8 @@ fn hex(s: &str) -> Vec<u8> {
 /// Verifies the request the way DMarket does: decoded path + raw query + body + date.
 fn assert_signed(req: &Request) {
     let key = req.headers.get("x-api-key").unwrap().to_str().unwrap();
-    assert_eq!(key, PUBLIC_HEX);
+    let vk = SigningKey::from_bytes(&FIXTURE_SEED).verifying_key();
+    assert_eq!(key, hex_encode(&vk.to_bytes()));
     let date = req.headers.get("x-sign-date").unwrap().to_str().unwrap();
     assert_eq!(date, t0().timestamp().to_string());
     let sign = req.headers.get("x-request-sign").unwrap().to_str().unwrap();
@@ -47,7 +53,6 @@ fn assert_signed(req: &Request) {
         std::str::from_utf8(&req.body).unwrap(),
         date.parse().unwrap(),
     );
-    let vk = VerifyingKey::from_bytes(&hex(PUBLIC_HEX).try_into().unwrap()).unwrap();
     let sig = Signature::from_bytes(&hex(sig_hex).try_into().unwrap());
     vk.verify(message.as_bytes(), &sig)
         .expect("signature verifies");

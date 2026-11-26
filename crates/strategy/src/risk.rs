@@ -207,8 +207,16 @@ impl RiskManager {
                 limit: self.limits.max_position_notional,
             });
         }
+        self.check_entry_exposure(order, notional)
+    }
+
+    pub(crate) fn check_entry_exposure(
+        &self,
+        order: &Order,
+        buy_cost: Money,
+    ) -> std::result::Result<(), RiskRejection> {
         let holding = self.holdings.get(&order.item).copied().unwrap_or_default();
-        let item_projected = Money(holding.cost_basis.saturating_add(notional.0));
+        let item_projected = Money(holding.cost_basis.saturating_add(buy_cost.0));
         if item_projected > self.limits.max_item_exposure {
             return Err(RiskRejection::ItemExposureLimit {
                 projected: item_projected,
@@ -221,7 +229,7 @@ impl RiskManager {
                 return Err(RiskRejection::ItemQuantityLimit { projected, limit });
             }
         }
-        let total_projected = Money(self.total_exposure.saturating_add(notional.0));
+        let total_projected = Money(self.total_exposure.saturating_add(buy_cost.0));
         if total_projected > self.limits.max_total_exposure {
             return Err(RiskRejection::TotalExposureLimit {
                 projected: total_projected,

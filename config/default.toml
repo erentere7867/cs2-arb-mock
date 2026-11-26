@@ -1,0 +1,42 @@
+# Illustrative mock fees, NOT verified marketplace schedules.
+# Percentage points (5.0 = 5%); fixed fees are USD cents.
+[fees.skinport]
+buyer_fee_pct = 0.0
+seller_fee_pct = 8.0
+buyer_fixed_fee = 0
+seller_fixed_fee = 0
+
+[fees.csfloat]
+buyer_fee_pct = 0.0
+seller_fee_pct = 2.0
+buyer_fixed_fee = 0
+seller_fixed_fee = 0
+
+[fees.dmarket]
+buyer_fee_pct = 0.0
+seller_fee_pct = 7.0
+buyer_fixed_fee = 0
+seller_fixed_fee = 0
+
+[rate_limits.skinport.items]
+path = "/v1/items"
+max_requests = 8
+window_seconds = 300
+
+[rate_limits.skinport.sales_history]
+path = "/v1/sales/history"
+max_requests = 8
+window_seconds = 300
+
+# Conservative mock defaults, not verified server policies.
+[rate_limits.csfloat.default]
+max_requests = 1
+window_seconds = 1
+
+[rate_limits.dmarket.default]
+max_requests = 1
+window_seconds = 1
+
+[retry]
+base_seconds = 1
+cap_seconds = 300

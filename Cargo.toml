@@ -1,0 +1,42 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/core",
+    "crates/net",
+    "crates/markets",
+    "crates/events",
+    "crates/sim",
+    "crates/strategy",
+    "crates/backtest",
+    "bins/cs2-arb",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace.dependencies]
+async-trait = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
+ed25519-dalek = "2"
+governor = "0.10"
+rand = "0.9"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sqlx = { version = "0.8", default-features = false, features = ["sqlite", "runtime-tokio", "chrono", "macros", "migrate"] }
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+cs2-arb-core = { path = "crates/core" }
+cs2-arb-net = { path = "crates/net" }
+cs2-arb-markets = { path = "crates/markets" }
+cs2-arb-events = { path = "crates/events" }
+cs2-arb-sim = { path = "crates/sim" }
+cs2-arb-strategy = { path = "crates/strategy" }
+cs2-arb-backtest = { path = "crates/backtest" }

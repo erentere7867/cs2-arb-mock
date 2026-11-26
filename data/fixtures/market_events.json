@@ -1,0 +1,5 @@
+[
+  {"kind": "branch_updated", "app_id": 730, "branch": "staging", "change_number": 100001, "observed_at": "2025-02-06T11:00:00Z"},
+  {"kind": "panic_window_opened", "branch": "staging", "opened_at": "2025-02-06T11:00:00Z"},
+  {"kind": "panic_window_closed", "branch": "staging", "closed_at": "2025-02-10T11:00:00Z"}
+]

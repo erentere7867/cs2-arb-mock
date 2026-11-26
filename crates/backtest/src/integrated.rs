@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use chrono::{DateTime, Duration, Utc};
@@ -14,15 +14,17 @@ use cs2_arb_strategy::{
     SubmitError,
 };
 
-use crate::{FillModel, FillOutcome, MarketView, StrategyAdapter, DEFAULT_TRADE_HOLD};
+use crate::{FillModel, FillOutcome, MarketView, QuoteKey, StrategyAdapter, DEFAULT_TRADE_HOLD};
 
 type PositionKey = (ItemId, Option<FloatBucket>);
-type Books = HashMap<(Platform, ItemId), Vec<Listing>>;
+type BookKey = (Platform, ItemId);
+type Books = HashMap<BookKey, Vec<Listing>>;
 
 /// Observations and individual sales used for simulated liquidity and fills.
 #[derive(Default)]
 pub struct MarketDepth {
     frames: BTreeMap<DateTime<Utc>, Books>,
+    replaced_books: BTreeMap<DateTime<Utc>, HashSet<BookKey>>,
     sales: Vec<Sale>,
 }
 
@@ -34,6 +36,10 @@ impl MarketDepth {
         item: ItemId,
         listings: Vec<Listing>,
     ) {
+        self.replaced_books
+            .entry(at)
+            .or_default()
+            .insert((platform, item.clone()));
         self.frames
             .entry(at)
             .or_default()
@@ -143,6 +149,16 @@ impl<'a> SimFillModel<'a> {
 }
 
 impl FillModel for SimFillModel<'_> {
+    fn add_quote_update_times(&self, times: &mut BTreeSet<DateTime<Utc>>) {
+        times.extend(self.depth.replaced_books.keys().copied());
+    }
+
+    fn invalidate_quotes(&self, at: DateTime<Utc>, quotes: &mut HashMap<QuoteKey, PriceSnapshot>) {
+        if let Some(books) = self.depth.replaced_books.get(&at) {
+            quotes.retain(|key, _| !books.contains(&(key.platform, key.item.clone())));
+        }
+    }
+
     fn seller_proceeds(
         &self,
         unit_price: Money,
@@ -297,7 +313,8 @@ impl StrategyAdapter for SpreadAdapter {
                 }
             }
         }
-        for candidate in evaluate_spread(view.history, view.fees, &self.config, view.now)? {
+        let quotes: Vec<_> = view.latest_quotes().cloned().collect();
+        for candidate in evaluate_spread(&quotes, view.fees, &self.config, view.now)? {
             let key = (candidate.item.clone(), candidate.float_bucket);
             if occupied.insert(key) {
                 let order = candidate.buy_order(view.now);

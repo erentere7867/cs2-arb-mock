@@ -1,7 +1,7 @@
 //! Deterministic historical replay of price snapshots and market events through
 //! one or more strategies and a simulated fill model.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use chrono::{DateTime, Duration, Utc};
 use cs2_arb_core::{
@@ -98,6 +98,10 @@ pub struct MarketView<'a> {
 }
 
 impl<'a> MarketView<'a> {
+    pub fn latest_quotes(&self) -> impl Iterator<Item = &'a PriceSnapshot> + '_ {
+        self.latest.values()
+    }
+
     pub fn latest_quote(
         &self,
         platform: Platform,
@@ -261,14 +265,21 @@ impl<F: FillModel> Backtester<F> {
         let mut delivered = 0usize;
         let mut start = 0usize;
         self.fill_model.prepare_run();
+        let mut times: BTreeSet<_> = snapshots
+            .iter()
+            .map(|snapshot| snapshot.observed_at)
+            .collect();
+        self.fill_model.add_quote_update_times(&mut times);
+        let first = times.first().copied();
+        let last = times.last().copied();
 
-        while start < snapshots.len() {
-            let now = snapshots[start].observed_at;
+        for now in times {
             let end = start
                 + snapshots[start..]
                     .iter()
                     .take_while(|s| s.observed_at == now)
                     .count();
+            self.fill_model.invalidate_quotes(now, &mut latest);
             for snapshot in &snapshots[start..end] {
                 latest.insert(QuoteKey::of(snapshot), snapshot.clone());
             }
@@ -331,8 +342,8 @@ impl<F: FillModel> Backtester<F> {
         }
 
         let window = ReplayWindow {
-            start: snapshots.first().map(|s| s.observed_at),
-            end: snapshots.last().map(|s| s.observed_at),
+            start: first,
+            end: last,
             steps,
             snapshots: snapshots.len() as u32,
             events_delivered: delivered as u32,
@@ -1042,6 +1053,37 @@ mod tests {
             log.borrow().rejects
         );
         assert_eq!(log.borrow().fills.len(), 3);
+    }
+
+    #[test]
+    fn empty_live_book_removes_old_ask_before_next_spread_evaluation() {
+        use crate::integrated::{MarketDepth, SimFillModel, SpreadAdapter};
+        use cs2_arb_strategy::{KillSwitch, RiskLimits, SpreadConfig};
+
+        let cheap = snap(Platform::CsFloat, 0, 1000);
+        let mut expensive = snap(Platform::DMarket, 0, 3000);
+        expensive.observed_at += Duration::minutes(2);
+        let mut depth = MarketDepth::default();
+        depth.replace_listings(
+            t(0) + Duration::minutes(1),
+            cheap.platform,
+            cheap.item.clone(),
+            vec![],
+        );
+        let fees = fees();
+        let model = SimFillModel::new(
+            &depth,
+            fees.clone(),
+            RiskLimits::default(),
+            KillSwitch::new(),
+        );
+        let mut strategies: Vec<Box<dyn StrategyAdapter>> =
+            vec![Box::new(SpreadAdapter::new(SpreadConfig::default()))];
+        let report = Backtester::with_fill_model(BacktestConfig::new(fees), model)
+            .run(SimulationMode, &[cheap, expensive], &[], &mut strategies)
+            .unwrap();
+        assert_eq!(report.window.steps, 3);
+        assert_eq!(report.strategies[0].orders_submitted, 0);
     }
 
     #[test]

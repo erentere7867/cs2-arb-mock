@@ -2,10 +2,12 @@
 //! and imposes the post-purchase trade hold. Purely in-process; nothing here can
 //! reach a marketplace.
 
+use std::collections::{BTreeSet, HashMap};
+
 use chrono::{DateTime, Duration, Utc};
 use cs2_arb_core::{FeeSchedule, Fill, Money, Order, OrderSide, PriceSnapshot, Result};
 
-use crate::replay::MarketView;
+use crate::replay::{MarketView, QuoteKey};
 
 /// Default trade hold applied to purchased items (CS2 7-day trade protection).
 pub const DEFAULT_TRADE_HOLD: Duration = Duration::days(7);
@@ -20,6 +22,15 @@ pub enum FillOutcome {
 /// Pluggable simulated execution. The real `cs2-arb-sim` can be adapted to this
 /// trait at integration time (for example by synthesizing a `Listing` from the quote).
 pub trait FillModel {
+    fn add_quote_update_times(&self, _times: &mut BTreeSet<DateTime<Utc>>) {}
+
+    fn invalidate_quotes(
+        &self,
+        _at: DateTime<Utc>,
+        _quotes: &mut HashMap<QuoteKey, PriceSnapshot>,
+    ) {
+    }
+
     fn seller_proceeds(
         &self,
         unit_price: Money,

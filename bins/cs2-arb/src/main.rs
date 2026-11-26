@@ -142,6 +142,7 @@ async fn run(cli: Cli) -> Result<()> {
                     samples,
                     interval_seconds,
                     &database,
+                    settings.dip.branch_update_window_hours,
                 )
                 .await?
             } else {

@@ -1,6 +1,20 @@
 use cs2_arb_core::{Error, MarketEvent, Result, CS2_APP_ID};
 use cs2_arb_events::{EventQueue, NewTransition, SteamCmdApiSource, Watcher, WatcherConfig};
 
+pub async fn recover_branch_updates(
+    queue: &EventQueue,
+    hours: Option<i64>,
+) -> Result<Vec<MarketEvent>> {
+    let Some(hours) = hours else {
+        return Ok(Vec::new());
+    };
+    let since = chrono::TimeDelta::try_hours(hours)
+        .filter(|window| *window > chrono::TimeDelta::zero())
+        .and_then(|window| queue.clock().now().checked_sub_signed(window))
+        .ok_or_else(|| Error::InvalidConfig("invalid dip branch update window".into()))?;
+    queue.acknowledged_branch_updates_since(since).await
+}
+
 pub async fn run(config: &str, database: &str, once: bool) -> Result<()> {
     let config = WatcherConfig::from_toml(config)?;
     if config.app_id != CS2_APP_ID {
@@ -72,6 +86,36 @@ mod tests {
     use cs2_arb_events::{QueueConfig, ScriptedSource};
 
     use super::*;
+
+    #[tokio::test]
+    async fn restores_an_acknowledged_branch_update_while_its_window_is_active() {
+        let at = DateTime::from_timestamp(1_740_000_000, 0).unwrap();
+        let clock = Arc::new(ManualClock::new(at));
+        let queue = EventQueue::open_in_memory(QueueConfig::default(), clock.clone())
+            .await
+            .unwrap();
+        let update = MarketEvent::BranchUpdated {
+            app_id: CS2_APP_ID,
+            branch: "staging".into(),
+            change_number: 2,
+            observed_at: at,
+        };
+        queue.enqueue(&update).await.unwrap();
+        drain(&queue, &mut Vec::new()).await.unwrap();
+
+        clock.advance(TimeDelta::minutes(30));
+        let recovered = recover_branch_updates(&queue, Some(1)).await.unwrap();
+        assert_eq!(recovered, vec![update]);
+        assert!(recover_branch_updates(&queue, None)
+            .await
+            .unwrap()
+            .is_empty());
+        clock.advance(TimeDelta::minutes(31));
+        assert!(recover_branch_updates(&queue, Some(1))
+            .await
+            .unwrap()
+            .is_empty());
+    }
 
     #[tokio::test]
     async fn watcher_events_are_delivered_and_record_strategy_state_transitions() {

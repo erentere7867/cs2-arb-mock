@@ -553,6 +553,34 @@ impl EventQueue {
         self.list(EventStatus::Dead).await
     }
 
+    pub async fn acknowledged_branch_updates_since(
+        &self,
+        since: DateTime<Utc>,
+    ) -> Result<Vec<MarketEvent>> {
+        let rows = sqlx::query(
+            "SELECT payload FROM event_queue WHERE status = 'acked' AND kind = 'branch_updated' \
+             AND acked_at >= ? ORDER BY id",
+        )
+        .bind(to_millis(since))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(storage)?;
+        Ok(rows
+            .iter()
+            .filter_map(|row| {
+                let event = serde_json::from_str(row.get("payload")).ok()?;
+                match &event {
+                    MarketEvent::BranchUpdated {
+                        app_id: cs2_arb_core::CS2_APP_ID,
+                        observed_at,
+                        ..
+                    } if *observed_at > since => Some(event),
+                    _ => None,
+                }
+            })
+            .collect())
+    }
+
     /// Move a dead-lettered event back to pending with a fresh attempt budget.
     pub async fn requeue_dead(&self, id: i64) -> Result<bool> {
         let result = sqlx::query(

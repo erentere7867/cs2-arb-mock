@@ -90,6 +90,7 @@ pub async fn collect(
     samples: u16,
     interval_seconds: u64,
     database: &str,
+    branch_update_window_hours: Option<i64>,
 ) -> Result<Inputs> {
     let assets = parse_snapshots(include_str!("../../../data/fixtures/price_snapshots.json"))?;
     let mut seen = HashSet::new();
@@ -100,7 +101,7 @@ pub async fn collect(
         .collect();
     let clients = make_clients(config, fees, platforms)?;
     let queue = EventQueue::open(database).await?;
-    let mut events = Vec::new();
+    let mut events = watch::recover_branch_updates(&queue, branch_update_window_hours).await?;
 
     // Restore already-consumed opens after a process restart. Later closes come through the queue.
     for window in queue.open_windows_at(CS2_APP_ID, Utc::now()).await? {

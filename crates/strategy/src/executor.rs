@@ -87,10 +87,18 @@ mod tests {
     use super::*;
     use crate::{KillSwitch, RiskLimits};
 
-    #[derive(Default)]
     struct FakeSim {
         submitted: Vec<Order>,
         fee: Money,
+    }
+
+    impl Default for FakeSim {
+        fn default() -> Self {
+            Self {
+                submitted: Vec::new(),
+                fee: Money(0),
+            }
+        }
     }
 
     impl SimExecutor for FakeSim {

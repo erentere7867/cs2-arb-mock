@@ -3,7 +3,7 @@
 //! reach a marketplace.
 
 use chrono::{DateTime, Duration, Utc};
-use cs2_arb_core::{FeeSchedule, Fill, Order, OrderSide, PriceSnapshot, Result};
+use cs2_arb_core::{FeeSchedule, Fill, Money, Order, OrderSide, PriceSnapshot, Result};
 
 use crate::replay::MarketView;
 
@@ -20,6 +20,15 @@ pub enum FillOutcome {
 /// Pluggable simulated execution. The real `cs2-arb-sim` can be adapted to this
 /// trait at integration time (for example by synthesizing a `Listing` from the quote).
 pub trait FillModel {
+    fn seller_proceeds(
+        &self,
+        unit_price: Money,
+        quantity: u32,
+        fees: FeeSchedule,
+    ) -> Result<Money> {
+        fees.seller_proceeds(unit_price.checked_mul(quantity)?)
+    }
+
     fn prepare_run(&self) {}
 
     fn prepare_step(&self, _strategy: &str, _view: &MarketView<'_>) -> Result<()> {

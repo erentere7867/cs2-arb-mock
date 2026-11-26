@@ -94,6 +94,7 @@ pub struct MarketView<'a> {
     pub fees: &'a FeeSchedules,
     latest: &'a HashMap<QuoteKey, PriceSnapshot>,
     max_quote_age: Duration,
+    fill_model: &'a dyn FillModel,
 }
 
 impl<'a> MarketView<'a> {
@@ -149,13 +150,17 @@ impl<'a> MarketView<'a> {
             if self.now - quote.observed_at > self.max_quote_age {
                 continue;
             }
-            let subtotal = quote.price.checked_mul(quantity)?;
-            let net = self.fees.get(quote.platform).seller_proceeds(subtotal)?;
+            let net = self.seller_proceeds(quote, quantity)?;
             if best.as_ref().is_none_or(|(_, _, b)| net > *b) {
                 best = Some((quote.platform, quote, net));
             }
         }
         Ok(best)
+    }
+
+    pub(crate) fn seller_proceeds(&self, quote: &PriceSnapshot, quantity: u32) -> Result<Money> {
+        self.fill_model
+            .seller_proceeds(quote.price, quantity, self.fees.get(quote.platform))
     }
 }
 
@@ -285,6 +290,7 @@ impl<F: FillModel> Backtester<F> {
                     fees: &self.config.fees,
                     latest: &latest,
                     max_quote_age: self.config.max_quote_age,
+                    fill_model: &self.fill_model,
                 };
                 self.fill_model.prepare_step(strategy.name(), &view)?;
                 let orders = strategy.on_step(&view)?;
@@ -492,8 +498,11 @@ impl<F: FillModel> Backtester<F> {
                 float_bucket: lot.position.float_bucket,
             };
             if let Some(quote) = latest.get(&key) {
-                let subtotal = quote.price.checked_mul(lot.position.quantity)?;
-                let net = self.config.fees.get(platform).seller_proceeds(subtotal)?;
+                let net = self.fill_model.seller_proceeds(
+                    quote.price,
+                    lot.position.quantity,
+                    self.config.fees.get(platform),
+                )?;
                 best = Some(best.map_or(net, |b| b.max(net)));
             }
         }
@@ -908,6 +917,7 @@ mod tests {
             fees: &fees,
             latest: &latest,
             max_quote_age: Duration::days(1),
+            fill_model: &SnapshotFillModel::default(),
         };
         let (platform, quote, _) = view
             .best_exit(&fresh.item, fresh.float_bucket, 1)
@@ -915,6 +925,70 @@ mod tests {
             .unwrap();
         assert_eq!(platform, fresh.platform);
         assert_eq!(quote, &fresh);
+    }
+
+    #[test]
+    fn simulator_marks_multi_unit_lots_and_ranks_exits_with_per_unit_fees() {
+        use crate::integrated::{MarketDepth, SimFillModel};
+        use cs2_arb_strategy::{KillSwitch, RiskLimits};
+
+        let mut fees = fees();
+        fees.skinport = cs2_arb_core::FeeSchedule {
+            seller_fee_pct: 0.0,
+            seller_fixed_fee: Money(50),
+            ..fees.skinport
+        };
+        fees.csfloat = cs2_arb_core::FeeSchedule {
+            seller_fee_pct: 0.0,
+            seller_fixed_fee: Money(0),
+            ..fees.csfloat
+        };
+        let skinport = snap(Platform::Skinport, 0, 1040);
+        let csfloat = snap(Platform::CsFloat, 0, 1000);
+        let latest = [skinport, csfloat.clone()]
+            .into_iter()
+            .map(|q| (QuoteKey::of(&q), q))
+            .collect();
+        let depth = MarketDepth::default();
+        let model = SimFillModel::new(
+            &depth,
+            fees.clone(),
+            RiskLimits::default(),
+            KillSwitch::new(),
+        );
+        let view = MarketView {
+            now: csfloat.observed_at,
+            batch: &[],
+            history: &[],
+            events: &[],
+            new_events: &[],
+            positions: &[],
+            fees: &fees,
+            latest: &latest,
+            max_quote_age: Duration::days(1),
+            fill_model: &model,
+        };
+        let (venue, _, proceeds) = view
+            .best_exit(&csfloat.item, csfloat.float_bucket, 2)
+            .unwrap()
+            .unwrap();
+        assert_eq!((venue, proceeds), (Platform::CsFloat, Money(2000)));
+        let lot = Lot {
+            position: Position {
+                id: "lot".into(),
+                item: csfloat.item.clone(),
+                float_bucket: csfloat.float_bucket,
+                acquired_on: Platform::CsFloat,
+                quantity: 2,
+                cost_basis: Money(1800),
+                acquired_at: t(0),
+                locked_until: t(7),
+            },
+            entry_subtotal: Money(1800),
+            entry_fee: Money(0),
+        };
+        let replay = Backtester::with_fill_model(BacktestConfig::new(fees.clone()), model);
+        assert_eq!(replay.mark(&lot, &latest).unwrap(), Money(2000));
     }
 
     #[test]

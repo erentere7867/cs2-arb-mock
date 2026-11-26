@@ -76,8 +76,7 @@ impl StrategyAdapter for SpreadStrategy {
             };
             let mut best_exit = None;
             for quote in quotes.iter().filter(|q| q.platform != buy.platform) {
-                let subtotal = quote.price.checked_mul(self.quantity)?;
-                let net = view.fees.get(quote.platform).seller_proceeds(subtotal)?;
+                let net = view.seller_proceeds(quote, self.quantity)?;
                 best_exit = Some(best_exit.map_or(net, |b: cs2_arb_core::Money| b.max(net)));
             }
             let Some(exit) = best_exit else {

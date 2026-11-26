@@ -7,7 +7,7 @@ use cs2_arb_core::{
     Error, FeeSchedule, FeeSchedules, Fill, FloatBucket, ItemId, Listing, ManualClock, Money,
     Order, OrderSide, Platform, Position, PriceSnapshot, Result, Sale, SimulationMode,
 };
-use cs2_arb_sim::{wear::quote_bucket, MockExecutor, SimConfig};
+use cs2_arb_sim::{wear::quote_bucket, ExactFeeSchedule, MockExecutor, SimConfig};
 use cs2_arb_strategy::{
     evaluate_spread, submit_with_risk, DipConfig, DipDetector, KillSwitch, RiskLimits, RiskManager,
     SpreadConfig, SubmitError,
@@ -142,6 +142,19 @@ impl<'a> SimFillModel<'a> {
 }
 
 impl FillModel for SimFillModel<'_> {
+    fn seller_proceeds(
+        &self,
+        unit_price: Money,
+        quantity: u32,
+        fees: FeeSchedule,
+    ) -> Result<Money> {
+        Ok(
+            ExactFeeSchedule::from_schedule(fees, SimConfig::default().fee_rounding)?
+                .sell(unit_price, quantity)?
+                .net,
+        )
+    }
+
     fn prepare_run(&self) {
         self.sessions.borrow_mut().clear();
     }

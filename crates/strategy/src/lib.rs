@@ -26,7 +26,7 @@ pub use kill_switch::KillSwitch;
 pub use risk::{RiskLimits, RiskManager, RiskRejection};
 
 use chrono::{DateTime, Utc};
-use cs2_arb_core::{Error, Money, Platform, Result};
+use cs2_arb_core::{Error, FloatBucket, Money, Platform, Result};
 
 pub(crate) fn platform_slug(platform: Platform) -> &'static str {
     match platform {
@@ -36,13 +36,18 @@ pub(crate) fn platform_slug(platform: Platform) -> &'static str {
     }
 }
 
-pub(crate) fn order_id(prefix: &str, parts: &[&str], at: DateTime<Utc>) -> String {
+pub(crate) fn order_id(
+    prefix: &str,
+    parts: &[&str],
+    bucket: Option<FloatBucket>,
+    at: DateTime<Utc>,
+) -> String {
     let mut id = String::from(prefix);
     for part in parts {
         id.push(':');
         id.push_str(part);
     }
-    id.push(':');
+    id.push_str(&format!(":{bucket:?}:"));
     id.push_str(&at.timestamp_millis().to_string());
     id
 }

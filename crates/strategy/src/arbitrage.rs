@@ -173,6 +173,7 @@ impl SpreadBreakdown {
                 platform_slug(self.sell_platform),
                 &self.item.market_hash_name,
             ],
+            self.float_bucket,
             at,
         )
     }
@@ -518,6 +519,24 @@ mod tests {
         assert!(evaluate_spread(&quotes, &fees(), &config, t0())
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn qualified_buckets_get_separate_buy_and_sell_order_ids() {
+        let buy = quote(Platform::Skinport, 10_000);
+        let sell = quote(Platform::CsFloat, 20_000);
+        let mut high_buy = buy.clone();
+        let mut high_sell = sell.clone();
+        high_buy.float_bucket = Some(FloatBucket::FieldTestedHigh);
+        high_sell.float_bucket = high_buy.float_bucket;
+        let spreads =
+            evaluate_spread(&[buy, sell, high_buy, high_sell], &fees(), &cfg(), t0()).unwrap();
+        assert_eq!(spreads.len(), 2);
+        assert_ne!(spreads[0].buy_order(t0()).id, spreads[1].buy_order(t0()).id);
+        assert_ne!(
+            spreads[0].sell_order(t0()).id,
+            spreads[1].sell_order(t0()).id
+        );
     }
 
     #[test]

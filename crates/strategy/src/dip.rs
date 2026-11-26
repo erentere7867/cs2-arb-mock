@@ -436,6 +436,7 @@ impl DipDetector {
                     platform_slug(snapshot.platform),
                     &snapshot.item.market_hash_name,
                 ],
+                snapshot.float_bucket,
                 snapshot.observed_at,
             ),
             side: OrderSide::Buy,
@@ -553,6 +554,16 @@ mod tests {
         assert!((s.lower_band(2.0) - (5.0 - 2.0 * s.std_dev)).abs() < 1e-12);
         assert!(rolling_stats(&[1.0]).is_none());
         assert_eq!(rolling_stats(&[3.0, 3.0]).unwrap().z_score(1.0), None);
+    }
+
+    #[test]
+    fn simultaneous_dip_buckets_produce_distinct_order_ids() {
+        let detector = DipDetector::new(DipConfig::default()).unwrap();
+        let mut low = snap(30, 2000);
+        low.float_bucket = Some(FloatBucket::FieldTestedLow);
+        let mut high = low.clone();
+        high.float_bucket = Some(FloatBucket::FieldTestedHigh);
+        assert_ne!(detector.buy_order(&low).id, detector.buy_order(&high).id);
     }
 
     #[test]

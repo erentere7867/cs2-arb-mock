@@ -17,7 +17,9 @@
 //!   Fees are integer cents, per unit, with an explicit [`RoundingMode`].
 
 pub mod book;
-pub mod clock;
+pub mod clock {
+    pub use cs2_arb_core::{Clock, ManualClock, SystemClock};
+}
 pub mod config;
 pub mod execution;
 pub mod executor;

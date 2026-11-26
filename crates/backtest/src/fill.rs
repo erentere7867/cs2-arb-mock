@@ -5,6 +5,8 @@
 use chrono::{DateTime, Duration, Utc};
 use cs2_arb_core::{FeeSchedule, Fill, Order, OrderSide, PriceSnapshot, Result};
 
+use crate::replay::MarketView;
+
 /// Default trade hold applied to purchased items (CS2 7-day trade protection).
 pub const DEFAULT_TRADE_HOLD: Duration = Duration::days(7);
 
@@ -18,6 +20,23 @@ pub enum FillOutcome {
 /// Pluggable simulated execution. The real `cs2-arb-sim` can be adapted to this
 /// trait at integration time (for example by synthesizing a `Listing` from the quote).
 pub trait FillModel {
+    fn prepare_run(&self) {}
+
+    fn prepare_step(&self, _strategy: &str, _view: &MarketView<'_>) -> Result<()> {
+        Ok(())
+    }
+
+    fn fill_for(
+        &self,
+        _strategy: &str,
+        order: &Order,
+        quote: &PriceSnapshot,
+        fees: FeeSchedule,
+        now: DateTime<Utc>,
+    ) -> Result<FillOutcome> {
+        self.fill(order, quote, fees, now)
+    }
+
     /// Simulate `order` against the most recent replayed `quote` for the same
     /// platform, item and float bucket. `fees` is the order platform's schedule.
     fn fill(

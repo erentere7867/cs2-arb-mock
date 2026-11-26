@@ -1,17 +1,12 @@
-//! Injected clocks. The executor never reads wall-clock time unless it is given
-//! a [`SystemClock`]; tests and backtests use [`ManualClock`].
-
-use std::fmt;
-use std::sync::Mutex;
+use std::fmt::Debug;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use chrono::{DateTime, TimeDelta, Utc};
 
-/// Source of "now" for the simulator.
-pub trait Clock: Send + Sync + fmt::Debug {
+pub trait Clock: Debug + Send + Sync {
     fn now(&self) -> DateTime<Utc>;
 }
 
-/// Wall-clock time. Only for interactive mock runs; never for deterministic tests.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SystemClock;
 
@@ -21,17 +16,12 @@ impl Clock for SystemClock {
     }
 }
 
-/// A clock that only moves when told to. Shareable through `Arc`.
-#[derive(Debug)]
-pub struct ManualClock {
-    now: Mutex<DateTime<Utc>>,
-}
+#[derive(Debug, Clone)]
+pub struct ManualClock(Arc<Mutex<DateTime<Utc>>>);
 
 impl ManualClock {
-    pub fn new(start: DateTime<Utc>) -> Self {
-        Self {
-            now: Mutex::new(start),
-        }
+    pub fn new(now: DateTime<Utc>) -> Self {
+        Self(Arc::new(Mutex::new(now)))
     }
 
     pub fn set(&self, now: DateTime<Utc>) {
@@ -39,13 +29,11 @@ impl ManualClock {
     }
 
     pub fn advance(&self, by: TimeDelta) {
-        let mut guard = self.lock();
-        *guard += by;
+        *self.lock() += by;
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, DateTime<Utc>> {
-        // A poisoned clock still holds a valid timestamp.
-        self.now
+    fn lock(&self) -> MutexGuard<'_, DateTime<Utc>> {
+        self.0
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }

@@ -10,6 +10,13 @@ path = "src/main.rs"
 
 [dependencies]
 clap.workspace = true
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["signal"] }
+toml.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
 cs2-arb-core.workspace = true
 cs2-arb-net.workspace = true
 cs2-arb-markets.workspace = true

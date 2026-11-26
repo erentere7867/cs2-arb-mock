@@ -21,7 +21,9 @@
 //! # Ok(()) }
 //! ```
 
-pub mod clock;
+pub mod clock {
+    pub use cs2_arb_core::{Clock, ManualClock, SystemClock};
+}
 pub mod queue;
 pub mod source;
 pub mod watcher;

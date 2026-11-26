@@ -4,11 +4,9 @@ version.workspace = true
 edition.workspace = true
 publish.workspace = true
 
-# NOTE: cs2-arb-sim is intentionally not a dependency. Order submission goes through the
-# local `SimExecutor` trait (src/executor.rs) so the in-flux simulator can be adapted at
-# integration time without coupling the strategy build to it.
 [dependencies]
 cs2-arb-core.workspace = true
+cs2-arb-sim.workspace = true
 chrono.workspace = true
 serde.workspace = true
 thiserror.workspace = true

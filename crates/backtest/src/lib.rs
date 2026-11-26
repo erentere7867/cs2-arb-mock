@@ -6,6 +6,7 @@
 
 pub mod fill;
 pub mod fixtures;
+pub mod integrated;
 pub mod ops;
 pub mod replay;
 pub mod report;

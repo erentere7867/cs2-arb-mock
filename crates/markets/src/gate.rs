@@ -1,13 +1,14 @@
 //! Local admission-control abstraction.
 //!
-//! `cs2-arb-net` (built in parallel) owns the real endpoint limiter, 429 silence window and
-//! retry policy. This crate only depends on the small [`RequestGate`] trait below; the
-//! integration step provides an adapter from net's limiter to it.
+//! Admission control for marketplace endpoints, backed by `cs2-arb-net` in the CLI.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use cs2_arb_core::{Platform, Result};
+use cs2_arb_net::RateLimiter;
+use reqwest::StatusCode;
 
 /// Identifies a rate-limit bucket: one per platform route template.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -42,4 +43,25 @@ impl RequestGate for NoopGate {
     }
 
     fn on_response(&self, _endpoint: &Endpoint, _status: u16, _retry_after: Option<Duration>) {}
+}
+
+#[derive(Debug, Clone)]
+pub struct NetGate(pub Arc<RateLimiter>);
+
+#[async_trait]
+impl RequestGate for NetGate {
+    async fn acquire(&self, endpoint: &Endpoint) -> Result<()> {
+        self.0.acquire(endpoint.platform, endpoint.path).await
+    }
+
+    fn on_response(&self, endpoint: &Endpoint, status: u16, retry_after: Option<Duration>) {
+        if let Ok(status) = StatusCode::from_u16(status) {
+            if let Err(error) =
+                self.0
+                    .record_response(endpoint.platform, endpoint.path, status, retry_after)
+            {
+                tracing::warn!(endpoint = endpoint.name, %error, "could not record HTTP status");
+            }
+        }
+    }
 }

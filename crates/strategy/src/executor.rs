@@ -1,8 +1,6 @@
 //! Local abstraction over the in-process **simulated** executor (crates/sim).
 //!
-//! There is deliberately no implementation here and no network dependency in this crate.
-//! Integration adapts the simulator to [`SimExecutor`]; nothing in this workspace may
-//! implement it against a real marketplace.
+//! This crate has no network dependency. The concrete sink is the in-process simulator.
 
 use chrono::{DateTime, Utc};
 use cs2_arb_core::{Error, Fill, Order};
@@ -12,6 +10,12 @@ use crate::risk::{RiskManager, RiskRejection};
 /// A mock-only order sink that returns simulated fills.
 pub trait SimExecutor {
     fn submit(&mut self, order: Order) -> Result<Fill, String>;
+}
+
+impl SimExecutor for cs2_arb_sim::MockExecutor {
+    fn submit(&mut self, order: Order) -> Result<Fill, String> {
+        cs2_arb_sim::MockExecutor::submit(self, order).map_err(|err| err.to_string())
+    }
 }
 
 impl<E: SimExecutor + ?Sized> SimExecutor for &mut E {

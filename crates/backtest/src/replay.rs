@@ -251,6 +251,7 @@ impl<F: FillModel> Backtester<F> {
         let mut steps = 0u32;
         let mut delivered = 0usize;
         let mut start = 0usize;
+        self.fill_model.prepare_run();
 
         while start < snapshots.len() {
             let now = snapshots[start].observed_at;
@@ -280,6 +281,7 @@ impl<F: FillModel> Backtester<F> {
                     fees: &self.config.fees,
                     latest: &latest,
                 };
+                self.fill_model.prepare_step(strategy.name(), &view)?;
                 let orders = strategy.on_step(&view)?;
                 for order in orders {
                     book.submitted += 1;
@@ -366,7 +368,10 @@ impl<F: FillModel> Backtester<F> {
             }
         }
         let fees = self.config.fees.get(order.platform);
-        let fill = match self.fill_model.fill(order, quote, fees, now)? {
+        let fill = match self
+            .fill_model
+            .fill_for(strategy, order, quote, fees, now)?
+        {
             FillOutcome::Filled(fill) => fill,
             FillOutcome::Rejected(reason) => return Ok(Err(reason)),
         };

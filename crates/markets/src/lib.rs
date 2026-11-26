@@ -10,7 +10,9 @@
 //! cache (memory plus optional on-disk JSON).
 
 pub mod cache;
-pub mod clock;
+pub mod clock {
+    pub use cs2_arb_core::{Clock, ManualClock, SystemClock};
+}
 pub mod convert;
 pub mod csfloat;
 pub mod dmarket;
@@ -23,8 +25,10 @@ pub use cache::Cached;
 pub use clock::{Clock, ManualClock, SystemClock};
 pub use csfloat::{CsFloatClient, CsFloatConfig, CsFloatCredentials};
 pub use dmarket::{DMarketClient, DMarketConfig, DMarketCredentials};
-pub use gate::{Endpoint, NoopGate, RequestGate};
+pub use gate::{Endpoint, NetGate, NoopGate, RequestGate};
+mod resilient;
 pub use limiter::{LimitPolicy, SlidingWindowLimiter, WindowLimit};
+pub use resilient::ResilientMarket;
 pub use skinport::{SkinportClient, SkinportConfig};
 
 /// User-Agent sent on every request.

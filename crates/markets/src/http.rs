@@ -12,7 +12,6 @@ use crate::gate::{Endpoint, RequestGate};
 
 /// Delay assumed for a 429 that carries no usable retry hint.
 pub(crate) const DEFAULT_429_RETRY: Duration = Duration::from_secs(60);
-const BODY_SNIPPET: usize = 200;
 
 pub(crate) struct HttpCore {
     client: reqwest::Client,
@@ -33,6 +32,7 @@ impl HttpCore {
             .map_err(|e| Error::InvalidConfig(format!("invalid base url: {e}")))?;
         let mut builder = reqwest::Client::builder()
             .user_agent(crate::USER_AGENT)
+            .redirect(reqwest::redirect::Policy::none())
             // No idle-pool timers: keeps paused-time tests deterministic and costs nothing.
             .pool_idle_timeout(None);
         if let Some(timeout) = timeout {
@@ -80,20 +80,22 @@ impl HttpCore {
                 retry_after: retry_after.unwrap_or(DEFAULT_429_RETRY),
             });
         }
+        if (500..600).contains(&status) {
+            return Err(Error::Network(format!(
+                "{} returned HTTP {status}",
+                endpoint.name
+            )));
+        }
+        if !(200..300).contains(&status) {
+            return Err(Error::HttpStatus {
+                endpoint: endpoint.name,
+                status,
+            });
+        }
         let body = response
             .bytes()
             .await
             .map_err(|e| Error::Network(format!("{}: {}", endpoint.name, e.without_url())))?;
-        if !(200..300).contains(&status) {
-            let snippet: String = String::from_utf8_lossy(&body)
-                .chars()
-                .take(BODY_SNIPPET)
-                .collect();
-            return Err(Error::Network(format!(
-                "{} returned HTTP {status}: {snippet}",
-                endpoint.name
-            )));
-        }
         Ok(body.to_vec())
     }
 }
@@ -132,7 +134,13 @@ pub(crate) fn header_value(value: &str) -> Result<HeaderValue> {
 }
 
 pub(crate) fn parse_json<T: serde::de::DeserializeOwned>(what: &str, body: &[u8]) -> Result<T> {
-    serde_json::from_slice(body).map_err(|e| Error::InvalidData(format!("{what}: {e}")))
+    serde_json::from_slice(body).map_err(|e| {
+        Error::InvalidData(format!(
+            "{what}: invalid JSON response at {}:{}",
+            e.line(),
+            e.column()
+        ))
+    })
 }
 
 #[cfg(test)]

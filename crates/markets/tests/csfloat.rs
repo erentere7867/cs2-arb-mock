@@ -1,12 +1,14 @@
 mod common;
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use common::*;
 use cs2_arb_core::{Error, MarketClient, Money, Platform};
 use cs2_arb_markets::csfloat::{CsFloatClient, CsFloatConfig, CsFloatCredentials};
-use cs2_arb_markets::{NoopGate, RequestGate};
+use cs2_arb_markets::{NetGate, NoopGate, RequestGate, ResilientMarket};
+use cs2_arb_net::{NetConfig, TokioClock};
 use serde_json::json;
 use wiremock::matchers::{header, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -162,4 +164,40 @@ async fn maps_429_with_ratelimit_reset_and_http_errors() {
             ("csfloat.sales_history", 500, None)
         ]
     );
+}
+
+#[tokio::test]
+async fn retries_5xx_but_records_and_does_not_retry_429() {
+    let server = MockServer::start().await;
+    let attempts = AtomicUsize::new(0);
+    Mock::given(method("GET"))
+        .and(path("/api/v1/listings"))
+        .respond_with(
+            move |_: &wiremock::Request| match attempts.fetch_add(1, Ordering::Relaxed) {
+                0 => ResponseTemplate::new(503),
+                _ => ResponseTemplate::new(429).insert_header("Retry-After", "0"),
+            },
+        )
+        .expect(2)
+        .mount(&server)
+        .await;
+    let config = NetConfig::from_toml(
+        "[rate_limits.csfloat.default]\nmax_requests = 10\nwindow_seconds = 60",
+    )
+    .unwrap();
+    let limiter = Arc::new(config.build_limiter(Arc::new(TokioClock)).unwrap());
+    let market = ResilientMarket::new(
+        client(&server, None, Arc::new(NetGate(limiter.clone()))),
+        cs2_arb_net::RetryPolicy::new(Duration::from_millis(1), Duration::from_millis(1), 4)
+            .unwrap(),
+    );
+    assert!(matches!(
+        market.list_listings(&redline()).await,
+        Err(Error::RateLimited { .. })
+    ));
+    assert!(matches!(
+        limiter.try_acquire(Platform::CsFloat, "/api/v1/listings"),
+        Err(Error::RateLimited { retry_after }) if retry_after > Duration::from_secs(55)
+    ));
+    server.verify().await;
 }

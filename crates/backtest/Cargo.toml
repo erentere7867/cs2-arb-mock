@@ -4,12 +4,10 @@ version.workspace = true
 edition.workspace = true
 publish.workspace = true
 
-# NOTE: cs2-arb-strategy and cs2-arb-sim are intentionally not dependencies yet.
-# The engine is built against local traits (`StrategyAdapter`, `FillModel`) so the
-# real strategy and simulator can be plugged in at integration time without a
-# dependency cycle or coupling to in-flux crates.
 [dependencies]
 cs2-arb-core.workspace = true
+cs2-arb-sim.workspace = true
+cs2-arb-strategy.workspace = true
 chrono.workspace = true
 serde.workspace = true
 serde_json.workspace = true

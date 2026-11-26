@@ -93,6 +93,7 @@ pub struct MarketView<'a> {
     pub positions: &'a [Position],
     pub fees: &'a FeeSchedules,
     latest: &'a HashMap<QuoteKey, PriceSnapshot>,
+    max_quote_age: Duration,
 }
 
 impl<'a> MarketView<'a> {
@@ -145,6 +146,9 @@ impl<'a> MarketView<'a> {
     ) -> Result<Option<(Platform, &'a PriceSnapshot, Money)>> {
         let mut best: Option<(Platform, &'a PriceSnapshot, Money)> = None;
         for quote in self.quotes_for(item, float_bucket) {
+            if self.now - quote.observed_at > self.max_quote_age {
+                continue;
+            }
             let subtotal = quote.price.checked_mul(quantity)?;
             let net = self.fees.get(quote.platform).seller_proceeds(subtotal)?;
             if best.as_ref().is_none_or(|(_, _, b)| net > *b) {
@@ -280,6 +284,7 @@ impl<F: FillModel> Backtester<F> {
                     positions: &positions,
                     fees: &self.config.fees,
                     latest: &latest,
+                    max_quote_age: self.config.max_quote_age,
                 };
                 self.fill_model.prepare_step(strategy.name(), &view)?;
                 let orders = strategy.on_step(&view)?;
@@ -882,6 +887,34 @@ mod tests {
         assert_eq!(report.totals.fee_drag_pct_of_gross, None);
         assert_eq!(report.totals.final_equity, report.totals.net_pnl);
         assert!(report.totals.max_drawdown.0 >= -report.totals.net_pnl.0);
+    }
+
+    #[test]
+    fn best_exit_prefers_fresh_quote_to_expired_higher_price() {
+        let stale = snap(Platform::DMarket, 0, 2000);
+        let fresh = snap(Platform::Skinport, 2, 1000);
+        let latest = [stale, fresh.clone()]
+            .into_iter()
+            .map(|q| (QuoteKey::of(&q), q))
+            .collect();
+        let fees = fees();
+        let view = MarketView {
+            now: fresh.observed_at,
+            batch: std::slice::from_ref(&fresh),
+            history: &[],
+            events: &[],
+            new_events: &[],
+            positions: &[],
+            fees: &fees,
+            latest: &latest,
+            max_quote_age: Duration::days(1),
+        };
+        let (platform, quote, _) = view
+            .best_exit(&fresh.item, fresh.float_bucket, 1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(platform, fresh.platform);
+        assert_eq!(quote, &fresh);
     }
 
     #[test]

@@ -41,6 +41,14 @@ fn hex_encode(bytes: &[u8]) -> String {
 }
 
 fn client(server: &MockServer) -> DMarketClient {
+    client_with_gate(server, Arc::new(NoopGate), clock())
+}
+
+fn client_with_gate(
+    server: &MockServer,
+    gate: Arc<dyn cs2_arb_markets::RequestGate>,
+    clock: Arc<cs2_arb_markets::ManualClock>,
+) -> DMarketClient {
     let signing_key = SigningKey::from_bytes(&FIXTURE_SEED);
     let public = hex_encode(&signing_key.verifying_key().to_bytes());
     let private = hex_encode(&FIXTURE_SEED);
@@ -50,7 +58,7 @@ fn client(server: &MockServer) -> DMarketClient {
         request_timeout: None,
         ..DMarketConfig::default()
     };
-    DMarketClient::with_config(fees(), cfg, creds, Arc::new(NoopGate), clock()).unwrap()
+    DMarketClient::with_config(fees(), cfg, creds, gate, clock).unwrap()
 }
 
 fn hex(s: &str) -> Vec<u8> {
@@ -62,11 +70,15 @@ fn hex(s: &str) -> Vec<u8> {
 
 /// Verifies the request the way DMarket does: decoded path + raw query + body + date.
 fn assert_signed(req: &Request) {
+    assert_signed_at(req, t0().timestamp());
+}
+
+fn assert_signed_at(req: &Request, timestamp: i64) {
     let key = req.headers.get("x-api-key").unwrap().to_str().unwrap();
     let vk = SigningKey::from_bytes(&FIXTURE_SEED).verifying_key();
     assert_eq!(key, hex_encode(&vk.to_bytes()));
     let date = req.headers.get("x-sign-date").unwrap().to_str().unwrap();
-    assert_eq!(date, t0().timestamp().to_string());
+    assert_eq!(date, timestamp.to_string());
     let sign = req.headers.get("x-request-sign").unwrap().to_str().unwrap();
     let sig_hex = sign.strip_prefix("dmar ed25519 ").expect("prefix");
     let message = string_to_sign(
@@ -79,6 +91,32 @@ fn assert_signed(req: &Request) {
     let sig = Signature::from_bytes(&hex(sig_hex).try_into().unwrap());
     vk.verify(message.as_bytes(), &sig)
         .expect("signature verifies");
+}
+
+#[tokio::test]
+async fn signs_after_quota_admission() {
+    use cs2_arb_markets::{Endpoint, ManualClock, RequestGate};
+    struct WaitingGate(Arc<ManualClock>);
+
+    #[async_trait::async_trait]
+    impl RequestGate for WaitingGate {
+        async fn acquire(&self, _: &Endpoint) -> cs2_arb_core::Result<()> {
+            self.0.advance(chrono::Duration::minutes(3));
+            Ok(())
+        }
+    }
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/trade-aggregator/v1/last-sales"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"sales": []})))
+        .mount(&server)
+        .await;
+    let clock = clock();
+    let client = client_with_gate(&server, Arc::new(WaitingGate(clock.clone())), clock);
+    client.recent_sales(&redline(), t0()).await.unwrap();
+    let requests = server.received_requests().await.unwrap();
+    assert_signed_at(&requests[0], t0().timestamp() + 180);
 }
 
 fn offer(

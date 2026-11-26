@@ -493,17 +493,24 @@ impl DMarketClient {
 
     /// Signed `GET path?query`; returns the body. Read-only by construction.
     async fn signed_get(&self, endpoint: &Endpoint, query: &str) -> Result<Vec<u8>> {
-        let timestamp = self.http.clock().now().timestamp();
-        let mut headers =
-            self.credentials
-                .auth_headers("GET", endpoint.path, query, "", timestamp)?;
-        headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
         let path_and_query = if query.is_empty() {
             endpoint.path.to_owned()
         } else {
             format!("{}?{query}", endpoint.path)
         };
-        self.http.get(endpoint, &path_and_query, headers).await
+        self.http
+            .get_with_headers(endpoint, &path_and_query, |now| {
+                let mut headers = self.credentials.auth_headers(
+                    "GET",
+                    endpoint.path,
+                    query,
+                    "",
+                    now.timestamp(),
+                )?;
+                headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
+                Ok(headers)
+            })
+            .await
     }
 }
 

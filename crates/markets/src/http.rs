@@ -61,12 +61,22 @@ impl HttpCore {
         path_and_query: &str,
         headers: HeaderMap,
     ) -> Result<Vec<u8>> {
+        self.get_with_headers(endpoint, path_and_query, |_| Ok(headers))
+            .await
+    }
+
+    pub(crate) async fn get_with_headers(
+        &self,
+        endpoint: &Endpoint,
+        path_and_query: &str,
+        headers: impl FnOnce(DateTime<Utc>) -> Result<HeaderMap>,
+    ) -> Result<Vec<u8>> {
         self.gate.acquire(endpoint).await?;
         let url = format!("{}{}", self.base_url, path_and_query);
         let response = self
             .client
             .get(&url)
-            .headers(headers)
+            .headers(headers(self.clock.now())?)
             .send()
             .await
             .map_err(|e| Error::Network(format!("{}: {}", endpoint.name, e.without_url())))?;

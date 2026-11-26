@@ -1,5 +1,6 @@
 # CLI
 
-Owns the `run-mock`, `backtest`, and `watch` entry points. In the scaffold these
-commands report that their workstream is not implemented; there is no live
-execution command or feature.
+Owns the `run-mock`, `backtest`, and `watch` entry points. Simulation runs
+offline by default. `run-mock --live-market-data` explicitly enables read-only
+quotes and sale records; neither that flag nor any other command can place
+real orders.

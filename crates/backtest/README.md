@@ -14,7 +14,8 @@ is mock simulation: strategies emit `Order` values that an in-process
 | `replay` | `Backtester`, `BacktestConfig`, `StrategyAdapter`, `MarketView`, `replay()` |
 | `fill` | `FillModel` trait and the built-in `SnapshotFillModel` (fills at the quote, applies configured fees, 7-day hold) |
 | `report` | `PerformanceReport` with `to_json()` / `to_markdown()` |
-| `strategies` | Built-in `SpreadStrategy` and `DipStrategy` used until `cs2-arb-strategy` is adapted |
+| `integrated` | CLI adapters for `cs2-arb-strategy` and `cs2-arb-sim`, including historical depth, per-strategy risk, and `MockExecutor` fills |
+| `strategies` | Built-in `SpreadStrategy` and `DipStrategy` for the lightweight comparison replay |
 | `fixtures` | JSON snapshot/event loaders and the fee-config loader |
 
 ## Replay semantics
@@ -28,7 +29,10 @@ is mock simulation: strategies emit `Order` values that an in-process
 - Equity is marked to market each step (realized net plus open positions at
   the best net-of-seller-fee quote). Max drawdown is taken on that curve, starting at zero.
 
-## Fixture results
+## Lightweight model fixture baseline
+
+For the CLI's results using real strategy and mock executor logic, see the
+[workspace backtest results](../../README.md#bundled-fixture-backtest).
 
 `cargo test -p cs2-arb-backtest --test fixtures_backtest -- --nocapture` prints
 the full Markdown report. With `config/default.toml` fees and default strategy

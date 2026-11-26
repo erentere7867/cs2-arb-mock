@@ -385,7 +385,8 @@ fn convert_last_sales(
         }
         out.push(Sale {
             id: format!(
-                "dmarket:{}:{ts}:{}:{}",
+                "dmarket:{:?}:{}:{ts}:{}:{}",
+                item.market_hash_name,
                 sale.tx_operation_type.as_deref().unwrap_or("sale"),
                 price.0,
                 serde_json::Value::from(sale.offer_attributes.unwrap_or_default())

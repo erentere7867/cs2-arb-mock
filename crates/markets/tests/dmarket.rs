@@ -32,6 +32,12 @@ fn last_sale_identity_survives_a_newer_row() {
     .unwrap();
     assert_eq!(before[0].id, after[0].id);
     assert_ne!(after[0].id, after[1].id);
+    let mut another_item = redline();
+    another_item.market_hash_name = "A different Field-Tested skin".into();
+    let same_sale_shape = json!({"sales": [{"price": "1.00", "date": "1748779198"}]});
+    let another =
+        parse_last_sales(same_sale_shape.to_string().as_bytes(), &another_item, since).unwrap();
+    assert_ne!(before[0].id, another[0].id);
 }
 
 const FIXTURE_SEED: [u8; 32] = [42; 32];

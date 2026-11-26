@@ -206,8 +206,8 @@ pub fn parse_sales(body: &[u8], item: &ItemId, since: DateTime<Utc>) -> Result<V
         let id = match &row.id {
             Some(id) => format!("csfloat:{}", id_string(id)),
             None => format!(
-                "csfloat:sale:{}:{}:{:?}",
-                row.sold_at, row.price, row.item.float_value
+                "csfloat:sale:{:?}:{}:{}:{:?}",
+                item.market_hash_name, row.sold_at, row.price, row.item.float_value
             ),
         };
         out.push(Sale {

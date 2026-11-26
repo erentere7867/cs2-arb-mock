@@ -219,8 +219,22 @@ impl FillModel for SimFillModel<'_> {
         let session = sessions
             .get_mut(strategy)
             .ok_or_else(|| Error::InvalidData("simulator step was not prepared".into()))?;
-        let unrealized = marked_unrealized(view, session.executor.portfolio().positions())?;
-        session.risk.record_marked_fill(fill, unrealized)?;
+        let portfolio = session.executor.portfolio();
+        let entry = portfolio
+            .ledger()
+            .last()
+            .filter(|entry| entry.order_id == fill.order.id)
+            .ok_or_else(|| Error::InvalidData("missing simulator ledger entry for fill".into()))?;
+        let released_cost = match fill.order.side {
+            OrderSide::Buy => Money(0),
+            OrderSide::Sell => entry.cost_basis_released.ok_or_else(|| {
+                Error::InvalidData("missing simulator cost basis for sell".into())
+            })?,
+        };
+        let unrealized = marked_unrealized(view, portfolio.positions())?;
+        session
+            .risk
+            .record_marked_fill(fill, unrealized, released_cost)?;
         Ok(())
     }
 

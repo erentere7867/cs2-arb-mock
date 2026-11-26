@@ -1056,6 +1056,74 @@ mod tests {
     }
 
     #[test]
+    fn break_even_sell_below_average_cost_does_not_halt_the_next_buy() {
+        use crate::integrated::{MarketDepth, SimFillModel};
+        use cs2_arb_strategy::{KillSwitch, RiskLimits};
+
+        let venue = Platform::CsFloat;
+        let buckets = [
+            (BUCKET, 1000, 0.20),
+            (Some(FloatBucket::FieldTestedHigh), 3000, 0.30),
+        ];
+        let mut snapshots = Vec::new();
+        let mut sales = Vec::new();
+        for day in [0, 7] {
+            for (bucket, price, float_value) in buckets {
+                let mut snapshot = snap(venue, day, price);
+                snapshot.float_bucket = bucket;
+                sales.extend((0..70).map(|n| cs2_arb_core::Sale {
+                    id: format!("{day}-{bucket:?}-{n}"),
+                    platform: venue,
+                    item: snapshot.item.clone(),
+                    price: snapshot.price,
+                    float_value: Some(float_value),
+                    sold_at: snapshot.observed_at,
+                    verified: true,
+                }));
+                snapshots.push(snapshot);
+            }
+        }
+        let mut depth = MarketDepth::from_snapshots(&snapshots);
+        depth.add_sales(sales);
+        let mut fees = fees();
+        fees.csfloat.seller_fee_pct = 0.0;
+        fees.csfloat.buyer_fee_pct = 0.0;
+        let model = SimFillModel::new(
+            &depth,
+            fees.clone(),
+            RiskLimits {
+                daily_drawdown_cap: Money(500),
+                ..RiskLimits::default()
+            },
+            KillSwitch::new(),
+        );
+        let mut high_buy = order(OrderSide::Buy, venue, 1, 3000, 0);
+        high_buy.id.push_str("-high");
+        high_buy.float_bucket = Some(FloatBucket::FieldTestedHigh);
+        let log = std::rc::Rc::default();
+        let mut strategies: Vec<Box<dyn StrategyAdapter>> = vec![Box::new(Scripted {
+            name: "s".into(),
+            script: vec![
+                (0, order(OrderSide::Buy, venue, 1, 1000, 0)),
+                (0, high_buy),
+                (7, order(OrderSide::Sell, venue, 1, 1000, 7)),
+                (7, order(OrderSide::Buy, venue, 1, 1000, 7)),
+            ],
+            log: std::rc::Rc::clone(&log),
+        })];
+        let report = Backtester::with_fill_model(BacktestConfig::new(fees), model)
+            .run(SimulationMode, &snapshots, &[], &mut strategies)
+            .unwrap();
+        assert_eq!(report.trades[0].net_pnl, Money(0));
+        assert!(
+            log.borrow().rejects.is_empty(),
+            "{:?}",
+            log.borrow().rejects
+        );
+        assert_eq!(log.borrow().fills.len(), 4);
+    }
+
+    #[test]
     fn empty_live_book_removes_old_ask_before_next_spread_evaluation() {
         use crate::integrated::{MarketDepth, SimFillModel, SpreadAdapter};
         use cs2_arb_strategy::{KillSwitch, RiskLimits, SpreadConfig};

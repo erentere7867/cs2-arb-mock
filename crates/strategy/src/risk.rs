@@ -243,15 +243,26 @@ impl RiskManager {
     /// basis; sells release average cost and realize `qty * price - fee - released cost`.
     /// Returns the realized P&L of this fill (zero for buys).
     pub fn record_fill(&mut self, fill: &Fill) -> Result<Money> {
-        self.record_fill_inner(fill, None)
+        self.record_fill_inner(fill, None, None)
     }
 
-    /// Replace the portfolio mark and record the fill before checking drawdown.
-    pub fn record_marked_fill(&mut self, fill: &Fill, unrealized: Money) -> Result<Money> {
-        self.record_fill_inner(fill, Some(unrealized))
+    /// Update drawdown using the post-fill mark and the simulator's actual sold-lot cost
+    /// basis (`Money(0)` on buys).
+    pub fn record_marked_fill(
+        &mut self,
+        fill: &Fill,
+        unrealized: Money,
+        cost_basis_released: Money,
+    ) -> Result<Money> {
+        self.record_fill_inner(fill, Some(unrealized), Some(cost_basis_released))
     }
 
-    fn record_fill_inner(&mut self, fill: &Fill, unrealized: Option<Money>) -> Result<Money> {
+    fn record_fill_inner(
+        &mut self,
+        fill: &Fill,
+        unrealized: Option<Money>,
+        cost_basis_released: Option<Money>,
+    ) -> Result<Money> {
         self.roll_day(fill.filled_at);
         let gross = fill.unit_price.checked_mul(fill.quantity)?;
         let holding = self.holdings.entry(fill.order.item.clone()).or_default();
@@ -277,7 +288,16 @@ impl RiskManager {
                         "sell fill exceeds tracked holding; clamping released cost"
                     );
                 }
-                let released = if holding.quantity == 0 {
+                let released = if let Some(cost) = cost_basis_released {
+                    if qty != u64::from(fill.quantity)
+                        || !(0..=holding.cost_basis).contains(&cost.0)
+                    {
+                        return Err(Error::InvalidData(
+                            "sold-lot cost exceeds risk holdings".into(),
+                        ));
+                    }
+                    cost.0
+                } else if holding.quantity == 0 {
                     0
                 } else {
                     // Pro-rata average cost (truncated); a full exit releases everything.

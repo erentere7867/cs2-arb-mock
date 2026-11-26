@@ -8,9 +8,10 @@ use cs2_arb_core::{
     Order, OrderSide, Platform, Position, PriceSnapshot, Result, Sale, SimulationMode,
 };
 use cs2_arb_sim::{wear::quote_bucket, ExactFeeSchedule, MockExecutor, SimConfig};
+use cs2_arb_strategy::executor::execute_with_risk;
 use cs2_arb_strategy::{
-    evaluate_spread, submit_with_risk, DipConfig, DipDetector, KillSwitch, RiskLimits, RiskManager,
-    SpreadConfig, SubmitError,
+    evaluate_spread, DipConfig, DipDetector, KillSwitch, RiskLimits, RiskManager, SpreadConfig,
+    SubmitError,
 };
 
 use crate::{FillModel, FillOutcome, MarketView, StrategyAdapter, DEFAULT_TRADE_HOLD};
@@ -192,15 +193,18 @@ impl FillModel for SimFillModel<'_> {
                     .replace_listings(*platform, item, listings.clone());
             }
         }
-        let mut unrealized = Money(0);
-        for position in view.positions {
-            if let Some((_, _, value)) =
-                view.best_exit(&position.item, position.float_bucket, position.quantity)?
-            {
-                unrealized = unrealized.checked_add(value.checked_sub(position.cost_basis)?)?;
-            }
-        }
+        let unrealized = marked_unrealized(view, session.executor.portfolio().positions())?;
         session.risk.set_unrealized_pnl(unrealized, view.now);
+        Ok(())
+    }
+
+    fn after_fill(&self, strategy: &str, view: &MarketView<'_>, fill: &Fill) -> Result<()> {
+        let mut sessions = self.sessions.borrow_mut();
+        let session = sessions
+            .get_mut(strategy)
+            .ok_or_else(|| Error::InvalidData("simulator step was not prepared".into()))?;
+        let unrealized = marked_unrealized(view, session.executor.portfolio().positions())?;
+        session.risk.record_marked_fill(fill, unrealized)?;
         Ok(())
     }
 
@@ -228,7 +232,7 @@ impl FillModel for SimFillModel<'_> {
         let Session { executor, risk, .. } = sessions
             .get_mut(strategy)
             .ok_or_else(|| Error::InvalidData("simulator step was not prepared".into()))?;
-        match submit_with_risk(risk, executor, order.clone(), now) {
+        match execute_with_risk(risk, executor, order.clone(), now) {
             Ok(fill) => Ok(FillOutcome::Filled(fill)),
             Err(SubmitError::Accounting(err)) => Err(err),
             Err(err) => Ok(FillOutcome::Rejected(err.to_string())),
@@ -238,6 +242,18 @@ impl FillModel for SimFillModel<'_> {
     fn locked_until(&self, fill: &Fill) -> DateTime<Utc> {
         fill.filled_at + cs2_arb_sim::valve_trade_hold()
     }
+}
+
+fn marked_unrealized(view: &MarketView<'_>, positions: &[Position]) -> Result<Money> {
+    positions.iter().try_fold(Money(0), |total, position| {
+        if let Some((_, _, value)) =
+            view.best_exit(&position.item, position.float_bucket, position.quantity)?
+        {
+            total.checked_add(value.checked_sub(position.cost_basis)?)
+        } else {
+            Ok(total)
+        }
+    })
 }
 
 pub struct SpreadAdapter {

@@ -243,6 +243,15 @@ impl RiskManager {
     /// basis; sells release average cost and realize `qty * price - fee - released cost`.
     /// Returns the realized P&L of this fill (zero for buys).
     pub fn record_fill(&mut self, fill: &Fill) -> Result<Money> {
+        self.record_fill_inner(fill, None)
+    }
+
+    /// Replace the portfolio mark and record the fill before checking drawdown.
+    pub fn record_marked_fill(&mut self, fill: &Fill, unrealized: Money) -> Result<Money> {
+        self.record_fill_inner(fill, Some(unrealized))
+    }
+
+    fn record_fill_inner(&mut self, fill: &Fill, unrealized: Option<Money>) -> Result<Money> {
         self.roll_day(fill.filled_at);
         let gross = fill.unit_price.checked_mul(fill.quantity)?;
         let holding = self.holdings.entry(fill.order.item.clone()).or_default();
@@ -289,6 +298,9 @@ impl RiskManager {
             self.holdings.remove(&fill.order.item);
         }
         self.day_realized += realized;
+        if let Some(mark) = unrealized {
+            self.unrealized = mark.0;
+        }
         self.refresh_drawdown(fill.filled_at);
         Ok(Money(realized))
     }

@@ -56,6 +56,19 @@ pub fn submit_with_risk<E: SimExecutor + ?Sized>(
     order: Order,
     now: DateTime<Utc>,
 ) -> Result<Fill, SubmitError> {
+    let fill = execute_with_risk(risk, executor, order, now)?;
+    risk.record_fill(&fill)?;
+    Ok(fill)
+}
+
+/// Submit a risk-checked order without recording its fill, so callers can update
+/// realized and marked P&L together with [`RiskManager::record_marked_fill`].
+pub fn execute_with_risk<E: SimExecutor + ?Sized>(
+    risk: &mut RiskManager,
+    executor: &mut E,
+    order: Order,
+    now: DateTime<Utc>,
+) -> Result<Fill, SubmitError> {
     risk.check(&order, now)?;
     if order.side == OrderSide::Buy {
         let cost = executor
@@ -63,9 +76,7 @@ pub fn submit_with_risk<E: SimExecutor + ?Sized>(
             .map_err(|_| RiskRejection::InvalidOrder("buy cost overflow"))?;
         risk.check_entry_exposure(&order, cost)?;
     }
-    let fill = executor.submit(order).map_err(SubmitError::Execution)?;
-    risk.record_fill(&fill)?;
-    Ok(fill)
+    executor.submit(order).map_err(SubmitError::Execution)
 }
 
 #[cfg(test)]

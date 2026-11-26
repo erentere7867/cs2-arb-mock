@@ -298,6 +298,7 @@ impl<F: FillModel> Backtester<F> {
                     book.submitted += 1;
                     match self.execute(strategy.name(), book, &order, &latest, now)? {
                         Ok(fill) => {
+                            self.fill_model.after_fill(strategy.name(), &view, &fill)?;
                             book.filled += 1;
                             tracing::debug!(
                                 strategy = strategy.name(),
@@ -989,6 +990,58 @@ mod tests {
         };
         let replay = Backtester::with_fill_model(BacktestConfig::new(fees.clone()), model);
         assert_eq!(replay.mark(&lot, &latest).unwrap(), Money(2000));
+    }
+
+    #[test]
+    fn losing_sale_does_not_halt_the_next_same_step_buy_by_counting_twice() {
+        use crate::integrated::{MarketDepth, SimFillModel};
+        use cs2_arb_strategy::{KillSwitch, RiskLimits};
+
+        let venue = Platform::CsFloat;
+        let snapshots = [snap(venue, 0, 1000), snap(venue, 7, 600)];
+        let mut depth = MarketDepth::from_snapshots(&snapshots);
+        for snapshot in &snapshots {
+            depth.add_sales((0..70).map(|n| cs2_arb_core::Sale {
+                id: format!("{}-{n}", snapshot.observed_at),
+                item: snapshot.item.clone(),
+                platform: venue,
+                price: snapshot.price,
+                float_value: Some(0.20),
+                sold_at: snapshot.observed_at,
+                verified: true,
+            }));
+        }
+        let mut fees = fees();
+        fees.csfloat.seller_fee_pct = 0.0;
+        fees.csfloat.buyer_fee_pct = 0.0;
+        let model = SimFillModel::new(
+            &depth,
+            fees.clone(),
+            RiskLimits {
+                daily_drawdown_cap: Money(500),
+                ..RiskLimits::default()
+            },
+            KillSwitch::new(),
+        );
+        let log = std::rc::Rc::default();
+        let mut strategies: Vec<Box<dyn StrategyAdapter>> = vec![Box::new(Scripted {
+            name: "s".into(),
+            script: vec![
+                (0, order(OrderSide::Buy, venue, 1, 1000, 0)),
+                (7, order(OrderSide::Sell, venue, 1, 600, 7)),
+                (7, order(OrderSide::Buy, venue, 1, 600, 7)),
+            ],
+            log: std::rc::Rc::clone(&log),
+        })];
+        Backtester::with_fill_model(BacktestConfig::new(fees), model)
+            .run(SimulationMode, &snapshots, &[], &mut strategies)
+            .unwrap();
+        assert!(
+            log.borrow().rejects.is_empty(),
+            "{:?}",
+            log.borrow().rejects
+        );
+        assert_eq!(log.borrow().fills.len(), 3);
     }
 
     #[test]

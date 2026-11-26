@@ -35,6 +35,10 @@ pub trait FillModel {
         Ok(())
     }
 
+    fn after_fill(&self, _strategy: &str, _view: &MarketView<'_>, _fill: &Fill) -> Result<()> {
+        Ok(())
+    }
+
     fn fill_for(
         &self,
         _strategy: &str,

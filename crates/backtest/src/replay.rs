@@ -1,17 +1,985 @@
-use std::time::Duration;
+//! Deterministic historical replay of price snapshots and market events through
+//! one or more strategies and a simulated fill model.
 
-use cs2_arb_core::{Error, MarketEvent, Money, PriceSnapshot, Result, SimulationMode};
+use std::collections::{HashMap, HashSet};
 
-pub struct PerformanceReport {
-    pub net_pnl: Money,
-    pub trade_durations: Vec<Duration>,
-    pub fee_drag: Money,
+use chrono::{DateTime, Duration, Utc};
+use cs2_arb_core::{
+    Error, FeeSchedules, Fill, FloatBucket, ItemId, MarketEvent, Money, Order, OrderSide, Platform,
+    Position, PriceSnapshot, Result, SimulationMode,
+};
+
+use crate::fill::{FillModel, FillOutcome, SnapshotFillModel};
+use crate::report::{
+    PerformanceReport, ReplayWindow, StrategyStats, TradeRecord, REPORT_DISCLAIMER,
+};
+use crate::strategies::{DipStrategy, SpreadStrategy};
+
+/// Every supported platform, in a fixed order used for deterministic iteration.
+pub const PLATFORMS: [Platform; 3] = [Platform::Skinport, Platform::CsFloat, Platform::DMarket];
+
+/// Identity of a replayed quote series.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct QuoteKey {
+    pub platform: Platform,
+    pub item: ItemId,
+    pub float_bucket: Option<FloatBucket>,
 }
 
+impl QuoteKey {
+    pub fn of(snapshot: &PriceSnapshot) -> Self {
+        Self {
+            platform: snapshot.platform,
+            item: snapshot.item.clone(),
+            float_bucket: snapshot.float_bucket,
+        }
+    }
+}
+
+/// When an event became observable.
+pub fn event_time(event: &MarketEvent) -> DateTime<Utc> {
+    match event {
+        MarketEvent::BranchUpdated { observed_at, .. } => *observed_at,
+        MarketEvent::PanicWindowOpened { opened_at, .. } => *opened_at,
+        MarketEvent::PanicWindowClosed { closed_at, .. } => *closed_at,
+    }
+}
+
+/// Branches whose panic window is open after applying `events` in order.
+pub fn open_panic_windows(events: &[MarketEvent]) -> Vec<String> {
+    let mut open: Vec<String> = Vec::new();
+    for event in events {
+        match event {
+            MarketEvent::PanicWindowOpened { branch, .. } => {
+                if !open.contains(branch) {
+                    open.push(branch.clone());
+                }
+            }
+            MarketEvent::PanicWindowClosed { branch, .. } => open.retain(|b| b != branch),
+            MarketEvent::BranchUpdated { .. } => {}
+        }
+    }
+    open
+}
+
+#[derive(Debug, Clone)]
+pub struct BacktestConfig {
+    pub fees: FeeSchedules,
+    /// Orders only fill against quotes at most this old.
+    pub max_quote_age: Duration,
+}
+
+impl BacktestConfig {
+    pub fn new(fees: FeeSchedules) -> Self {
+        Self {
+            fees,
+            max_quote_age: Duration::days(1),
+        }
+    }
+}
+
+/// Read-only view handed to a strategy at each replay step.
+pub struct MarketView<'a> {
+    pub now: DateTime<Utc>,
+    /// Snapshots observed exactly at `now`.
+    pub batch: &'a [PriceSnapshot],
+    /// All snapshots observed at or before `now`, oldest first.
+    pub history: &'a [PriceSnapshot],
+    /// All events observed at or before `now`, oldest first.
+    pub events: &'a [MarketEvent],
+    /// Events first observed in this step.
+    pub new_events: &'a [MarketEvent],
+    /// This strategy's open positions, oldest first (the FIFO sell order).
+    pub positions: &'a [Position],
+    pub fees: &'a FeeSchedules,
+    latest: &'a HashMap<QuoteKey, PriceSnapshot>,
+}
+
+impl<'a> MarketView<'a> {
+    pub fn latest_quote(
+        &self,
+        platform: Platform,
+        item: &ItemId,
+        float_bucket: Option<FloatBucket>,
+    ) -> Option<&'a PriceSnapshot> {
+        self.latest.get(&QuoteKey {
+            platform,
+            item: item.clone(),
+            float_bucket,
+        })
+    }
+
+    /// Latest quote on each platform for the same item and float bucket.
+    pub fn quotes_for(
+        &self,
+        item: &ItemId,
+        float_bucket: Option<FloatBucket>,
+    ) -> Vec<&'a PriceSnapshot> {
+        PLATFORMS
+            .iter()
+            .filter_map(|p| self.latest_quote(*p, item, float_bucket))
+            .collect()
+    }
+
+    pub fn panic_window_active(&self) -> bool {
+        !open_panic_windows(self.events).is_empty()
+    }
+
+    pub fn open_positions_for(
+        &self,
+        item: &ItemId,
+        float_bucket: Option<FloatBucket>,
+    ) -> impl Iterator<Item = &'a Position> + '_ {
+        let item = item.clone();
+        self.positions
+            .iter()
+            .filter(move |p| p.item == item && p.float_bucket == float_bucket)
+    }
+
+    /// Best `(platform, quote, net proceeds)` for selling `quantity` units now.
+    pub fn best_exit(
+        &self,
+        item: &ItemId,
+        float_bucket: Option<FloatBucket>,
+        quantity: u32,
+    ) -> Result<Option<(Platform, &'a PriceSnapshot, Money)>> {
+        let mut best: Option<(Platform, &'a PriceSnapshot, Money)> = None;
+        for quote in self.quotes_for(item, float_bucket) {
+            let subtotal = quote.price.checked_mul(quantity)?;
+            let net = self.fees.get(quote.platform).seller_proceeds(subtotal)?;
+            if best.as_ref().is_none_or(|(_, _, b)| net > *b) {
+                best = Some((quote.platform, quote, net));
+            }
+        }
+        Ok(best)
+    }
+}
+
+/// A strategy that can be driven by the replay engine. Integration can wrap
+/// `cs2-arb-strategy` in this trait.
+pub trait StrategyAdapter {
+    /// Unique name, used for the per-strategy breakdown.
+    fn name(&self) -> &str;
+
+    /// Decide on simulated orders for this step. Buys fill on `order.platform`
+    /// against the latest quote; sells consume this strategy's unlocked
+    /// positions for the same item and float bucket in FIFO order.
+    fn on_step(&mut self, view: &MarketView<'_>) -> Result<Vec<Order>>;
+
+    fn on_fill(&mut self, _fill: &Fill) {}
+
+    fn on_reject(&mut self, _order: &Order, _reason: &str) {}
+}
+
+#[derive(Debug, Clone)]
+struct Lot {
+    position: Position,
+    /// Remaining purchase subtotal (excluding fees).
+    entry_subtotal: Money,
+    /// Remaining entry fees.
+    entry_fee: Money,
+}
+
+#[derive(Default)]
+struct Book {
+    lots: Vec<Lot>,
+    next_position: u64,
+    trades: Vec<TradeRecord>,
+    submitted: u32,
+    filled: u32,
+    rejected: u32,
+    equity: Vec<Money>,
+}
+
+/// `amount * part / whole` with i128 intermediates; `part <= whole`.
+fn prorate(amount: Money, part: u32, whole: u32) -> Money {
+    if part == whole {
+        return amount;
+    }
+    Money((i128::from(amount.0) * i128::from(part) / i128::from(whole)) as i64)
+}
+
+pub struct Backtester<F: FillModel = SnapshotFillModel> {
+    config: BacktestConfig,
+    fill_model: F,
+}
+
+impl Backtester<SnapshotFillModel> {
+    pub fn new(config: BacktestConfig) -> Self {
+        Self::with_fill_model(config, SnapshotFillModel::default())
+    }
+}
+
+impl<F: FillModel> Backtester<F> {
+    pub fn with_fill_model(config: BacktestConfig, fill_model: F) -> Self {
+        Self { config, fill_model }
+    }
+
+    /// Replay `snapshots` and `events` in time order. Inputs need not be sorted;
+    /// ties keep input order. Events are delivered at the first step whose time is
+    /// at or after the event time.
+    pub fn run(
+        &self,
+        _mode: SimulationMode,
+        snapshots: &[PriceSnapshot],
+        events: &[MarketEvent],
+        strategies: &mut [Box<dyn StrategyAdapter + '_>],
+    ) -> Result<PerformanceReport> {
+        let mut names = HashSet::new();
+        for strategy in strategies.iter() {
+            if !names.insert(strategy.name().to_owned()) {
+                return Err(Error::InvalidConfig(format!(
+                    "duplicate strategy name {}",
+                    strategy.name()
+                )));
+            }
+        }
+        if let Some(bad) = snapshots.iter().find(|s| s.price.0 < 0) {
+            return Err(Error::InvalidData(format!(
+                "negative price for {} at {}",
+                bad.item.market_hash_name, bad.observed_at
+            )));
+        }
+
+        let mut snapshots = snapshots.to_vec();
+        snapshots.sort_by_key(|s| s.observed_at);
+        let mut events = events.to_vec();
+        events.sort_by_key(event_time);
+
+        let mut books: Vec<Book> = strategies.iter().map(|_| Book::default()).collect();
+        let mut latest: HashMap<QuoteKey, PriceSnapshot> = HashMap::new();
+        let mut steps = 0u32;
+        let mut delivered = 0usize;
+        let mut start = 0usize;
+
+        while start < snapshots.len() {
+            let now = snapshots[start].observed_at;
+            let end = start
+                + snapshots[start..]
+                    .iter()
+                    .take_while(|s| s.observed_at == now)
+                    .count();
+            for snapshot in &snapshots[start..end] {
+                latest.insert(QuoteKey::of(snapshot), snapshot.clone());
+            }
+            let first_new_event = delivered;
+            while delivered < events.len() && event_time(&events[delivered]) <= now {
+                delivered += 1;
+            }
+
+            for (strategy, book) in strategies.iter_mut().zip(books.iter_mut()) {
+                let positions: Vec<Position> =
+                    book.lots.iter().map(|l| l.position.clone()).collect();
+                let view = MarketView {
+                    now,
+                    batch: &snapshots[start..end],
+                    history: &snapshots[..end],
+                    events: &events[..delivered],
+                    new_events: &events[first_new_event..delivered],
+                    positions: &positions,
+                    fees: &self.config.fees,
+                    latest: &latest,
+                };
+                let orders = strategy.on_step(&view)?;
+                for order in orders {
+                    book.submitted += 1;
+                    match self.execute(strategy.name(), book, &order, &latest, now)? {
+                        Ok(fill) => {
+                            book.filled += 1;
+                            tracing::debug!(
+                                strategy = strategy.name(),
+                                order = %order.id,
+                                side = ?order.side,
+                                price = fill.unit_price.0,
+                                "simulated fill"
+                            );
+                            strategy.on_fill(&fill);
+                        }
+                        Err(reason) => {
+                            book.rejected += 1;
+                            tracing::debug!(
+                                strategy = strategy.name(),
+                                order = %order.id,
+                                %reason,
+                                "simulated order rejected"
+                            );
+                            strategy.on_reject(&order, &reason);
+                        }
+                    }
+                }
+            }
+            for book in &mut books {
+                let equity = self.equity(book, &latest)?;
+                book.equity.push(equity);
+            }
+            steps += 1;
+            start = end;
+        }
+
+        let window = ReplayWindow {
+            start: snapshots.first().map(|s| s.observed_at),
+            end: snapshots.last().map(|s| s.observed_at),
+            steps,
+            snapshots: snapshots.len() as u32,
+            events_delivered: delivered as u32,
+            events_total: events.len() as u32,
+        };
+        self.build_report(window, strategies, &books, &latest)
+    }
+
+    /// Outer `Result` is a hard error; inner `Err` is a rejection reason.
+    fn execute(
+        &self,
+        strategy: &str,
+        book: &mut Book,
+        order: &Order,
+        latest: &HashMap<QuoteKey, PriceSnapshot>,
+        now: DateTime<Utc>,
+    ) -> Result<std::result::Result<Fill, String>> {
+        let key = QuoteKey {
+            platform: order.platform,
+            item: order.item.clone(),
+            float_bucket: order.float_bucket,
+        };
+        let Some(quote) = latest.get(&key) else {
+            return Ok(Err("no quote for platform, item and float bucket".into()));
+        };
+        if now - quote.observed_at > self.config.max_quote_age {
+            return Ok(Err("quote is stale".into()));
+        }
+        if order.side == OrderSide::Sell {
+            let unlocked: u64 = book
+                .lots
+                .iter()
+                .filter(|l| {
+                    l.position.item == order.item
+                        && l.position.float_bucket == order.float_bucket
+                        && !l.position.is_trade_locked_at(now)
+                })
+                .map(|l| u64::from(l.position.quantity))
+                .sum();
+            if unlocked < u64::from(order.quantity) {
+                return Ok(Err(format!(
+                    "insufficient unlocked inventory: have {unlocked}, need {}",
+                    order.quantity
+                )));
+            }
+        }
+        let fees = self.config.fees.get(order.platform);
+        let fill = match self.fill_model.fill(order, quote, fees, now)? {
+            FillOutcome::Filled(fill) => fill,
+            FillOutcome::Rejected(reason) => return Ok(Err(reason)),
+        };
+        if fill.quantity == 0 || fill.quantity > order.quantity {
+            return Err(Error::InvalidData(format!(
+                "fill model returned quantity {} for order of {}",
+                fill.quantity, order.quantity
+            )));
+        }
+        let subtotal = fill.unit_price.checked_mul(fill.quantity)?;
+        match order.side {
+            OrderSide::Buy => {
+                book.next_position += 1;
+                let position = Position {
+                    id: format!("{strategy}-{}", book.next_position),
+                    item: order.item.clone(),
+                    float_bucket: order.float_bucket,
+                    acquired_on: order.platform,
+                    quantity: fill.quantity,
+                    cost_basis: subtotal.checked_add(fill.fee)?,
+                    acquired_at: fill.filled_at,
+                    locked_until: self.fill_model.locked_until(&fill),
+                };
+                book.lots.push(Lot {
+                    position,
+                    entry_subtotal: subtotal,
+                    entry_fee: fill.fee,
+                });
+            }
+            OrderSide::Sell => {
+                self.close_lots(strategy, book, &fill, subtotal)?;
+            }
+        }
+        Ok(Ok(fill))
+    }
+
+    fn close_lots(
+        &self,
+        strategy: &str,
+        book: &mut Book,
+        fill: &Fill,
+        exit_subtotal: Money,
+    ) -> Result<()> {
+        let order = &fill.order;
+        let now = fill.filled_at;
+        let mut remaining = fill.quantity;
+        let mut exit_left = exit_subtotal;
+        let mut exit_fee_left = fill.fee;
+        let mut units_left = fill.quantity;
+        let mut index = 0;
+        while remaining > 0 {
+            let lot = &mut book.lots[index];
+            if lot.position.item != order.item
+                || lot.position.float_bucket != order.float_bucket
+                || lot.position.is_trade_locked_at(now)
+            {
+                index += 1;
+                continue;
+            }
+            let take = remaining.min(lot.position.quantity);
+            let entry_subtotal = prorate(lot.entry_subtotal, take, lot.position.quantity);
+            let entry_fee = prorate(lot.entry_fee, take, lot.position.quantity);
+            let exit_part = prorate(exit_left, take, units_left);
+            let exit_fee = prorate(exit_fee_left, take, units_left);
+            exit_left = exit_left.checked_sub(exit_part)?;
+            exit_fee_left = exit_fee_left.checked_sub(exit_fee)?;
+            units_left -= take;
+            remaining -= take;
+
+            let gross = exit_part.checked_sub(entry_subtotal)?;
+            let fees = entry_fee.checked_add(exit_fee)?;
+            book.trades.push(TradeRecord {
+                strategy: strategy.to_owned(),
+                position_id: lot.position.id.clone(),
+                item: lot.position.item.clone(),
+                float_bucket: lot.position.float_bucket,
+                quantity: take,
+                buy_platform: lot.position.acquired_on,
+                sell_platform: order.platform,
+                entry_subtotal,
+                entry_fee,
+                exit_subtotal: exit_part,
+                exit_fee,
+                gross_pnl: gross,
+                fees,
+                net_pnl: gross.checked_sub(fees)?,
+                opened_at: lot.position.acquired_at,
+                locked_until: lot.position.locked_until,
+                closed_at: now,
+                duration_secs: (now - lot.position.acquired_at).num_seconds(),
+            });
+
+            lot.position.quantity -= take;
+            lot.entry_subtotal = lot.entry_subtotal.checked_sub(entry_subtotal)?;
+            lot.entry_fee = lot.entry_fee.checked_sub(entry_fee)?;
+            lot.position.cost_basis = lot.entry_subtotal.checked_add(lot.entry_fee)?;
+            if lot.position.quantity == 0 {
+                book.lots.remove(index);
+            } else {
+                index += 1;
+            }
+        }
+        Ok(())
+    }
+
+    /// Mark value (best net-of-fee exit) of a lot; cost basis when no quote exists.
+    fn mark(&self, lot: &Lot, latest: &HashMap<QuoteKey, PriceSnapshot>) -> Result<Money> {
+        let mut best: Option<Money> = None;
+        for platform in PLATFORMS {
+            let key = QuoteKey {
+                platform,
+                item: lot.position.item.clone(),
+                float_bucket: lot.position.float_bucket,
+            };
+            if let Some(quote) = latest.get(&key) {
+                let subtotal = quote.price.checked_mul(lot.position.quantity)?;
+                let net = self.config.fees.get(platform).seller_proceeds(subtotal)?;
+                best = Some(best.map_or(net, |b| b.max(net)));
+            }
+        }
+        Ok(best.unwrap_or(lot.position.cost_basis))
+    }
+
+    fn unrealized(&self, book: &Book, latest: &HashMap<QuoteKey, PriceSnapshot>) -> Result<Money> {
+        book.lots.iter().try_fold(Money(0), |acc, lot| {
+            acc.checked_add(
+                self.mark(lot, latest)?
+                    .checked_sub(lot.position.cost_basis)?,
+            )
+        })
+    }
+
+    fn equity(&self, book: &Book, latest: &HashMap<QuoteKey, PriceSnapshot>) -> Result<Money> {
+        let realized = book
+            .trades
+            .iter()
+            .try_fold(Money(0), |acc, t| acc.checked_add(t.net_pnl))?;
+        realized.checked_add(self.unrealized(book, latest)?)
+    }
+
+    fn build_report(
+        &self,
+        window: ReplayWindow,
+        strategies: &[Box<dyn StrategyAdapter + '_>],
+        books: &[Book],
+        latest: &HashMap<QuoteKey, PriceSnapshot>,
+    ) -> Result<PerformanceReport> {
+        let mut per_strategy = Vec::with_capacity(books.len());
+        let mut all_trades: Vec<TradeRecord> = Vec::new();
+        let mut combined_equity = vec![Money(0); window.steps as usize];
+        let mut total_unrealized = Money(0);
+        let mut total_open_basis = Money(0);
+        let mut total_open = 0u32;
+        let (mut submitted, mut filled, mut rejected) = (0u32, 0u32, 0u32);
+
+        for (strategy, book) in strategies.iter().zip(books) {
+            let unrealized = self.unrealized(book, latest)?;
+            let open_basis = book
+                .lots
+                .iter()
+                .try_fold(Money(0), |acc, l| acc.checked_add(l.position.cost_basis))?;
+            let open = book.lots.len() as u32;
+            per_strategy.push(stats(
+                strategy.name(),
+                &book.trades,
+                &book.equity,
+                (book.submitted, book.filled, book.rejected),
+                (open, open_basis, unrealized),
+            )?);
+            for (sum, point) in combined_equity.iter_mut().zip(&book.equity) {
+                *sum = sum.checked_add(*point)?;
+            }
+            total_unrealized = total_unrealized.checked_add(unrealized)?;
+            total_open_basis = total_open_basis.checked_add(open_basis)?;
+            total_open += open;
+            submitted += book.submitted;
+            filled += book.filled;
+            rejected += book.rejected;
+            all_trades.extend(book.trades.iter().cloned());
+        }
+        // Stable sort keeps strategy order for trades closed at the same instant.
+        all_trades.sort_by_key(|t| t.closed_at);
+        let totals = stats(
+            "all",
+            &all_trades,
+            &combined_equity,
+            (submitted, filled, rejected),
+            (total_open, total_open_basis, total_unrealized),
+        )?;
+        Ok(PerformanceReport {
+            disclaimer: REPORT_DISCLAIMER.to_owned(),
+            window,
+            trade_hold_secs: hold_secs(&self.fill_model),
+            totals,
+            strategies: per_strategy,
+            trades: all_trades,
+        })
+    }
+}
+
+/// Trade hold implied by the fill model, measured on a probe fill.
+fn hold_secs<F: FillModel>(model: &F) -> i64 {
+    let at = DateTime::<Utc>::UNIX_EPOCH;
+    let probe = Fill {
+        order: Order {
+            id: "probe".into(),
+            side: OrderSide::Buy,
+            platform: Platform::CsFloat,
+            item: ItemId {
+                market_hash_name: String::new(),
+                wear_tier: cs2_arb_core::WearTier::FactoryNew,
+            },
+            float_bucket: None,
+            quantity: 1,
+            limit_price: Money(0),
+            submitted_at: at,
+        },
+        quantity: 1,
+        unit_price: Money(0),
+        fee: Money(0),
+        filled_at: at,
+    };
+    (model.locked_until(&probe) - at).num_seconds()
+}
+
+/// Peak-to-trough decline of an equity curve that starts at zero.
+pub fn max_drawdown(equity: &[Money]) -> Money {
+    let mut peak = 0i64;
+    let mut worst = 0i64;
+    for point in equity {
+        peak = peak.max(point.0);
+        worst = worst.max(peak.saturating_sub(point.0));
+    }
+    Money(worst)
+}
+
+/// Median of integer samples; mean of the middle pair for even lengths.
+pub fn median(values: &[i64]) -> Option<f64> {
+    if values.is_empty() {
+        return None;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_unstable();
+    let mid = sorted.len() / 2;
+    Some(if sorted.len() % 2 == 1 {
+        sorted[mid] as f64
+    } else {
+        (sorted[mid - 1] as f64 + sorted[mid] as f64) / 2.0
+    })
+}
+
+fn stats(
+    name: &str,
+    trades: &[TradeRecord],
+    equity: &[Money],
+    (submitted, filled, rejected): (u32, u32, u32),
+    (open_positions, open_cost_basis, unrealized_pnl): (u32, Money, Money),
+) -> Result<StrategyStats> {
+    let sum = |f: fn(&TradeRecord) -> Money| {
+        trades
+            .iter()
+            .try_fold(Money(0), |acc, t| acc.checked_add(f(t)))
+    };
+    let gross_pnl = sum(|t| t.gross_pnl)?;
+    let buy_fees = sum(|t| t.entry_fee)?;
+    let sell_fees = sum(|t| t.exit_fee)?;
+    let total_fees = buy_fees.checked_add(sell_fees)?;
+    let net_pnl = gross_pnl.checked_sub(total_fees)?;
+    let entry = sum(|t| t.entry_subtotal)?;
+    let exit = sum(|t| t.exit_subtotal)?;
+    let closed_turnover = entry.checked_add(exit)?;
+    let durations: Vec<i64> = trades.iter().map(|t| t.duration_secs).collect();
+    let count = trades.len() as u32;
+    let winning_trades = trades.iter().filter(|t| t.net_pnl.0 > 0).count() as u32;
+    let losing_trades = trades.iter().filter(|t| t.net_pnl.0 < 0).count() as u32;
+    Ok(StrategyStats {
+        strategy: name.to_owned(),
+        orders_submitted: submitted,
+        orders_filled: filled,
+        orders_rejected: rejected,
+        trade_count: count,
+        winning_trades,
+        losing_trades,
+        win_rate: (count > 0).then(|| f64::from(winning_trades) / f64::from(count)),
+        gross_pnl,
+        buy_fees,
+        sell_fees,
+        total_fees,
+        net_pnl,
+        fee_drag_pct_of_gross: (gross_pnl.0 > 0)
+            .then(|| total_fees.0 as f64 / gross_pnl.0 as f64 * 100.0),
+        fee_pct_of_turnover: (closed_turnover.0 > 0)
+            .then(|| total_fees.0 as f64 / closed_turnover.0 as f64 * 100.0),
+        closed_turnover,
+        open_positions,
+        open_cost_basis,
+        unrealized_pnl,
+        total_pnl: net_pnl.checked_add(unrealized_pnl)?,
+        avg_trade_duration_secs: (count > 0)
+            .then(|| durations.iter().map(|d| *d as f64).sum::<f64>() / f64::from(count)),
+        median_trade_duration_secs: median(&durations),
+        min_trade_duration_secs: durations.iter().copied().min(),
+        max_trade_duration_secs: durations.iter().copied().max(),
+        max_drawdown: max_drawdown(equity),
+        final_equity: equity.last().copied().unwrap_or(Money(0)),
+    })
+}
+
+/// The built-in strategy set used by [`replay`]: spread then dip, default parameters.
+pub fn default_strategies() -> Vec<Box<dyn StrategyAdapter>> {
+    vec![
+        Box::new(SpreadStrategy::default()),
+        Box::new(DipStrategy::default()),
+    ]
+}
+
+/// Replay with the built-in fill model and the built-in spread and dip strategies.
 pub fn replay(
-    _mode: SimulationMode,
-    _snapshots: &[PriceSnapshot],
-    _events: &[MarketEvent],
+    mode: SimulationMode,
+    snapshots: &[PriceSnapshot],
+    events: &[MarketEvent],
+    fees: FeeSchedules,
 ) -> Result<PerformanceReport> {
-    Err(Error::NotImplemented("historical snapshot replay"))
+    let mut strategies = default_strategies();
+    Backtester::new(BacktestConfig::new(fees)).run(mode, snapshots, events, &mut strategies)
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::TimeZone;
+    use cs2_arb_core::{FeeSchedule, WearTier};
+
+    use super::*;
+
+    fn t(day: i64) -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2025, 1, 1, 12, 0, 0).unwrap() + Duration::days(day)
+    }
+
+    fn item() -> ItemId {
+        ItemId {
+            market_hash_name: "AK-47 | Redline (Field-Tested)".into(),
+            wear_tier: WearTier::FieldTested,
+        }
+    }
+
+    const BUCKET: Option<FloatBucket> = Some(FloatBucket::FieldTestedLow);
+
+    fn snap(platform: Platform, day: i64, price: i64) -> PriceSnapshot {
+        PriceSnapshot {
+            platform,
+            item: item(),
+            float_bucket: BUCKET,
+            price: Money(price),
+            observed_at: t(day),
+        }
+    }
+
+    fn fees() -> FeeSchedules {
+        let schedule = |seller| FeeSchedule {
+            buyer_fee_pct: 1.0,
+            seller_fee_pct: seller,
+            buyer_fixed_fee: Money(0),
+            seller_fixed_fee: Money(0),
+        };
+        FeeSchedules {
+            skinport: schedule(8.0),
+            csfloat: schedule(2.0),
+            dmarket: schedule(5.0),
+        }
+    }
+
+    fn order(side: OrderSide, platform: Platform, qty: u32, limit: i64, day: i64) -> Order {
+        Order {
+            id: format!("{side:?}-{day}"),
+            side,
+            platform,
+            item: item(),
+            float_bucket: BUCKET,
+            quantity: qty,
+            limit_price: Money(limit),
+            submitted_at: t(day),
+        }
+    }
+
+    #[derive(Default)]
+    struct Log {
+        fills: Vec<Fill>,
+        rejects: Vec<String>,
+        saw_panic: Vec<(i64, bool, usize)>,
+    }
+
+    /// Emits a fixed list of orders on given days and records callbacks.
+    #[derive(Default)]
+    struct Scripted {
+        name: String,
+        script: Vec<(i64, Order)>,
+        log: std::rc::Rc<std::cell::RefCell<Log>>,
+    }
+
+    impl StrategyAdapter for Scripted {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn on_step(&mut self, view: &MarketView<'_>) -> Result<Vec<Order>> {
+            let day = (view.now - t(0)).num_days();
+            self.log.borrow_mut().saw_panic.push((
+                day,
+                view.panic_window_active(),
+                view.new_events.len(),
+            ));
+            Ok(self
+                .script
+                .iter()
+                .filter(|(d, _)| *d == day)
+                .map(|(_, o)| o.clone())
+                .collect())
+        }
+        fn on_fill(&mut self, fill: &Fill) {
+            self.log.borrow_mut().fills.push(fill.clone());
+        }
+        fn on_reject(&mut self, _order: &Order, reason: &str) {
+            self.log.borrow_mut().rejects.push(reason.to_owned());
+        }
+    }
+
+    fn daily(days: i64, price: impl Fn(Platform, i64) -> i64) -> Vec<PriceSnapshot> {
+        (0..days)
+            .flat_map(|d| PLATFORMS.map(|p| snap(p, d, price(p, d))))
+            .collect()
+    }
+
+    fn run_scripted(
+        snapshots: &[PriceSnapshot],
+        events: &[MarketEvent],
+        script: Vec<(i64, Order)>,
+    ) -> (PerformanceReport, Log) {
+        let log = std::rc::Rc::default();
+        let mut strategies: Vec<Box<dyn StrategyAdapter>> = vec![Box::new(Scripted {
+            name: "s".into(),
+            script,
+            log: std::rc::Rc::clone(&log),
+        })];
+        let report = Backtester::new(BacktestConfig::new(fees()))
+            .run(SimulationMode, snapshots, events, &mut strategies)
+            .unwrap();
+        drop(strategies);
+        let log = std::rc::Rc::try_unwrap(log).ok().unwrap().into_inner();
+        (report, log)
+    }
+
+    #[test]
+    fn enforces_seven_day_hold_and_applies_fees() {
+        let snapshots = daily(10, |p, _| if p == Platform::DMarket { 1000 } else { 1200 });
+        let script = vec![
+            (0, order(OrderSide::Buy, Platform::DMarket, 1, 1000, 0)),
+            (6, order(OrderSide::Sell, Platform::CsFloat, 1, 0, 6)),
+            (7, order(OrderSide::Sell, Platform::CsFloat, 1, 0, 7)),
+        ];
+        let (report, s) = run_scripted(&snapshots, &[], script);
+        assert_eq!(s.fills.len(), 2);
+        assert_eq!(s.rejects.len(), 1);
+        assert!(s.rejects[0].contains("insufficient unlocked inventory"));
+        let trade = &report.trades[0];
+        assert_eq!(trade.entry_fee, Money(10)); // 1% buyer fee on DMarket
+        assert_eq!(trade.exit_fee, Money(24)); // 2% seller fee on CSFloat
+        assert_eq!(trade.gross_pnl, Money(200));
+        assert_eq!(trade.net_pnl, Money(166));
+        assert_eq!(trade.duration_secs, Duration::days(7).num_seconds());
+        let totals = &report.totals;
+        assert_eq!(totals.trade_count, 1);
+        assert_eq!(totals.fee_drag_pct_of_gross, Some(17.0));
+        assert_eq!(totals.orders_rejected, 1);
+        assert_eq!(totals.win_rate, Some(1.0));
+        // Nothing is left open, so final equity is the realized net.
+        assert_eq!(report.window.steps, 10);
+        assert_eq!(totals.final_equity, Money(166));
+    }
+
+    #[test]
+    fn fifo_partial_sells_prorate_cost_and_fees() {
+        let snapshots = daily(20, |_, d| if d < 2 { 1000 } else { 900 + d });
+        let script = vec![
+            (0, order(OrderSide::Buy, Platform::CsFloat, 3, 1000, 0)),
+            (1, order(OrderSide::Buy, Platform::CsFloat, 2, 1000, 1)),
+            (8, order(OrderSide::Sell, Platform::CsFloat, 4, 0, 8)),
+            (9, order(OrderSide::Sell, Platform::CsFloat, 1, 0, 9)),
+        ];
+        let (report, s) = run_scripted(&snapshots, &[], script);
+        assert!(s.rejects.is_empty(), "{:?}", s.rejects);
+        let trades = &report.trades;
+        assert_eq!(
+            trades.iter().map(|t| t.quantity).collect::<Vec<_>>(),
+            [3, 1, 1]
+        );
+        assert_eq!(trades[0].position_id, "s-1");
+        assert_eq!(trades[1].position_id, "s-2");
+        assert_eq!(trades[2].position_id, "s-2");
+        // Sell of 4 @ 908 = 3632, 2% fee = 73 (72.64 rounded), split 3:1.
+        assert_eq!(trades[0].exit_subtotal.0 + trades[1].exit_subtotal.0, 3632);
+        assert_eq!(trades[0].exit_fee.0 + trades[1].exit_fee.0, 73);
+        assert_eq!(trades[1].entry_subtotal, Money(1000));
+        assert_eq!(trades[1].entry_fee, Money(10));
+        assert_eq!(trades[2].entry_fee, Money(10));
+        assert_eq!(report.totals.open_positions, 0);
+        assert!(report.totals.net_pnl.0 < 0);
+        assert_eq!(report.totals.losing_trades, 3);
+        assert_eq!(report.totals.win_rate, Some(0.0));
+        assert_eq!(report.totals.fee_drag_pct_of_gross, None);
+        assert_eq!(report.totals.final_equity, report.totals.net_pnl);
+        assert!(report.totals.max_drawdown.0 >= -report.totals.net_pnl.0);
+    }
+
+    #[test]
+    fn rejects_missing_stale_and_unmarketable_orders() {
+        // Skinport stops quoting after day 0, so its quote is stale from day 2.
+        let snapshots: Vec<_> = daily(4, |_, _| 1000)
+            .into_iter()
+            .filter(|s| s.platform != Platform::Skinport || s.observed_at == t(0))
+            .collect();
+        let mut other = order(OrderSide::Buy, Platform::CsFloat, 1, 1000, 1);
+        other.float_bucket = Some(FloatBucket::FieldTestedHigh);
+        let script = vec![
+            (1, other),
+            (2, order(OrderSide::Buy, Platform::Skinport, 1, 1000, 2)),
+            (3, order(OrderSide::Buy, Platform::CsFloat, 1, 999, 3)),
+            (3, order(OrderSide::Buy, Platform::CsFloat, 0, 1000, 3)),
+        ];
+        let (report, s) = run_scripted(&snapshots, &[], script);
+        assert_eq!(s.rejects.len(), 4);
+        assert!(s.rejects[0].contains("no quote"));
+        assert!(s.rejects[1].contains("stale"));
+        assert!(s.rejects[2].contains("not marketable"));
+        assert!(s.rejects[3].contains("zero quantity"));
+        assert_eq!(report.totals.orders_filled, 0);
+        assert_eq!(report.totals.trade_count, 0);
+        assert_eq!(report.totals.max_drawdown, Money(0));
+    }
+
+    #[test]
+    fn delivers_events_at_first_step_at_or_after_their_time() {
+        let snapshots = daily(5, |_, _| 1000);
+        let events = vec![
+            MarketEvent::PanicWindowClosed {
+                branch: "staging".into(),
+                closed_at: t(3) - Duration::hours(1),
+            },
+            MarketEvent::PanicWindowOpened {
+                branch: "staging".into(),
+                opened_at: t(1) - Duration::hours(1),
+            },
+            MarketEvent::BranchUpdated {
+                app_id: 730,
+                branch: "staging".into(),
+                change_number: 1,
+                observed_at: t(1) - Duration::hours(1),
+            },
+        ];
+        let (report, s) = run_scripted(&snapshots, &events, vec![]);
+        assert_eq!(
+            s.saw_panic,
+            [
+                (0, false, 0),
+                (1, true, 2),
+                (2, true, 0),
+                (3, false, 1),
+                (4, false, 0)
+            ]
+        );
+        assert_eq!(report.window.events_delivered, 3);
+    }
+
+    #[test]
+    fn rejects_duplicate_names_and_negative_prices() {
+        let backtester = Backtester::new(BacktestConfig::new(fees()));
+        let mut dupes: Vec<Box<dyn StrategyAdapter>> = vec![
+            Box::new(Scripted {
+                name: "x".into(),
+                ..Scripted::default()
+            }),
+            Box::new(Scripted {
+                name: "x".into(),
+                ..Scripted::default()
+            }),
+        ];
+        assert!(backtester
+            .run(SimulationMode, &daily(1, |_, _| 1), &[], &mut dupes)
+            .is_err());
+        let mut one: Vec<Box<dyn StrategyAdapter>> = vec![Box::new(Scripted::default())];
+        assert!(backtester
+            .run(SimulationMode, &daily(1, |_, _| -1), &[], &mut one)
+            .is_err());
+    }
+
+    #[test]
+    fn empty_replay_produces_empty_report() {
+        let report = replay(SimulationMode, &[], &[], fees()).unwrap();
+        assert_eq!(report.window.steps, 0);
+        assert_eq!(report.totals.trade_count, 0);
+        assert_eq!(report.totals.win_rate, None);
+        assert_eq!(report.strategies.len(), 2);
+        assert!(report.to_markdown().contains("No closed trades."));
+    }
+
+    #[test]
+    fn drawdown_and_median_helpers() {
+        assert_eq!(max_drawdown(&[]), Money(0));
+        assert_eq!(
+            max_drawdown(&[Money(-5), Money(10), Money(3), Money(12)]),
+            Money(7)
+        );
+        assert_eq!(max_drawdown(&[Money(-5), Money(-2)]), Money(5));
+        assert_eq!(median(&[]), None);
+        assert_eq!(median(&[3, 1, 2]), Some(2.0));
+        assert_eq!(median(&[4, 1, 3, 2]), Some(2.5));
+    }
 }

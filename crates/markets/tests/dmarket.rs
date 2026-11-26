@@ -175,3 +175,45 @@ async fn parses_signed_last_sales() {
     assert_signed(&server.received_requests().await.unwrap()[0]);
     assert_eq!(dm.fees().await.unwrap(), fees());
 }
+
+#[tokio::test]
+async fn pages_full_sales_results_until_the_cutoff() {
+    let server = MockServer::start().await;
+    let since = t0() - chrono::Duration::days(7);
+    for offset in [0, 20, 40, 60] {
+        let query = if offset == 0 {
+            query_param("limit", "20")
+        } else {
+            query_param("offset", offset.to_string())
+        };
+        let sales: Vec<_> = (offset..offset + 20)
+            .map(|i| {
+                json!({"price": "1.00", "date": if i < 71 {
+                    (t0().timestamp() - i).to_string()
+                } else {
+                    (since.timestamp() - i).to_string()
+                }})
+            })
+            .collect();
+        let mut request = Mock::given(method("GET"))
+            .and(path("/trade-aggregator/v1/last-sales"))
+            .and(query);
+        if offset == 0 {
+            request =
+                request.and(|req: &Request| !req.url.query_pairs().any(|(key, _)| key == "offset"));
+        }
+        request
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"sales": sales})))
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+    let sales = client(&server)
+        .recent_sales(&redline(), since)
+        .await
+        .unwrap();
+    assert_eq!(sales.len(), 71);
+    for request in server.received_requests().await.unwrap() {
+        assert_signed(&request);
+    }
+}

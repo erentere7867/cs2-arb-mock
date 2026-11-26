@@ -347,13 +347,26 @@ pub fn parse_offers(
 /// Parses `/trade-aggregator/v1/last-sales` into verified sales at or after `since`.
 pub fn parse_last_sales(body: &[u8], item: &ItemId, since: DateTime<Utc>) -> Result<Vec<Sale>> {
     let raw: RawSales = parse_json("dmarket last sales", body)?;
+    convert_last_sales(raw.sales, item, since)
+}
+
+fn sale_timestamp(sale: &RawSale) -> Result<DateTime<Utc>> {
+    let ts = value_as_string(&sale.date)
+        .and_then(|d| d.trim().parse().ok())
+        .ok_or_else(|| Error::InvalidData("dmarket sale date is not unix seconds".into()))?;
+    DateTime::from_timestamp(ts, 0)
+        .ok_or_else(|| Error::InvalidData("dmarket sale date out of range".into()))
+}
+
+fn convert_last_sales(
+    rows: Vec<RawSale>,
+    item: &ItemId,
+    since: DateTime<Utc>,
+) -> Result<Vec<Sale>> {
     let mut out = Vec::new();
-    for (index, sale) in raw.sales.into_iter().enumerate() {
-        let ts: i64 = value_as_string(&sale.date)
-            .and_then(|d| d.trim().parse().ok())
-            .ok_or_else(|| Error::InvalidData("dmarket sale date is not unix seconds".into()))?;
-        let sold_at = DateTime::from_timestamp(ts, 0)
-            .ok_or_else(|| Error::InvalidData("dmarket sale date out of range".into()))?;
+    for (index, sale) in rows.into_iter().enumerate() {
+        let sold_at = sale_timestamp(&sale)?;
+        let ts = sold_at.timestamp();
         if sold_at < since {
             continue;
         }
@@ -517,13 +530,39 @@ impl MarketClient for DMarketClient {
     async fn recent_sales(&self, item: &ItemId, since: DateTime<Utc>) -> Result<Vec<Sale>> {
         validate_item(item)?;
         let limit = self.config.sales_limit.to_string();
-        let query = query_string(&[
+        let mut query = query_string(&[
             ("gameId", self.config.game_id.as_str()),
             ("title", item.market_hash_name.as_str()),
             ("limit", limit.as_str()),
         ]);
-        let body = self.signed_get(&LAST_SALES_ENDPOINT, &query).await?;
-        parse_last_sales(&body, item, since)
+        let mut rows = Vec::new();
+        let mut previous = Vec::new();
+        loop {
+            let body = self.signed_get(&LAST_SALES_ENDPOINT, &query).await?;
+            let RawSales { sales } = parse_json("dmarket last sales", &body)?;
+            let mut reached_since = false;
+            for sale in &sales {
+                reached_since |= sale_timestamp(sale)? < since;
+            }
+            let last_page = sales.len() < self.config.sales_limit as usize || reached_since;
+            if !last_page && body == previous {
+                return Err(Error::InvalidData(
+                    "dmarket sales pagination did not advance".into(),
+                ));
+            }
+            rows.extend(sales);
+            if last_page {
+                break;
+            }
+            previous = body;
+            query = query_string(&[
+                ("gameId", self.config.game_id.as_str()),
+                ("title", item.market_hash_name.as_str()),
+                ("limit", limit.as_str()),
+                ("offset", &rows.len().to_string()),
+            ]);
+        }
+        convert_last_sales(rows, item, since)
     }
 
     /// Lowest unlocked ask across the wear tier (`float_bucket: None`).

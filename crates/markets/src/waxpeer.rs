@@ -34,6 +34,7 @@ const DETAILED_BUY_ORDERS: Endpoint = Endpoint {
     path: "/v2/buy-orders",
 };
 const BID_PAGE_SIZE: usize = 100;
+const MAX_BID_OWNERS: u32 = 100;
 const MAX_BID_PAGES: usize = 3;
 
 fn add_detailed_bid_page(
@@ -94,16 +95,21 @@ fn detailed_depth(
     for price in owners.into_values() {
         *depth.entry(price).or_default() += 1;
     }
+    let mut remaining = MAX_BID_OWNERS;
     depth
         .into_iter()
         .rev()
-        .map(|(price, quantity)| BuyOrder {
-            platform: Platform::Waxpeer,
-            item: item.clone(),
-            float_bucket: None,
-            price,
-            quantity,
-            observed_at: at,
+        .map_while(|(price, quantity)| {
+            let quantity = remaining.min(quantity);
+            remaining -= quantity;
+            (quantity > 0).then(|| BuyOrder {
+                platform: Platform::Waxpeer,
+                item: item.clone(),
+                float_bucket: None,
+                price,
+                quantity,
+                observed_at: at,
+            })
         })
         .collect()
 }
@@ -345,7 +351,7 @@ impl MarketClient for WaxpeerClient {
                     .await?;
                 observed_at = Some(self.http.clock().now());
                 let rows = add_detailed_bid_page(&body, item, game, &mut owners)?;
-                if rows < BID_PAGE_SIZE || owners.len() >= BID_PAGE_SIZE {
+                if rows < BID_PAGE_SIZE || owners.len() >= MAX_BID_OWNERS as usize {
                     break;
                 }
             }
@@ -375,6 +381,29 @@ impl MarketClient for WaxpeerClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn detailed_depth_caps_owners_at_the_best_prices() {
+        let item = ItemId {
+            market_hash_name: "Alien Red".into(),
+            wear_tier: cs2_arb_core::WearTier::NotApplicable,
+        };
+        let owners = (0..150)
+            .map(|index| {
+                (
+                    index.to_string(),
+                    Money(if index < 60 { 1200 } else { 1100 }),
+                )
+            })
+            .collect();
+        let bids = detailed_depth(owners, &item, DateTime::<Utc>::UNIX_EPOCH);
+        assert_eq!(
+            bids.iter()
+                .map(|bid| (bid.price, bid.quantity))
+                .collect::<Vec<_>>(),
+            [(Money(1200), 60), (Money(1100), 40)]
+        );
+    }
 
     #[test]
     fn detailed_depth_counts_one_funded_unit_per_distinct_unrestricted_owner() {

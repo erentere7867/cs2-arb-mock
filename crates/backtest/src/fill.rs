@@ -28,8 +28,8 @@ pub trait FillModel {
         now
     }
 
-    fn venue_trade_holds(&self) -> Vec<VenueTradeHold> {
-        Vec::new()
+    fn venue_trade_holds(&self) -> Option<Vec<VenueTradeHold>> {
+        None
     }
 
     fn preview_fill(&self, _strategy: &str, order: &Order) -> Option<(Money, u32)> {

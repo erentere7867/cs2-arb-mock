@@ -7,6 +7,7 @@ use cs2_arb_core::{
     Error, FeeSchedule, FeeSchedules, Fill, FloatBucket, ItemId, Listing, ManualClock, Money,
     Order, OrderSide, Platform, Position, PriceSnapshot, Result, Sale, SimulationMode,
 };
+use cs2_arb_sim::venues::VenueTradeHold;
 use cs2_arb_sim::{wear::quote_bucket, MockExecutor, SimConfig};
 use cs2_arb_strategy::executor::execute_with_risk;
 use cs2_arb_strategy::{
@@ -134,6 +135,7 @@ pub struct SimFillModel<'a> {
     kill_switch: KillSwitch,
     sessions: RefCell<HashMap<String, Session>>,
     venue_accounts: Option<cs2_arb_sim::venues::VenueAccounts>,
+    active_platforms: Option<Vec<Platform>>,
     sim_config: SimConfig,
 }
 
@@ -151,6 +153,7 @@ impl<'a> SimFillModel<'a> {
             kill_switch,
             sessions: RefCell::default(),
             venue_accounts: None,
+            active_platforms: None,
             sim_config: SimConfig::default(),
         }
     }
@@ -162,6 +165,11 @@ impl<'a> SimFillModel<'a> {
 
     pub fn with_sim_config(mut self, config: SimConfig) -> Self {
         self.sim_config = config;
+        self
+    }
+
+    pub fn with_active_platforms(mut self, platforms: Vec<Platform>) -> Self {
+        self.active_platforms = Some(platforms);
         self
     }
 }
@@ -176,10 +184,10 @@ impl FillModel for SimFillModel<'_> {
             .sample_fill_time(now)
     }
 
-    fn venue_trade_holds(&self) -> Vec<cs2_arb_sim::venues::VenueTradeHold> {
-        self.venue_accounts
-            .as_ref()
-            .map_or_else(Vec::new, cs2_arb_sim::venues::VenueAccounts::trade_holds)
+    fn venue_trade_holds(&self) -> Option<Vec<VenueTradeHold>> {
+        self.venue_accounts.as_ref().map(|accounts| {
+            accounts.trade_holds_for(self.active_platforms.as_deref().unwrap_or(&Platform::ALL))
+        })
     }
 
     fn preview_fill(&self, strategy: &str, order: &Order) -> Option<(Money, u32)> {
@@ -377,9 +385,6 @@ impl SpreadAdapter {
         config: &SpreadConfig,
         holds: &[cs2_arb_sim::venues::VenueTradeHold],
     ) -> Result<()> {
-        if holds.is_empty() {
-            return config.validate();
-        }
         for hold in holds {
             let duration = Duration::try_seconds(hold.seconds)
                 .filter(|_| hold.seconds >= 0)
@@ -401,7 +406,11 @@ impl StrategyAdapter for SpreadAdapter {
     }
 
     fn validate(&self, fill_model: &dyn FillModel) -> Result<()> {
-        Self::validate_holds(&self.config, &fill_model.venue_trade_holds())
+        if let Some(holds) = fill_model.venue_trade_holds() {
+            Self::validate_holds(&self.config, &holds)
+        } else {
+            self.config.validate()
+        }
     }
 
     fn on_step(&mut self, view: &MarketView<'_>) -> Result<Vec<Order>> {
@@ -430,17 +439,19 @@ impl StrategyAdapter for SpreadAdapter {
         let venue_holds = view.venue_trade_holds();
         let hold = |platform| {
             venue_holds
+                .as_deref()
+                .unwrap_or_default()
                 .iter()
                 .find(|hold| hold.platform == platform)
                 .map(|hold| Duration::seconds(hold.seconds))
         };
         let quotes: Vec<_> = view
             .latest_quotes()
-            .filter(|quote| venue_holds.is_empty() || hold(quote.platform).is_some())
+            .filter(|quote| venue_holds.is_none() || hold(quote.platform).is_some())
             .cloned()
             .collect();
         let mut executable = Vec::new();
-        let candidates = if !venue_holds.is_empty() {
+        let candidates = if venue_holds.is_some() {
             evaluate_spread_with_holds(&quotes, view.fees, &self.config, view.now, hold)?
         } else {
             evaluate_spread(&quotes, view.fees, &self.config, view.now)?

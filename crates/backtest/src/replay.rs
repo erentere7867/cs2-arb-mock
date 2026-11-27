@@ -135,7 +135,7 @@ pub struct MarketView<'a> {
 }
 
 impl<'a> MarketView<'a> {
-    pub fn venue_trade_holds(&self) -> Vec<cs2_arb_sim::venues::VenueTradeHold> {
+    pub fn venue_trade_holds(&self) -> Option<Vec<cs2_arb_sim::venues::VenueTradeHold>> {
         self.fill_model.venue_trade_holds()
     }
 
@@ -725,12 +725,12 @@ impl<F: FillModel> Backtester<F> {
         Ok(PerformanceReport {
             disclaimer: REPORT_DISCLAIMER.to_owned(),
             window,
-            trade_hold_secs: if venue_trade_holds.is_empty() {
+            trade_hold_secs: if venue_trade_holds.is_none() {
                 hold_secs(&self.fill_model)
             } else {
                 0
             },
-            venue_trade_holds,
+            venue_trade_holds: venue_trade_holds.unwrap_or_default(),
             totals,
             strategies: per_strategy,
             trades: all_trades,

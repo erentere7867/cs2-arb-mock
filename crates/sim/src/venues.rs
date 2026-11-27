@@ -139,9 +139,10 @@ impl VenueAccounts {
         after(at, self.venue(platform)?.trade_hold_seconds)
     }
 
-    pub fn trade_holds(&self) -> Vec<VenueTradeHold> {
+    pub fn trade_holds_for(&self, platforms: &[Platform]) -> Vec<VenueTradeHold> {
         Platform::ALL
             .into_iter()
+            .filter(|platform| platforms.contains(platform))
             .filter_map(|platform| {
                 self.rules
                     .venues

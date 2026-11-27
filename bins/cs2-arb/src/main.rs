@@ -257,11 +257,18 @@ async fn run(cli: Cli) -> Result<()> {
     let audit_enabled = settings.platform_audit
         || settings.venue_accounts.is_some()
         || settings.relist.instant_sale;
-    let mut audited_markets = markets.to_vec();
+    let live_platforms = match &cli.command {
+        Command::RunMock {
+            live_market_data: true,
+            platform,
+            ..
+        } => Some(settings.live_platforms(platform.clone(), &Secrets::from_env())?),
+        _ => None,
+    };
+    let audited_markets = live_platforms.as_deref().unwrap_or(markets).to_vec();
     let accounts = if let Some(rules) = &settings.venue_accounts {
         rules.validate(markets)?;
         let accounts = VenueAccounts::new(rules.clone(), fees.clone());
-        SpreadAdapter::validate_holds(&settings.spread, &accounts.trade_holds())?;
         for schedule in [
             &mut fees.skinport,
             &mut fees.csfloat,
@@ -276,23 +283,25 @@ async fn run(cli: Cli) -> Result<()> {
     } else {
         None
     };
-    let mut live_data = false;
+    if let Some(accounts) = &accounts {
+        SpreadAdapter::validate_holds(
+            &settings.spread,
+            &accounts.trade_holds_for(&audited_markets),
+        )?;
+    }
     let (inputs, output) = match cli.command {
         Command::RunMock {
             history,
-            live_market_data,
-            platform,
             samples,
             interval_seconds,
             database,
+            ..
         } => {
-            let inputs = if live_market_data {
-                live_data = true;
-                audited_markets = settings.live_platforms(platform, &Secrets::from_env())?;
+            let inputs = if let Some(platforms) = &live_platforms {
                 live::collect(
                     &config,
                     &fees,
-                    audited_markets.clone(),
+                    platforms.clone(),
                     samples,
                     interval_seconds,
                     (game == Game::Cs2)
@@ -328,8 +337,9 @@ async fn run(cli: Cli) -> Result<()> {
         settings,
         kill_switch.clone(),
         accounts.clone(),
+        &audited_markets,
     )?;
-    if audit_enabled || live_data {
+    if audit_enabled || live_platforms.is_some() {
         report.unverified_platform_assumptions = platform_audit::unverified(&audited_markets);
     }
     let peg_dashboard = peg_runner::run_peg_bid_engine(
@@ -471,7 +481,7 @@ fn simulate(
     settings: Settings,
     kill_switch: KillSwitch,
 ) -> Result<PerformanceReport> {
-    simulate_with_accounts(inputs, fees, settings, kill_switch, None)
+    simulate_with_accounts(inputs, fees, settings, kill_switch, None, &Platform::ALL)
 }
 
 fn simulate_with_accounts(
@@ -480,6 +490,7 @@ fn simulate_with_accounts(
     settings: Settings,
     kill_switch: KillSwitch,
     accounts: Option<VenueAccounts>,
+    active_platforms: &[Platform],
 ) -> Result<PerformanceReport> {
     let mut strategies: Vec<Box<dyn StrategyAdapter>> = vec![
         Box::new(SpreadAdapter::new(settings.spread)),
@@ -488,7 +499,9 @@ fn simulate_with_accounts(
     let mut model = SimFillModel::new(&inputs.depth, fees.clone(), settings.risk, kill_switch)
         .with_sim_config(settings.simulation.build()?);
     if let Some(accounts) = accounts {
-        model = model.with_venue_accounts(accounts);
+        model = model
+            .with_venue_accounts(accounts)
+            .with_active_platforms(active_platforms.to_vec());
     }
     Backtester::with_fill_model(BacktestConfig::new(fees), model).run(
         SimulationMode,
@@ -565,6 +578,68 @@ mod tests {
             DMARKET_SECRET_KEY => secret.map(str::to_owned),
             _ => None,
         })
+    }
+
+    #[test]
+    fn selected_live_venues_scope_spread_hold_validation() {
+        let settings: Settings = toml::from_str(
+            r#"
+markets = ["skinport", "csfloat"]
+
+[spread]
+price_drift_pct_per_day = 10.0
+
+[venue_accounts.venues.skinport]
+starting_cash = 1000
+trade_hold_seconds = 86400
+sale_balance_hold_seconds = 0
+transfer_in_seconds = 0
+transfer_out_seconds = 0
+
+[venue_accounts.venues.csfloat]
+starting_cash = 1000
+trade_hold_seconds = 864000
+sale_balance_hold_seconds = 0
+transfer_in_seconds = 0
+transfer_out_seconds = 0
+"#,
+        )
+        .unwrap();
+        let rules = settings.venue_accounts.clone().unwrap();
+        rules
+            .validate(settings.market_allowlist().unwrap())
+            .unwrap();
+        let selected = settings
+            .live_platforms(vec![Market::Skinport], &dmarket_secrets(None, None))
+            .unwrap();
+        let fees = FeeSchedules::from_toml(include_str!("../../../config/default.toml")).unwrap();
+        let accounts = VenueAccounts::new(rules, fees.clone());
+        SpreadAdapter::validate_holds(&settings.spread, &accounts.trade_holds_for(&selected))
+            .unwrap();
+        assert!(SpreadAdapter::validate_holds(
+            &settings.spread,
+            &accounts.trade_holds_for(&[Platform::CsFloat])
+        )
+        .is_err());
+        let inputs = Inputs {
+            snapshots: Vec::new(),
+            events: Vec::new(),
+            depth: MarketDepth::default(),
+            buy_orders: Vec::new(),
+            bid_refreshes: Vec::new(),
+            has_observed_bids: true,
+        };
+        let report = simulate_with_accounts(
+            &inputs,
+            fees,
+            settings,
+            KillSwitch::new(),
+            Some(accounts),
+            &selected,
+        )
+        .unwrap();
+        assert_eq!(report.venue_trade_holds.len(), 1);
+        assert_eq!(report.venue_trade_holds[0].platform, Platform::Skinport);
     }
 
     #[test]

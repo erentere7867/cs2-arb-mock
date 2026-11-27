@@ -6,7 +6,7 @@ prerequisites and GitHub access. From that checkout, install or refresh the VPS 
 
 ```sh
 umask 077
-test -f .env || install -m 600 /dev/null .env
+test -f .env || install -m 600 .env.example .env
 chmod 600 .env
 sudo install -m 644 deploy/*.service /etc/systemd/system/
 sudo install -m 755 deploy/cs2-arb-run deploy/cs2-arb-update /usr/local/bin/
@@ -20,11 +20,12 @@ also accepts another branch on `origin`. It refuses a dirty checkout and builds
 the exact remote commit before switching the runtime release and restarting.
 The deployed branch and commit are in `/home/ubuntu/cs2-arb-mock-data/current/revision`.
 
-Add `CSFLOAT_API_KEY` to `/home/ubuntu/cs2-arb-mock/.env` when available (systemd
-`KEY=value` syntax, no `export`), then run
-`sudo systemctl restart cs2-arb-mock@cs2`. The CS2 and Rust jobs use their
-branch's default live venues.
-Skinport reads are public; DMarket's existing offers adapter requires both
+See [`.env.example`](../.env.example) for the credential names. If `.env`
+already exists, edit it in place rather than replacing it. Add `CSFLOAT_API_KEY`
+to `/home/ubuntu/cs2-arb-mock/.env` when available (systemd `KEY=value` syntax,
+no `export`), then run `sudo systemctl restart cs2-arb-mock@cs2`.
+The CS2 and Rust jobs use their branch's default live venues.
+Skinport and Waxpeer reads are public; DMarket's existing offers adapter requires both
 credentials and opt-in, so these jobs do not use it by default.
 
 To block new simulated orders in both jobs, create

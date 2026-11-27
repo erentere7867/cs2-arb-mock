@@ -549,11 +549,16 @@ impl PegBidStrategy {
             if target_exceeds_ceiling
                 || ceiling.is_none_or(|ceiling| active.order.limit_price > ceiling)
             {
-                cancelled.push(key.clone());
+                let bypass_cooldown = self.config.lower_to_ceiling
+                    && ceiling.is_some_and(|ceiling| active.order.limit_price > ceiling);
+                cancelled.push((key.clone(), bypass_cooldown));
             }
         }
-        for key in cancelled {
+        for (key, bypass_cooldown) in cancelled {
             self.active_bids.remove(&key);
+            if bypass_cooldown {
+                self.last_updated.remove(&key);
+            }
         }
         Ok(())
     }
@@ -743,6 +748,57 @@ mod tests {
                 observed_at: now - Duration::hours(i as i64 + 1),
             });
         }
+    }
+
+    #[test]
+    fn cancelled_bid_above_a_lower_ceiling_can_be_replaced_during_cooldown() {
+        let now = t(12, 0);
+        let platform = Platform::CsFloat;
+        let item = item();
+        let fees = fees();
+        let config = PegBidConfig {
+            lower_to_ceiling: true,
+            ..PegBidConfig::default()
+        };
+        let mut strategy = PegBidStrategy::new(config.clone()).unwrap();
+        seed_median(&mut strategy, platform, 10_000, now);
+        strategy.ingest_buy_order(BuyOrder {
+            platform,
+            item: item.clone(),
+            float_bucket: None,
+            price: Money(8_500),
+            quantity: 1,
+            observed_at: now,
+        });
+        assert!(matches!(
+            strategy
+                .evaluate_item(platform, &item, None, &fees, now)
+                .unwrap(),
+            PegBidDecision::Placed(_)
+        ));
+
+        let now = now + Duration::seconds(1);
+        for _ in 0..4 {
+            strategy.observe_snapshot(&PriceSnapshot {
+                platform,
+                item: item.clone(),
+                float_bucket: None,
+                price: Money(8_000),
+                observed_at: now,
+            });
+        }
+        strategy.cancel_unprofitable_bids(&fees, now).unwrap();
+        assert!(strategy.active_bids().is_empty());
+        let PegBidDecision::Placed(replacement) = strategy
+            .evaluate_item(platform, &item, None, &fees, now)
+            .unwrap()
+        else {
+            panic!("safety repricing should bypass cooldown");
+        };
+        let ceiling = compute_effective_ceiling(Money(8_000), fees.get(platform), &config)
+            .unwrap()
+            .unwrap();
+        assert_eq!(replacement.order.limit_price, ceiling);
     }
 
     #[test]

@@ -1,3 +1,4 @@
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -225,14 +226,22 @@ async fn main() -> ExitCode {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_writer(std::io::stderr)
         .init();
-    if let Err(err) = run(cli).await {
+    let sources = live::MarketSources {
+        secrets: &Secrets::from_env(),
+        base_url_override: None,
+    };
+    if let Err(err) = run(cli, &sources, io::stdout()).await {
         eprintln!("{err}");
         return ExitCode::FAILURE;
     }
     ExitCode::SUCCESS
 }
 
-async fn run(cli: Cli) -> Result<()> {
+async fn run(
+    cli: Cli,
+    market_sources: &live::MarketSources<'_>,
+    mut mock_report: impl Write,
+) -> Result<()> {
     let config = read(&cli.config)?;
     if let Command::Watch { database, once } = cli.command {
         #[derive(Deserialize, Default)]
@@ -262,7 +271,7 @@ async fn run(cli: Cli) -> Result<()> {
             live_market_data: true,
             platform,
             ..
-        } => Some(settings.live_platforms(platform.clone(), &Secrets::from_env())?),
+        } => Some(settings.live_platforms(platform.clone(), market_sources.secrets)?),
         _ => None,
     };
     let audited_markets = live_platforms.as_deref().unwrap_or(markets).to_vec();
@@ -311,6 +320,7 @@ async fn run(cli: Cli) -> Result<()> {
                     settings.relist.instant_sale,
                     settings.live_sales_lookback_days(),
                     settings.simulation.build()?.max_listing_age,
+                    market_sources,
                 )
                 .await?
             } else {
@@ -360,7 +370,13 @@ async fn run(cli: Cli) -> Result<()> {
     if let Some(directory) = output {
         write_reports(&directory, &report, &peg_dashboard)?;
     } else {
-        print!("{}{}", report.to_markdown(), peg_dashboard.to_markdown());
+        write!(
+            mock_report,
+            "{}{}",
+            report.to_markdown(),
+            peg_dashboard.to_markdown()
+        )
+        .map_err(|err| Error::Storage(err.to_string()))?;
     }
     Ok(())
 }
@@ -554,8 +570,84 @@ fn write_reports(
 #[cfg(test)]
 mod tests {
     use cs2_arb_backtest::ops::secrets::vars::{DMARKET_PUBLIC_KEY, DMARKET_SECRET_KEY};
+    use serde_json::json;
+    use wiremock::matchers::{method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::*;
+
+    #[tokio::test]
+    async fn cs2_live_batch_writes_a_report_with_only_waxpeer_quotes() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/items"))
+            .and(query_param("app_id", "730"))
+            .respond_with(ResponseTemplate::new(403))
+            .expect(1..)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/listings"))
+            .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "60"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/prices/snapshot"))
+            .and(query_param("game", "csgo"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "success": true,
+                "items": [{
+                    "name": "AK-47 | Redline (Field-Tested)",
+                    "item_id": "ask-1",
+                    "price": 25000,
+                }],
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/buy-orders/snapshot"))
+            .and(query_param("game", "csgo"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "success": true,
+                "offers": [],
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let config = concat!(env!("CARGO_MANIFEST_DIR"), "/../../config/default.toml");
+        let cli = Cli::try_parse_from([
+            "cs2-arb",
+            "--config",
+            config,
+            "run-mock",
+            "--live-market-data",
+            "--samples",
+            "1",
+            "--database",
+            ":memory:",
+        ])
+        .unwrap();
+        let sources = live::MarketSources {
+            secrets: &Secrets::default(),
+            base_url_override: Some(&server.uri()),
+        };
+        let mut report = tempfile::NamedTempFile::new().unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            run(cli, &sources, report.as_file_mut()),
+        )
+        .await
+        .expect("mock batch timed out")
+        .unwrap();
+
+        let markdown = read(report.path()).unwrap();
+        assert!(markdown.starts_with("# Backtest performance report"));
+        assert!(markdown.contains("· 1 snapshots ·"));
+        assert!(markdown.contains("Total P&L"));
+    }
 
     #[test]
     fn live_sales_lookback_covers_configured_simulation_window() {
@@ -837,13 +929,17 @@ amount = 100
 
     #[test]
     fn shipped_profiles_add_dmarket_to_default_live_reads_only_with_both_keys() {
-        for (config, other_venue) in [
+        let profiles: [(&str, &[Platform]); 2] = [
             (
                 include_str!("../../../config/default.toml"),
-                Platform::CsFloat,
+                &[Platform::Skinport, Platform::CsFloat, Platform::Waxpeer],
             ),
-            (include_str!("../../../config/rust.toml"), Platform::Waxpeer),
-        ] {
+            (
+                include_str!("../../../config/rust.toml"),
+                &[Platform::Skinport, Platform::Waxpeer],
+            ),
+        ];
+        for (config, public_platforms) in profiles {
             let settings: Settings = toml::from_str(config).unwrap();
             let public = Some(EXAMPLE_DMARKET_PUBLIC);
             let secret = Some(EXAMPLE_DMARKET_SEED);
@@ -854,7 +950,7 @@ amount = 100
                 (dmarket_secrets(public, Some(" ")), false),
                 (dmarket_secrets(public, secret), true),
             ] {
-                let mut expected = vec![Platform::Skinport, other_venue];
+                let mut expected = public_platforms.to_vec();
                 if enable {
                     expected.push(Platform::DMarket);
                 }
@@ -874,16 +970,17 @@ amount = 100
 
     #[test]
     fn malformed_or_mismatched_dmarket_keys_do_not_break_default_live_reads() {
-        for (config, public_platforms) in [
+        let profiles: [(&str, &[Platform]); 2] = [
             (
                 include_str!("../../../config/default.toml"),
-                [Platform::Skinport, Platform::CsFloat],
+                &[Platform::Skinport, Platform::CsFloat, Platform::Waxpeer],
             ),
             (
                 include_str!("../../../config/rust.toml"),
-                [Platform::Skinport, Platform::Waxpeer],
+                &[Platform::Skinport, Platform::Waxpeer],
             ),
-        ] {
+        ];
+        for (config, public_platforms) in profiles {
             let settings: Settings = toml::from_str(config).unwrap();
             let mismatched_seed = "00".repeat(32);
             for seed in ["not-hex", mismatched_seed.as_str()] {

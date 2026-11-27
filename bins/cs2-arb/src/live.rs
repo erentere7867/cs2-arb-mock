@@ -22,6 +22,19 @@ use crate::{bundled_snapshots, watch, Inputs, Market};
 
 type MarketClients = Vec<(Platform, Box<dyn MarketClient>)>;
 
+pub struct MarketSources<'a> {
+    pub secrets: &'a Secrets,
+    pub base_url_override: Option<&'a str>,
+}
+
+impl MarketSources<'_> {
+    fn override_base_url(&self, base_url: &mut String) {
+        if let Some(url) = self.base_url_override {
+            *base_url = url.into();
+        }
+    }
+}
+
 pub fn dmarket_credentials(secrets: &Secrets) -> Result<DMarketCredentials> {
     let (public, secret) = secrets.require_dmarket()?;
     DMarketCredentials::from_hex(public.expose_secret(), secret.expose_secret())
@@ -67,46 +80,52 @@ fn make_clients(
     game: Game,
     instant_sale: bool,
     waxpeer_api_key: Option<String>,
+    sources: &MarketSources<'_>,
 ) -> Result<MarketClients> {
     let net = NetConfig::from_toml(source)?;
     let gate: Arc<dyn RequestGate> = Arc::new(NetGate(Arc::new(build_limiter(&net, &platforms)?)));
     let clock = Arc::new(SystemClock);
-    let secrets = Secrets::from_env();
     let mut seen = HashSet::new();
     let mut clients: Vec<(Platform, Box<dyn MarketClient>)> = Vec::new();
     for platform in platforms.into_iter().filter(|p| seen.insert(*p)) {
         let schedule = fees.get(platform);
         let client: Box<dyn MarketClient> = match platform {
-            Platform::Skinport => Box::new(ResilientMarket::new(
-                SkinportClient::with_config(
-                    schedule,
-                    SkinportConfig {
-                        game,
-                        tradable_only: true,
-                        ..SkinportConfig::default()
-                    },
-                    gate.clone(),
-                    clock.clone(),
-                )?,
-                net.retry,
-            )),
+            Platform::Skinport => {
+                let mut config = SkinportConfig {
+                    game,
+                    tradable_only: true,
+                    ..SkinportConfig::default()
+                };
+                sources.override_base_url(&mut config.base_url);
+                Box::new(ResilientMarket::new(
+                    SkinportClient::with_config(schedule, config, gate.clone(), clock.clone())?,
+                    net.retry,
+                ))
+            }
             Platform::Waxpeer => {
-                let mut client = WaxpeerClient::new(schedule, game, gate.clone(), clock.clone())?;
+                let mut client = if let Some(url) = sources.base_url_override {
+                    WaxpeerClient::with_base_url(schedule, game, url, gate.clone(), clock.clone())?
+                } else {
+                    WaxpeerClient::new(schedule, game, gate.clone(), clock.clone())?
+                };
                 if instant_sale {
                     client = client.with_detailed_buy_orders(waxpeer_api_key.clone());
                 }
                 Box::new(ResilientMarket::new(client, net.retry))
             }
             Platform::CsFloat => {
-                let credentials = secrets
+                let credentials = sources
+                    .secrets
                     .csfloat_api_key
                     .as_ref()
                     .map(|key| CsFloatCredentials::new(key.expose_secret()))
                     .transpose()?;
+                let mut config = CsFloatConfig::default();
+                sources.override_base_url(&mut config.base_url);
                 Box::new(ResilientMarket::new(
                     CsFloatClient::with_config(
                         schedule,
-                        CsFloatConfig::default(),
+                        config,
                         credentials,
                         gate.clone(),
                         clock.clone(),
@@ -115,11 +134,13 @@ fn make_clients(
                 ))
             }
             Platform::DMarket => {
-                let credentials = dmarket_credentials(&secrets)?;
+                let credentials = dmarket_credentials(sources.secrets)?;
+                let mut config = DMarketConfig::for_game(game);
+                sources.override_base_url(&mut config.base_url);
                 Box::new(ResilientMarket::new(
                     DMarketClient::with_config(
                         schedule,
-                        DMarketConfig::for_game(game),
+                        config,
                         credentials,
                         gate.clone(),
                         clock.clone(),
@@ -163,6 +184,7 @@ pub async fn collect(
     instant_sale: bool,
     sales_lookback_days: i64,
     max_listing_age: TimeDelta,
+    sources: &MarketSources<'_>,
 ) -> Result<Inputs> {
     let sales_lookback = TimeDelta::try_days(sales_lookback_days)
         .ok_or_else(|| Error::InvalidConfig("live sales lookback is out of range".into()))?;
@@ -177,7 +199,15 @@ pub async fn collect(
         .then(|| std::env::var("WAXPEER_API_KEY").ok())
         .flatten();
     let waxpeer_has_key = waxpeer_api_key.is_some();
-    let clients = make_clients(config, fees, platforms, game, instant_sale, waxpeer_api_key)?;
+    let clients = make_clients(
+        config,
+        fees,
+        platforms,
+        game,
+        instant_sale,
+        waxpeer_api_key,
+        sources,
+    )?;
     let mut events = Vec::new();
     let queue = if let Some((database, hours)) = branch_updates {
         let queue = EventQueue::open(database).await?;

@@ -27,6 +27,8 @@ The simulator requires ten verified sales in the last seven days on the order's 
 
 ## Run
 
+For unattended Linux operation and reading live mock results, see the [VPS operations guide](deploy/README.md).
+
 From the workspace root:
 
 ```sh

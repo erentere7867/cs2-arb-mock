@@ -17,6 +17,8 @@ use cs2_arb_strategy::{
 };
 use serde::Serialize;
 
+pub type EmptyBidRefresh = (DateTime<Utc>, Platform, ItemId);
+
 /// One trade-locked inventory entry displayed on the dashboard.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct LockedInventoryRow {
@@ -229,6 +231,7 @@ pub fn run_peg_bid_engine(
     snapshots: &[PriceSnapshot],
     sales: &[Sale],
     buy_orders: &[BuyOrder],
+    empty_bid_refreshes: &[EmptyBidRefresh],
     fees: &FeeSchedules,
     peg_config: PegBidConfig,
     relist_config: RelistConfig,
@@ -270,16 +273,20 @@ pub fn run_peg_bid_engine(
 
     let mut sorted_bids = buy_orders.to_vec();
     sorted_bids.sort_by_key(|b| b.observed_at);
+    let mut empty_bid_refreshes = empty_bid_refreshes.to_vec();
+    empty_bid_refreshes.sort_by_key(|&(at, _, _)| at);
 
     let mut times: BTreeSet<DateTime<Utc>> = BTreeSet::new();
     times.extend(sorted_snapshots.iter().map(|s| s.observed_at));
     times.extend(sorted_sales.iter().map(|s| s.sold_at));
     times.extend(sorted_bids.iter().map(|b| b.observed_at));
+    times.extend(empty_bid_refreshes.iter().map(|&(at, _, _)| at));
     let replay_end = times.last().copied();
 
     let mut snap_idx = 0usize;
     let mut sale_idx = 0usize;
     let mut bid_idx = 0usize;
+    let mut empty_bid_idx = 0usize;
     let mut bids_placed = 0usize;
     let mut bids_filled = 0usize;
     let mut last_now = None;
@@ -293,7 +300,10 @@ pub fn run_peg_bid_engine(
             || sorted_sales.get(sale_idx).is_some_and(|s| s.sold_at == now)
             || sorted_bids
                 .get(bid_idx)
-                .is_some_and(|b| b.observed_at == now);
+                .is_some_and(|b| b.observed_at == now)
+            || empty_bid_refreshes
+                .get(empty_bid_idx)
+                .is_some_and(|&(at, _, _)| at == now);
         if !market_tick
             && !resting_ttl.is_some_and(|ttl| {
                 simulator
@@ -381,6 +391,13 @@ pub fn run_peg_bid_engine(
             bid_idx += 1;
         }
         relist.observe_bids(&sorted_bids[bid_start..bid_idx]);
+        while let Some((_, platform, item)) = empty_bid_refreshes
+            .get(empty_bid_idx)
+            .filter(|(at, _, _)| *at == now)
+        {
+            relist.clear_bid_book(*platform, item);
+            empty_bid_idx += 1;
+        }
         let relist_step = relist.step(
             &sorted_sales[..sale_idx],
             &sorted_snapshots[..snap_idx],
@@ -707,6 +724,7 @@ mod tests {
             &snapshots,
             &sales,
             &bids,
+            &[],
             &fees(),
             PegBidConfig {
                 resting_bid_ttl_secs: Some(7 * 86_400 + 4 * 3_600),
@@ -782,6 +800,7 @@ mod tests {
             &snapshots,
             &sales,
             &buy_orders,
+            &[],
             &fees(),
             PegBidConfig::default(),
             RelistConfig::default(),
@@ -833,6 +852,7 @@ mod tests {
             &snapshots,
             &sales,
             &buy_orders,
+            &[],
             &fees(),
             PegBidConfig::default(),
             RelistConfig::default(),

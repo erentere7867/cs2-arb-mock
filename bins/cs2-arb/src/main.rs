@@ -299,6 +299,7 @@ async fn run(cli: Cli) -> Result<()> {
         &inputs.snapshots,
         inputs.depth.sales(),
         &inputs.buy_orders,
+        &inputs.empty_bid_refreshes,
         &fees,
         peg_config,
         relist_config,
@@ -321,6 +322,7 @@ struct Inputs {
     events: Vec<MarketEvent>,
     depth: MarketDepth,
     buy_orders: Vec<BuyOrder>,
+    empty_bid_refreshes: Vec<peg_runner::EmptyBidRefresh>,
     has_observed_bids: bool,
 }
 
@@ -420,6 +422,7 @@ fn historical(game: Game, markets: &[Platform], args: HistoricalArgs) -> Result<
         events,
         depth,
         buy_orders,
+        empty_bid_refreshes: Vec::new(),
         has_observed_bids,
     })
 }
@@ -565,6 +568,7 @@ mod tests {
         let mut inputs = Inputs {
             depth: MarketDepth::from_snapshots(&snapshots),
             buy_orders: peg_runner::derive_offline_buy_orders(&snapshots),
+            empty_bid_refreshes: Vec::new(),
             has_observed_bids: false,
             snapshots,
             events,

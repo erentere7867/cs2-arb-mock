@@ -223,6 +223,11 @@ impl RelistEngine {
         }
     }
 
+    pub fn clear_bid_book(&mut self, platform: Platform, item: &ItemId) {
+        self.bids
+            .retain(|(venue, bid_item, _), _| *venue != platform || bid_item != item);
+    }
+
     fn time_adjusted(&self, platform: Platform, net: Money, wait: i64) -> i128 {
         let wait =
             i128::from(wait) + i128::from(*self.balance_hold_seconds.get(&platform).unwrap_or(&0));
@@ -848,6 +853,32 @@ mod tests {
             assert_eq!(breakdown.crypto_deposit, Money(100));
             assert_eq!(breakdown.platform_buy, Money(50));
         }
+    }
+
+    #[test]
+    fn empty_bid_refresh_prevents_instant_sale_into_recent_depth() {
+        let acquired = t(1, 12);
+        let now = t(8, 12);
+        let mut engine = RelistEngine::new(RelistConfig {
+            instant_sale: true,
+            ..RelistConfig::default()
+        })
+        .unwrap();
+        engine.track_position(make_position(acquired), acquired);
+        engine.observe_bids(&[BuyOrder {
+            platform: Platform::CsFloat,
+            item: item(),
+            float_bucket: None,
+            price: Money(12_000),
+            quantity: 1,
+            observed_at: now - Duration::seconds(1),
+        }]);
+        engine.clear_bid_book(Platform::CsFloat, &item());
+        let step = engine
+            .step(&make_sales(20, 10_000, now), &[], &fees(), now)
+            .unwrap();
+        assert!(step.realized_sales.is_empty());
+        assert_eq!(step.listed_orders.len(), 1);
     }
 
     #[test]

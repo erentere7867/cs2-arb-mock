@@ -6,7 +6,9 @@ use std::time::Duration;
 
 use chrono::TimeDelta;
 use common::{open, snapshot, t0};
-use cs2_arb_core::{Error, MarketEvent};
+use cs2_arb_core::{
+    Error, FloatBucket, Game, ItemId, MarketEvent, Money, Platform, PriceSnapshot, Sale, WearTier,
+};
 use cs2_arb_events::{
     Clock, EnqueueOptions, EventQueue, EventStatus, ManualClock, NackOutcome, NewTransition,
     QueueConfig, QueueStats, WatcherConfig,
@@ -26,6 +28,163 @@ fn config() -> QueueConfig {
         max_attempts: 3,
         default_lease: Duration::from_secs(30),
     }
+}
+
+#[tokio::test]
+async fn queue_creates_missing_database_directories() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("data/nested/events.db");
+    EventQueue::open(path.to_str().unwrap())
+        .await
+        .unwrap()
+        .close()
+        .await;
+    assert!(path.is_file());
+
+    let path = dir.path().join("another/nested/events.db");
+    let url = format!("sqlite://{}", path.display());
+    EventQueue::open(&url).await.unwrap().close().await;
+    assert!(path.is_file());
+}
+
+#[tokio::test]
+async fn queue_reopens_with_an_unknown_applied_migration() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("events.db");
+    let location = path.to_str().unwrap();
+    EventQueue::open(location).await.unwrap().close().await;
+
+    let options = sqlx::sqlite::SqliteConnectOptions::new().filename(&path);
+    let pool = sqlx::SqlitePool::connect_with(options).await.unwrap();
+    sqlx::query(
+        "INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time)
+         VALUES (99999999999999, 'future migration', TRUE, X'', 0)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    pool.close().await;
+
+    EventQueue::open(location).await.unwrap().close().await;
+}
+
+#[tokio::test]
+async fn market_history_survives_reopen_and_prunes_by_game() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("events.db");
+    let now = t0() + TimeDelta::nanoseconds(123_456);
+    let quote = PriceSnapshot {
+        item: ItemId {
+            market_hash_name: "Sample (Field-Tested)".into(),
+            wear_tier: WearTier::FieldTested,
+        },
+        platform: Platform::DMarket,
+        float_bucket: Some(FloatBucket::FieldTestedLow),
+        price: Money(1234),
+        observed_at: now - TimeDelta::days(7),
+    };
+    let old_quote = PriceSnapshot {
+        observed_at: now - TimeDelta::days(11),
+        ..quote.clone()
+    };
+    let sale = Sale {
+        id: "same-id".into(),
+        platform: quote.platform,
+        item: quote.item.clone(),
+        price: quote.price,
+        float_value: Some(0.18),
+        sold_at: quote.observed_at,
+        verified: true,
+    };
+    let other_venue = Sale {
+        platform: Platform::CsFloat,
+        ..sale.clone()
+    };
+    let old_sale = Sale {
+        id: "older".into(),
+        sold_at: old_quote.observed_at,
+        ..sale.clone()
+    };
+    let unverified = Sale {
+        id: "aggregate".into(),
+        verified: false,
+        ..sale.clone()
+    };
+    let rust_quote = PriceSnapshot {
+        item: ItemId {
+            market_hash_name: "Alien Red".into(),
+            wear_tier: WearTier::NotApplicable,
+        },
+        float_bucket: None,
+        ..old_quote.clone()
+    };
+    let rust_sale = Sale {
+        item: rust_quote.item.clone(),
+        float_value: None,
+        sold_at: rust_quote.observed_at,
+        ..sale.clone()
+    };
+    let start = now - TimeDelta::days(12);
+    let queue = EventQueue::open(path.to_str().unwrap()).await.unwrap();
+    for _ in 0..2 {
+        queue
+            .record_market_history(
+                Game::Cs2,
+                &[quote.clone(), old_quote.clone()],
+                &[
+                    sale.clone(),
+                    other_venue.clone(),
+                    old_sale.clone(),
+                    unverified.clone(),
+                ],
+                start,
+            )
+            .await
+            .unwrap();
+    }
+    queue
+        .record_market_history(
+            Game::Rust,
+            std::slice::from_ref(&rust_quote),
+            std::slice::from_ref(&rust_sale),
+            start,
+        )
+        .await
+        .unwrap();
+    queue.close().await;
+
+    let queue = EventQueue::open(path.to_str().unwrap()).await.unwrap();
+    let history = queue
+        .load_market_history(Game::Cs2, start, now)
+        .await
+        .unwrap();
+    assert_eq!(history.snapshots, vec![old_quote, quote.clone()]);
+    assert_eq!(
+        history.sales,
+        vec![old_sale, other_venue.clone(), sale.clone()]
+    );
+    let before = quote.observed_at - TimeDelta::nanoseconds(1);
+    let history = queue
+        .load_market_history(Game::Cs2, before, before)
+        .await
+        .unwrap();
+    assert!(history.snapshots.is_empty() && history.sales.is_empty());
+    queue
+        .record_market_history(Game::Cs2, &[], &[], now - TimeDelta::days(10))
+        .await
+        .unwrap();
+    let history = queue
+        .load_market_history(Game::Cs2, start, now)
+        .await
+        .unwrap();
+    assert_eq!(history.snapshots, vec![quote]);
+    assert_eq!(history.sales, vec![other_venue, sale]);
+    let history = queue
+        .load_market_history(Game::Rust, start, now)
+        .await
+        .unwrap();
+    assert_eq!(history.snapshots, vec![rust_quote]);
+    assert_eq!(history.sales, vec![rust_sale]);
 }
 
 #[tokio::test]

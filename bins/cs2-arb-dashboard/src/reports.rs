@@ -295,6 +295,9 @@ _None_
 | Mock Bids Placed | 10 |
 | Market Regime | Risk-off: market downtrend |
 | Broad Index 24h | -3.00% |
+| Regime History Quotes | 12 |
+| Regime History Verified Sales | 4 |
+| Regime History Oldest Observation | 2026-11-20T12:00:00+00:00 |
 | Realized Buy-Order P&L | $12.99 |
 ";
         let s = parse_summary(report);
@@ -308,6 +311,12 @@ _None_
         assert_eq!(metrics["Mock Bids Placed"], ["10"]);
         assert_eq!(metrics["Market Regime"], ["Risk-off: market downtrend"]);
         assert_eq!(metrics["Broad Index 24h"], ["-3.00%"]);
+        assert_eq!(metrics["Regime History Quotes"], ["12"]);
+        assert_eq!(metrics["Regime History Verified Sales"], ["4"]);
+        assert_eq!(
+            metrics["Regime History Oldest Observation"],
+            ["2026-11-20T12:00:00+00:00"]
+        );
         assert_eq!(metrics["Realized Buy-Order P&L"], ["$12.99"]);
     }
 }

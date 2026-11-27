@@ -8,6 +8,7 @@ use cs2_arb_core::{
     BuyOrder, Error, FeeSchedules, Game, ItemId, Listing, MarketClient, MarketEvent, Platform,
     PriceSnapshot, Result, SystemClock,
 };
+use cs2_arb_events::queue::MarketHistory;
 use cs2_arb_events::EventQueue;
 use cs2_arb_markets::{
     CsFloatClient, CsFloatConfig, CsFloatCredentials, DMarketClient, DMarketConfig,
@@ -21,6 +22,8 @@ use crate::peg_runner::BidRefresh;
 use crate::{bundled_snapshots, watch, Inputs, Market};
 
 type MarketClients = Vec<(Platform, Box<dyn MarketClient>)>;
+
+const MARKET_HISTORY_RETENTION: TimeDelta = TimeDelta::days(10);
 
 pub struct MarketSources<'a> {
     pub secrets: &'a Secrets,
@@ -179,13 +182,14 @@ pub async fn collect(
     platforms: Vec<Platform>,
     samples: u16,
     interval_seconds: u64,
-    branch_updates: Option<(&str, Option<i64>)>,
+    database: &str,
+    branch_update_window_hours: Option<i64>,
     game: Game,
     instant_sale: bool,
     sales_lookback_days: i64,
     max_listing_age: TimeDelta,
     sources: &MarketSources<'_>,
-) -> Result<Inputs> {
+) -> Result<(Inputs, MarketHistory)> {
     let sales_lookback = TimeDelta::try_days(sales_lookback_days)
         .ok_or_else(|| Error::InvalidConfig("live sales lookback is out of range".into()))?;
     let assets = bundled_snapshots(game)?;
@@ -208,10 +212,10 @@ pub async fn collect(
         waxpeer_api_key,
         sources,
     )?;
+    let queue = EventQueue::open(database).await?;
     let mut events = Vec::new();
-    let queue = if let Some((database, hours)) = branch_updates {
-        let queue = EventQueue::open(database).await?;
-        events = watch::recover_branch_updates(&queue, hours).await?;
+    if game == Game::Cs2 {
+        events = watch::recover_branch_updates(&queue, branch_update_window_hours).await?;
         // Restore already-consumed opens after a process restart. Later closes come through the queue.
         for window in queue.open_windows_at(game.app_id(), Utc::now()).await? {
             events.push(MarketEvent::PanicWindowOpened {
@@ -219,13 +223,12 @@ pub async fn collect(
                 opened_at: window.opened_at,
             });
         }
-        Some(queue)
-    } else {
-        None
-    };
+    }
     let mut snapshots = Vec::new();
+    let mut regime_quotes = Vec::new();
     let mut bid_refreshes = Vec::new();
     let mut depth = MarketDepth::default();
+    let started_at = Utc::now();
     for sample in 0..samples {
         if sample > 0 {
             tokio::time::sleep(Duration::from_secs(interval_seconds)).await;
@@ -288,30 +291,57 @@ pub async fn collect(
                             item: item.clone(),
                             float_bucket: bucket,
                             price: listing.price,
-                            observed_at: at,
+                            observed_at: if platform == Platform::Skinport {
+                                listing.observed_at
+                            } else {
+                                at
+                            },
                         });
                 }
             }
-            snapshots.extend(best.into_values());
+            for mut quote in best.into_values() {
+                regime_quotes.push(quote.clone());
+                quote.observed_at = at;
+                snapshots.push(quote);
+            }
             depth.replace_listings(at, platform, item, listings);
         }
-        if let Some(queue) = &queue {
-            watch::drain(queue, &mut events).await?;
+        if game == Game::Cs2 {
+            watch::drain(&queue, &mut events).await?;
         }
     }
+    let retain_since = started_at - MARKET_HISTORY_RETENTION;
+    queue
+        .record_market_history(game, &regime_quotes, depth.sales(), retain_since)
+        .await?;
     if snapshots.is_empty() {
         return Err(Error::InvalidData(
             "no usable quotes from the selected read-only markets".into(),
         ));
     }
-    Ok(Inputs {
-        snapshots,
-        events,
-        depth,
-        buy_orders: Vec::new(),
-        bid_refreshes,
-        has_observed_bids: true,
-    })
+    let mut history = queue
+        .load_market_history(game, retain_since, Utc::now())
+        .await?;
+    let in_scope = |platform, item: &ItemId| {
+        seen.contains(item) && clients.iter().any(|(active, _)| *active == platform)
+    };
+    history
+        .snapshots
+        .retain(|quote| in_scope(quote.platform, &quote.item));
+    history
+        .sales
+        .retain(|sale| in_scope(sale.platform, &sale.item));
+    Ok((
+        Inputs {
+            snapshots,
+            events,
+            depth,
+            buy_orders: Vec::new(),
+            bid_refreshes,
+            has_observed_bids: true,
+        },
+        history,
+    ))
 }
 
 fn record_bid_poll(

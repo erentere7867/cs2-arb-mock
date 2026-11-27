@@ -68,7 +68,11 @@ cargo run --bin cs2-arb -- run-mock --live-market-data \
   --platform csfloat --samples 5 --interval-seconds 120 --database data/events.db
 ```
 
-The CS2 live reader consumes watcher events from the same SQLite database and records panic/monitoring transitions. With the shipped config and no `--platform`, it reads Skinport, CSFloat, and Waxpeer and adds signed DMarket reads when both DMarket keys are set. Live samples and their price history are in memory for that run; a short run cannot establish a 30-day price baseline. Missing or insufficient sales cause orders to be rejected rather than filled on assumed live liquidity. Historical input formats are arrays of `PriceSnapshot`, `Sale`, and `MarketEvent` as defined in `crates/core`; custom history is not given synthetic sales.
+The CS2 live reader consumes watcher events from the same SQLite database and records panic/monitoring transitions. With the shipped config and no `--platform`, it reads Skinport, CSFloat, and Waxpeer and adds signed DMarket reads when both DMarket keys are set. Missing or insufficient sales cause orders to be rejected rather than filled on assumed live liquidity. Historical input formats are arrays of `PriceSnapshot`, `Sale`, and `MarketEvent` as defined in `crates/core`; custom history is not given synthetic sales.
+
+Live mock batches for both games store quotes and verified individual sales in the SQLite database named by `--database`, keeping ten days of regime history per game. The next batch reads that history for its tracked items and enabled venues. Only the regime gate uses persisted history; the prior batches are not replayed as executable books or fills, and the dip baseline and liquidity checks still use the batch's existing inputs. Historical replays do not read or populate the live store.
+
+Timestamped verified sales already fetched from CSFloat and DMarket can seed the long and short anchors without extra requests, but only when enough comparable sale history exists for the tracked items. Skinport aggregates and synthetic fixture sales do not seed the live store. A fresh database without comparable sales needs recurring quote samples reaching back to the seven-day anchor and its lookback tolerance (up to eight days); missing anchors still block entries. Look for quote and verified-sale counts and the oldest loaded observation in the dashboard's peg summary and batch logs. The oldest observation alone does not establish comparable anchor coverage.
 
 ## Configuration and credentials
 

@@ -9,6 +9,7 @@ use cs2_arb_core::{
     BuyOrder, FeeSchedules, FloatBucket, ItemId, Money, Platform, PriceSnapshot, Result, Sale,
     SimulationMode,
 };
+use cs2_arb_events::queue::MarketHistory;
 use cs2_arb_sim::venues::{VenueAccounts, VenueBalance};
 use cs2_arb_sim::{BuyOrderFillConfig, BuyOrderFillSimulator};
 use cs2_arb_strategy::regime::{MarketRegime, RegimeState, RegimeStatus};
@@ -43,6 +44,8 @@ pub struct PegBidDashboard {
     pub as_of: Option<DateTime<Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub market_regime: Option<RegimeState>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub history_coverage: Option<HistoryCoverage>,
     pub active_mock_bids: Vec<ActivePegBid>,
     pub locked_inventory: Vec<LockedInventoryRow>,
     pub ready_to_sell_count: usize,
@@ -61,9 +64,40 @@ pub struct PegBidDashboard {
     pub venue_balances: Vec<VenueBalance>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct HistoryCoverage {
+    quotes: usize,
+    verified_sales: usize,
+    oldest_observation: Option<DateTime<Utc>>,
+}
+
+impl From<&MarketHistory> for HistoryCoverage {
+    fn from(history: &MarketHistory) -> Self {
+        Self {
+            quotes: history.snapshots.len(),
+            verified_sales: history.sales.len(),
+            oldest_observation: history
+                .snapshots
+                .iter()
+                .map(|quote| quote.observed_at)
+                .chain(history.sales.iter().map(|sale| sale.sold_at))
+                .min(),
+        }
+    }
+}
+
 impl PegBidDashboard {
     /// Emit structured log lines for Active Mock Bids, Locked Inventory, and Realized P&L.
     pub fn log_summary(&self) {
+        if let (Some(regime), Some(coverage)) = (self.market_regime, &self.history_coverage) {
+            tracing::info!(
+                regime = regime.status.label(),
+                quotes = coverage.quotes,
+                verified_sales = coverage.verified_sales,
+                oldest_observation = ?coverage.oldest_observation,
+                "persisted regime history"
+            );
+        }
         tracing::info!(
             active_bids = self.active_mock_bids.len(),
             locked_inventory = self.locked_inventory.len(),
@@ -119,6 +153,18 @@ impl PegBidDashboard {
                 let value = change.map_or_else(|| "n/a".into(), |pct| format!("{pct:+.2}%"));
                 let _ = writeln!(out, "| {label} | {value} |");
             }
+        }
+        if let Some(coverage) = &self.history_coverage {
+            let oldest = coverage
+                .oldest_observation
+                .map_or_else(|| "n/a".into(), |at| at.to_rfc3339());
+            let _ = writeln!(out, "| Regime History Quotes | {} |", coverage.quotes);
+            let _ = writeln!(
+                out,
+                "| Regime History Verified Sales | {} |",
+                coverage.verified_sales
+            );
+            let _ = writeln!(out, "| Regime History Oldest Observation | {oldest} |");
         }
         let _ = writeln!(out, "| Mock Bids Placed | {} |", self.bids_placed);
         let _ = writeln!(out, "| Passive Buy-Order Fills | {} |", self.bids_filled);
@@ -580,6 +626,7 @@ pub fn run_peg_bid_engine(
     Ok(PegBidDashboard {
         as_of: last_now,
         market_regime: last_regime,
+        history_coverage: None,
         active_mock_bids,
         locked_inventory,
         ready_to_sell_count: relist.ready_to_sell().len(),

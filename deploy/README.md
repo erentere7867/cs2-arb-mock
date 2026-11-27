@@ -21,16 +21,20 @@ the exact remote commit before switching the runtime release and restarting.
 The deployed branch and commit are in `/home/ubuntu/cs2-arb-mock-data/current/revision`.
 
 See [`.env.example`](../.env.example) for the credential names. If `.env`
-already exists, edit it in place rather than replacing it. Add `CSFLOAT_API_KEY`
-to `/home/ubuntu/cs2-arb-mock/.env` when available (systemd `KEY=value` syntax,
-no `export`), then run `sudo systemctl restart cs2-arb-mock@cs2`.
+already exists, edit `/home/ubuntu/cs2-arb-mock/.env` in place rather than
+replacing it. Use systemd `KEY=value` syntax, without `export`.
+
 Skinport and Waxpeer reads are public and need no keys. CSFloat makes
-unauthenticated requests if its key is blank; those requests can be rate limited.
-DMarket has no public fallback and is disabled in the default jobs. To enable
-it for a job, add `"dmarket"` to the top-level `markets` list in that game's
-config (`config/default.toml` for CS2, where the list is commented out, or
-`config/rust.toml` for Rust) and set both `DMARKET_PUBLIC_KEY` and
-`DMARKET_SECRET_KEY` in `.env` before deploying the updated config.
+unauthenticated requests without `CSFLOAT_API_KEY`; those requests can be rate limited.
+DMarket has no public fallback. Both jobs automatically add DMarket's signed,
+read-only requests when `DMARKET_PUBLIC_KEY` and `DMARKET_SECRET_KEY` are set.
+If either key is blank or missing, the jobs skip DMarket and continue with
+the other venues. Once the keys are in `.env`, restart the jobs; no config
+edit is needed:
+
+```sh
+sudo systemctl restart cs2-arb-mock@cs2 cs2-arb-mock@rust
+```
 
 To block new simulated orders in both jobs, create
 `/home/ubuntu/cs2-arb-mock-data/KILL_SWITCH` (not a file in the checkout).

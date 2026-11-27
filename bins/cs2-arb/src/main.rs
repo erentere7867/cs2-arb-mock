@@ -3,7 +3,9 @@ use std::process::ExitCode;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use cs2_arb_backtest::integrated::{DipAdapter, MarketDepth, SimFillModel, SpreadAdapter};
-use cs2_arb_backtest::{fixtures, BacktestConfig, Backtester, PerformanceReport, StrategyAdapter};
+use cs2_arb_backtest::{
+    fixtures, BacktestConfig, Backtester, PerformanceReport, Secrets, StrategyAdapter,
+};
 use cs2_arb_core::{
     BuyOrder, Error, FeeSchedules, Game, ItemId, MarketEvent, Platform, PriceSnapshot, Result,
     SimulationMode,
@@ -106,6 +108,7 @@ impl From<Market> for Platform {
 struct Settings {
     game: Game,
     markets: Option<Vec<Platform>>,
+    dmarket_if_configured: bool,
     spread: SpreadConfig,
     dip: DipConfig,
     risk: RiskLimits,
@@ -131,6 +134,23 @@ impl Settings {
             }
         }
         Ok(markets)
+    }
+
+    fn live_platforms(&self, requested: Vec<Market>, secrets: &Secrets) -> Result<Vec<Platform>> {
+        let auto_dmarket = self.dmarket_if_configured && requested.is_empty();
+        let mut platforms = live::select_platforms(
+            self.game,
+            requested,
+            self.market_allowlist()?,
+            self.markets.is_some(),
+        )?;
+        if auto_dmarket {
+            platforms.retain(|&platform| platform != Platform::DMarket);
+            if self.game.supports_market(Platform::DMarket) && secrets.require_dmarket().is_ok() {
+                platforms.push(Platform::DMarket);
+            }
+        }
+        Ok(platforms)
     }
 }
 
@@ -183,7 +203,7 @@ async fn run(cli: Cli) -> Result<()> {
                 live::collect(
                     &config,
                     &fees,
-                    live::select_platforms(game, platform, markets, settings.markets.is_some())?,
+                    settings.live_platforms(platform, &Secrets::from_env())?,
                     samples,
                     interval_seconds,
                     (game == Game::Cs2)
@@ -395,6 +415,8 @@ fn write_reports(
 
 #[cfg(test)]
 mod tests {
+    use cs2_arb_backtest::ops::secrets::vars::{DMARKET_PUBLIC_KEY, DMARKET_SECRET_KEY};
+
     use super::*;
 
     #[test]
@@ -561,6 +583,43 @@ mod tests {
             false
         )
         .is_err());
+    }
+
+    #[test]
+    fn shipped_profiles_add_dmarket_to_default_live_reads_only_with_both_keys() {
+        for (config, other_venue) in [
+            (
+                include_str!("../../../config/default.toml"),
+                Platform::CsFloat,
+            ),
+            (include_str!("../../../config/rust.toml"), Platform::Waxpeer),
+        ] {
+            let settings: Settings = toml::from_str(config).unwrap();
+            for (public, secret) in [
+                (None, None),
+                (Some("example"), None),
+                (None, Some("example")),
+                (Some("example"), Some(" ")),
+                (Some("example"), Some("example")),
+            ] {
+                let secrets = Secrets::from_lookup(|name| match name {
+                    DMARKET_PUBLIC_KEY => public.map(str::to_owned),
+                    DMARKET_SECRET_KEY => secret.map(str::to_owned),
+                    _ => None,
+                });
+                let mut expected = vec![Platform::Skinport, other_venue];
+                if public == Some("example") && secret == Some("example") {
+                    expected.push(Platform::DMarket);
+                }
+                assert_eq!(settings.live_platforms(vec![], &secrets).unwrap(), expected);
+                assert_eq!(
+                    settings
+                        .live_platforms(vec![Market::Skinport], &secrets)
+                        .unwrap(),
+                    [Platform::Skinport]
+                );
+            }
+        }
     }
 
     #[test]

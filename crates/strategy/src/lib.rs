@@ -30,7 +30,8 @@ pub use executor::{submit_with_risk, SimExecutor, SubmitError};
 pub use kill_switch::KillSwitch;
 pub use peg_bid::{
     compute_effective_ceiling, evaluate_bid_economics, median_cents, meets_net_margin,
-    ActivePegBid, PegBidConfig, PegBidDecision, PegBidEconomics, PegBidSkipReason, PegBidStrategy,
+    ActivePegBid, PegBidConfig, PegBidDecision, PegBidEconomics, PegBidPlacement, PegBidSkipReason,
+    PegBidStrategy,
 };
 pub use relist::{
     InventoryStatus, RealizedRelistSale, RelistConfig, RelistEngine, RelistStepResult,

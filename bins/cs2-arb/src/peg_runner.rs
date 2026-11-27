@@ -12,8 +12,8 @@ use cs2_arb_core::{
 use cs2_arb_sim::venues::{VenueAccounts, VenueBalance};
 use cs2_arb_sim::{BuyOrderFillConfig, BuyOrderFillSimulator};
 use cs2_arb_strategy::{
-    ActivePegBid, KillSwitch, PegBidConfig, PegBidStrategy, RealizedRelistSale, RelistConfig,
-    RelistEngine, RiskLimits, RiskManager,
+    ActivePegBid, KillSwitch, PegBidConfig, PegBidPlacement, PegBidStrategy, RealizedRelistSale,
+    RelistConfig, RelistEngine, RiskLimits, RiskManager,
 };
 use serde::Serialize;
 
@@ -453,23 +453,40 @@ pub fn run_peg_bid_engine(
         if !kill_switch.is_engaged()
             && (snapshot_tick || !historical_bids.is_empty() || refresh_idx > refresh_start)
         {
-            strategy.evaluate_with(&[], fees, now, |order| {
+            strategy.evaluate_with(&[], fees, now, |order, resting| {
                 let cost = fees
                     .get(order.platform)
                     .buyer_order_total(order.limit_price, order.quantity)?;
-                if simulator
+                let can_afford = simulator
                     .portfolio()
                     .available_on(order.platform)
-                    .is_some_and(|cash| cash < cost)
-                {
-                    return Ok(false);
-                }
-                if let Err(reason) = risk.check(order, now) {
-                    tracing::debug!(order_id = %order.id, %reason, "peg bid blocked by risk limits");
-                    return Ok(false);
-                }
-                if simulator.place_bid(order.clone(), now).is_err() {
-                    return Ok(false);
+                    .is_none_or(|cash| cash >= cost);
+                let accepted = can_afford
+                    && match risk.check(order, now) {
+                        Ok(()) => simulator.place_bid(order.clone(), now).is_ok(),
+                        Err(reason) => {
+                            tracing::debug!(order_id = %order.id, %reason, "peg bid blocked by risk limits");
+                            false
+                        }
+                    };
+                if !accepted {
+                    let still_allowed = resting.is_some_and(|order| {
+                        simulator.active_bids().into_iter().any(|bid| {
+                            bid.order.id == order.id
+                                && risk.allows(
+                                    &cs2_arb_core::Order {
+                                        quantity: bid.remaining_quantity,
+                                        ..order.clone()
+                                    },
+                                    now,
+                                )
+                        })
+                    });
+                    return Ok(if still_allowed {
+                        PegBidPlacement::KeepResting
+                    } else {
+                        PegBidPlacement::CancelResting
+                    });
                 }
                 bids_placed += 1;
                 if let Some(expiry) = resting_ttl.and_then(|ttl| now.checked_add_signed(ttl)) {
@@ -484,7 +501,7 @@ pub fn run_peg_bid_engine(
                     now,
                     &mut accounted_fee_losses,
                 )?;
-                Ok(true)
+                Ok(PegBidPlacement::Accepted)
             })?;
         }
         strategy.cancel_unprofitable_bids(fees, now)?;
@@ -1036,6 +1053,99 @@ mod tests {
         };
         assert_eq!(resting.updated_at, placed_at);
         assert_eq!(resting.order.limit_price, ceiling);
+    }
+
+    #[test]
+    fn rejected_replacement_cancels_the_resting_bid_if_exposure_has_increased() {
+        let placed_at = t(3, 12);
+        let repriced_at = placed_at + Duration::minutes(6);
+        let platform = Platform::CsFloat;
+        let quote = PriceSnapshot {
+            platform,
+            item: item(),
+            float_bucket: Some(FloatBucket::FieldTestedLow),
+            price: Money(8_000),
+            observed_at: placed_at,
+        };
+        let other = PriceSnapshot {
+            item: ItemId {
+                market_hash_name: "AK-47 | Slate (Field-Tested)".into(),
+                ..item()
+            },
+            price: Money(10_000),
+            ..quote.clone()
+        };
+        let bids = [
+            (&quote, Money(8_500), placed_at),
+            (&other, Money(5_000), placed_at - Duration::minutes(55)),
+        ]
+        .map(|(snapshot, price, observed_at)| BuyOrder {
+            platform,
+            item: snapshot.item.clone(),
+            float_bucket: snapshot.float_bucket,
+            price,
+            quantity: 1,
+            observed_at,
+        });
+        let mut sales = Vec::new();
+        for (snapshot, crossed_at, price) in [
+            (&other, placed_at + Duration::minutes(1), Money(4_900)),
+            (&quote, repriced_at + Duration::seconds(1), Money(7_000)),
+        ] {
+            let crossing = Sale {
+                id: format!("crossing-{}", snapshot.item.market_hash_name),
+                platform,
+                item: snapshot.item.clone(),
+                price,
+                float_value: Some(0.20),
+                sold_at: crossed_at,
+                verified: true,
+            };
+            sales.extend((0..15).map(|i| Sale {
+                id: format!("{}-{i}", crossing.id),
+                sold_at: t(2, 10),
+                ..crossing.clone()
+            }));
+            sales.push(crossing);
+        }
+        let snapshots = [
+            quote.clone(),
+            other.clone(),
+            PriceSnapshot {
+                price: Money(12_000),
+                observed_at: repriced_at,
+                ..quote
+            },
+        ];
+        let dashboard = run_peg_bid_engine(
+            &snapshots,
+            &sales,
+            &bids,
+            &[],
+            &fees(),
+            PegBidConfig {
+                lower_to_ceiling: true,
+                min_median_samples: 1,
+                lookback_days: 1,
+                ..PegBidConfig::default()
+            },
+            RelistConfig::default(),
+            RiskLimits {
+                max_total_exposure: Money(12_000),
+                ..RiskLimits::default()
+            },
+            &KillSwitch::new(),
+            Some(Money(50_000)),
+            None,
+        )
+        .unwrap();
+        assert_eq!(dashboard.bids_placed, 2);
+        assert_eq!(dashboard.bids_filled, 1);
+        assert!(dashboard.active_mock_bids.is_empty());
+        assert_eq!(
+            dashboard.locked_inventory[0].item,
+            other.item.market_hash_name
+        );
     }
 
     #[test]

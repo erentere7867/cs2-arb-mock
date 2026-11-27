@@ -179,6 +179,13 @@ pub enum PegBidDecision {
     Skipped(PegBidSkipReason),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PegBidPlacement {
+    Accepted,
+    KeepResting,
+    CancelResting,
+}
+
 type BookKey = (Platform, ItemId, Option<FloatBucket>);
 
 #[derive(Debug, Clone, Copy)]
@@ -508,16 +515,17 @@ impl PegBidStrategy {
         fees: &FeeSchedules,
         now: DateTime<Utc>,
     ) -> Result<Vec<Order>> {
-        self.evaluate_with(buy_orders, fees, now, |_| Ok(true))
+        self.evaluate_with(buy_orders, fees, now, |_, _| Ok(PegBidPlacement::Accepted))
     }
 
-    /// Evaluate bids and record only placements accepted by the caller.
+    /// Evaluate bids and let the caller decide whether a rejected replacement
+    /// should leave the current bid resting.
     pub fn evaluate_with(
         &mut self,
         buy_orders: &[BuyOrder],
         fees: &FeeSchedules,
         now: DateTime<Utc>,
-        mut place: impl FnMut(&Order) -> Result<bool>,
+        mut place: impl FnMut(&Order, Option<&Order>) -> Result<PegBidPlacement>,
     ) -> Result<Vec<Order>> {
         self.ingest_buy_orders(buy_orders.iter().cloned());
         let mut keys: Vec<BookKey> = self.top_bids.keys().cloned().collect();
@@ -528,15 +536,23 @@ impl PegBidStrategy {
                 .then_with(|| format!("{:?}", a.2).cmp(&format!("{:?}", b.2)))
         });
         let mut orders = Vec::new();
-        for (platform, item, bucket) in keys {
+        for key in keys {
+            let (platform, item, bucket) = &key;
             let PegBidDecision::Placed(active) =
-                self.propose_item(platform, &item, bucket, fees, now)?
+                self.propose_item(*platform, item, *bucket, fees, now)?
             else {
                 continue;
             };
-            if place(&active.order)? {
-                orders.push(active.order.clone());
-                self.record_placement(active);
+            let resting = self.active_bids.get(&key).map(|bid| &bid.order);
+            match place(&active.order, resting)? {
+                PegBidPlacement::Accepted => {
+                    orders.push(active.order.clone());
+                    self.record_placement(active);
+                }
+                PegBidPlacement::KeepResting => {}
+                PegBidPlacement::CancelResting => {
+                    self.active_bids.remove(&key);
+                }
             }
         }
         Ok(orders)

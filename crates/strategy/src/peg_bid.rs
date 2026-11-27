@@ -1,7 +1,7 @@
 //! Automated peg-bidding strategy (mock simulation only).
 //!
 //! Ingests read-only top-of-book buy orders from supported marketplaces (CSFloat /
-//! Skinport), computes `target_bid = max_current_bid + bid_increment`, enforces a
+//! Waxpeer), computes `target_bid = max_current_bid + bid_increment`, enforces a
 //! strict margin ceiling guaranteeing at least `target_margin_pct` (7% default)
 //! net profit after platform fees and the 7-day trade hold, and applies cooldown
 //! and debounce controls to prevent 1-cent bot-war churn.
@@ -50,7 +50,7 @@ pub struct PegBidConfig {
     pub lower_to_ceiling: bool,
     /// Units per mock buy order. Default 1.
     pub quantity: u32,
-    /// Platforms permitted for peg-bidding. Default `[CsFloat, Skinport]`.
+    /// Platforms permitted for peg-bidding. Default `[CsFloat, Waxpeer]`.
     pub allowed_platforms: Vec<Platform>,
 }
 
@@ -69,7 +69,7 @@ impl Default for PegBidConfig {
             resting_bid_ttl_secs: None,
             lower_to_ceiling: false,
             quantity: 1,
-            allowed_platforms: vec![Platform::CsFloat, Platform::Skinport, Platform::Waxpeer],
+            allowed_platforms: vec![Platform::CsFloat, Platform::Waxpeer],
         }
     }
 }
@@ -78,13 +78,13 @@ impl PegBidConfig {
     pub fn validate(&self) -> Result<()> {
         let bad = |msg: &str| Err(Error::InvalidConfig(format!("peg_bid: {msg}")));
         if !self.target_margin_pct.is_finite()
-            || self.target_margin_pct <= 0.0
+            || self.target_margin_pct < 7.0
             || self.target_margin_pct >= 100.0
         {
-            return bad("target_margin_pct must be finite and in (0, 100)");
+            return bad("target_margin_pct must be finite and in [7, 100)");
         }
-        if self.bid_increment.0 <= 0 {
-            return bad("bid_increment must be > 0");
+        if self.bid_increment != Money(1) {
+            return bad("bid_increment must be 1 cent");
         }
         if self.hold_days < 7 {
             return bad("hold_days must be >= 7 to match the mandatory 7-day CS2 trade hold");
@@ -98,8 +98,8 @@ impl PegBidConfig {
         if self.min_median_samples == 0 {
             return bad("min_median_samples must be >= 1");
         }
-        if self.cooldown_secs < 0 {
-            return bad("cooldown_secs must be >= 0");
+        if self.cooldown_secs <= 0 {
+            return bad("cooldown_secs must be > 0");
         }
         if self.min_reprice_delta.0 < 0 {
             return bad("min_reprice_delta must be >= 0");
@@ -113,8 +113,13 @@ impl PegBidConfig {
         if self.quantity == 0 {
             return bad("quantity must be >= 1");
         }
-        if self.allowed_platforms.is_empty() {
-            return bad("allowed_platforms must not be empty");
+        if self.allowed_platforms.is_empty()
+            || self
+                .allowed_platforms
+                .iter()
+                .any(|platform| !matches!(platform, Platform::CsFloat | Platform::Waxpeer))
+        {
+            return bad("allowed_platforms must contain only CSFloat or Waxpeer");
         }
         Ok(())
     }
@@ -172,6 +177,13 @@ pub enum PegBidSkipReason {
 pub enum PegBidDecision {
     Placed(ActivePegBid),
     Skipped(PegBidSkipReason),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PegBidPlacement {
+    Accepted,
+    KeepResting,
+    CancelResting,
 }
 
 type BookKey = (Platform, ItemId, Option<FloatBucket>);
@@ -274,6 +286,9 @@ impl PegBidStrategy {
                 })
                 .or_insert_with(|| order.clone());
         }
+        self.active_bids.retain(|key @ (venue, bid_item, _), _| {
+            *venue != platform || bid_item != item || self.top_bids.contains_key(key)
+        });
     }
 
     /// Record a verified sale into the rolling median price history.
@@ -357,6 +372,21 @@ impl PegBidStrategy {
         fees: &FeeSchedules,
         now: DateTime<Utc>,
     ) -> Result<PegBidDecision> {
+        let decision = self.propose_item(platform, item, float_bucket, fees, now)?;
+        if let PegBidDecision::Placed(active) = &decision {
+            self.record_placement(active.clone());
+        }
+        Ok(decision)
+    }
+
+    fn propose_item(
+        &mut self,
+        platform: Platform,
+        item: &ItemId,
+        float_bucket: Option<FloatBucket>,
+        fees: &FeeSchedules,
+        now: DateTime<Utc>,
+    ) -> Result<PegBidDecision> {
         if !self.config.allowed_platforms.contains(&platform) {
             return Ok(PegBidDecision::Skipped(
                 PegBidSkipReason::PlatformNotAllowed(platform),
@@ -364,21 +394,13 @@ impl PegBidStrategy {
         }
 
         let key = (platform, item.clone(), float_bucket);
-        let Some(top_bid) = self.top_bids.get(&key).cloned() else {
+        let Some(top_bid) = self.fresh_top_bid(&key, now).cloned() else {
             return Ok(PegBidDecision::Skipped(PegBidSkipReason::NoBuyOrderData));
         };
 
-        if top_bid.observed_at > now {
-            return Ok(PegBidDecision::Skipped(PegBidSkipReason::NoBuyOrderData));
-        }
-        if let Some(max_age) = self.config.max_order_age_secs {
-            if (now - top_bid.observed_at).num_seconds() > max_age {
-                return Ok(PegBidDecision::Skipped(PegBidSkipReason::NoBuyOrderData));
-            }
-        }
-
         let Some((rolling_median, _)) = self.rolling_median(platform, item, float_bucket, now)
         else {
+            self.active_bids.remove(&key);
             let found = self.sample_count(platform, item, float_bucket, now);
             return Ok(PegBidDecision::Skipped(
                 PegBidSkipReason::InsufficientMedianHistory {
@@ -421,25 +443,28 @@ impl PegBidStrategy {
             &self.config,
         )?;
 
+        let mut violates_ceiling = false;
         if let Some(existing) = self.active_bids.get(&key) {
             let current = existing.order.limit_price;
             // Safety override: if the existing resting bid now violates the new margin
             // ceiling, bypass cooldown/debounce so we never stay exposed above ceiling.
-            let violates_ceiling = current > effective_ceiling;
-            if !violates_ceiling {
-                if proposed_bid == current {
-                    return Ok(PegBidDecision::Skipped(PegBidSkipReason::Unchanged));
+            violates_ceiling = current > effective_ceiling;
+            if !violates_ceiling && proposed_bid == current {
+                return Ok(PegBidDecision::Skipped(PegBidSkipReason::Unchanged));
+            }
+        }
+        if !violates_ceiling {
+            if let Some(last) = self.last_updated.get(&key) {
+                let elapsed = (now - *last).num_seconds();
+                if elapsed < self.config.cooldown_secs {
+                    return Ok(PegBidDecision::Skipped(PegBidSkipReason::CooldownActive {
+                        remaining_secs: self.config.cooldown_secs - elapsed,
+                    }));
                 }
-                if let Some(last) = self.last_updated.get(&key) {
-                    let elapsed = (now - *last).num_seconds();
-                    if elapsed < self.config.cooldown_secs {
-                        return Ok(PegBidDecision::Skipped(PegBidSkipReason::CooldownActive {
-                            remaining_secs: self.config.cooldown_secs - elapsed,
-                        }));
-                    }
-                }
-                let delta = (proposed_bid.0 - current.0).abs();
-                if delta < self.config.min_reprice_delta.0 {
+            }
+            if let Some(existing) = self.active_bids.get(&key) {
+                let current = existing.order.limit_price;
+                if (proposed_bid.0 - current.0).abs() < self.config.min_reprice_delta.0 {
                     return Ok(PegBidDecision::Skipped(PegBidSkipReason::Debounced {
                         current,
                         proposed: proposed_bid,
@@ -472,9 +497,14 @@ impl PegBidStrategy {
             expected_net_margin_pct: economics.expected_net_margin_pct,
             updated_at: now,
         };
-        self.active_bids.insert(key.clone(), active.clone());
-        self.last_updated.insert(key, now);
         Ok(PegBidDecision::Placed(active))
+    }
+
+    fn record_placement(&mut self, active: ActivePegBid) {
+        let order = &active.order;
+        let key = (order.platform, order.item.clone(), order.float_bucket);
+        self.last_updated.insert(key.clone(), active.updated_at);
+        self.active_bids.insert(key, active);
     }
 
     /// Ingest a batch of top-of-book buy orders and emit mock `Order`s for every
@@ -485,6 +515,18 @@ impl PegBidStrategy {
         fees: &FeeSchedules,
         now: DateTime<Utc>,
     ) -> Result<Vec<Order>> {
+        self.evaluate_with(buy_orders, fees, now, |_, _| Ok(PegBidPlacement::Accepted))
+    }
+
+    /// Evaluate bids and let the caller decide whether a rejected replacement
+    /// should leave the current bid resting.
+    pub fn evaluate_with(
+        &mut self,
+        buy_orders: &[BuyOrder],
+        fees: &FeeSchedules,
+        now: DateTime<Utc>,
+        mut place: impl FnMut(&Order, Option<&Order>) -> Result<PegBidPlacement>,
+    ) -> Result<Vec<Order>> {
         self.ingest_buy_orders(buy_orders.iter().cloned());
         let mut keys: Vec<BookKey> = self.top_bids.keys().cloned().collect();
         keys.sort_by(|a, b| {
@@ -494,11 +536,23 @@ impl PegBidStrategy {
                 .then_with(|| format!("{:?}", a.2).cmp(&format!("{:?}", b.2)))
         });
         let mut orders = Vec::new();
-        for (platform, item, bucket) in keys {
-            if let PegBidDecision::Placed(active) =
-                self.evaluate_item(platform, &item, bucket, fees, now)?
-            {
-                orders.push(active.order);
+        for key in keys {
+            let (platform, item, bucket) = &key;
+            let PegBidDecision::Placed(active) =
+                self.propose_item(*platform, item, *bucket, fees, now)?
+            else {
+                continue;
+            };
+            let resting = self.active_bids.get(&key).map(|bid| &bid.order);
+            match place(&active.order, resting)? {
+                PegBidPlacement::Accepted => {
+                    orders.push(active.order.clone());
+                    self.record_placement(active);
+                }
+                PegBidPlacement::KeepResting => {}
+                PegBidPlacement::CancelResting => {
+                    self.active_bids.remove(&key);
+                }
             }
         }
         Ok(orders)
@@ -512,6 +566,53 @@ impl PegBidStrategy {
             .find(|(_, bid)| bid.order.id == order_id)
             .map(|(k, _)| k.clone())?;
         self.active_bids.remove(&key)
+    }
+
+    pub fn cancel_unprofitable_bids(
+        &mut self,
+        fees: &FeeSchedules,
+        now: DateTime<Utc>,
+    ) -> Result<()> {
+        let mut cancelled = Vec::new();
+        for (key @ (platform, item, bucket), active) in &self.active_bids {
+            let ceiling = match self.rolling_median(*platform, item, *bucket, now) {
+                Some((median, _)) => {
+                    compute_effective_ceiling(median, fees.get(*platform), &self.config)?
+                }
+                None => None,
+            };
+            let target_exceeds_ceiling =
+                if let (Some(ceiling), Some(top)) = (ceiling, self.fresh_top_bid(key, now)) {
+                    !self.config.lower_to_ceiling
+                        && top.price.checked_add(self.config.bid_increment)? > ceiling
+                } else {
+                    false
+                };
+            if target_exceeds_ceiling
+                || ceiling.is_none_or(|ceiling| active.order.limit_price > ceiling)
+            {
+                let bypass_cooldown = self.config.lower_to_ceiling
+                    && ceiling.is_some_and(|ceiling| active.order.limit_price > ceiling);
+                cancelled.push((key.clone(), bypass_cooldown));
+            }
+        }
+        for (key, bypass_cooldown) in cancelled {
+            self.active_bids.remove(&key);
+            if bypass_cooldown {
+                self.last_updated.remove(&key);
+            }
+        }
+        Ok(())
+    }
+
+    fn fresh_top_bid(&self, key: &BookKey, now: DateTime<Utc>) -> Option<&BuyOrder> {
+        self.top_bids.get(key).filter(|bid| {
+            bid.observed_at <= now
+                && self
+                    .config
+                    .max_order_age_secs
+                    .is_none_or(|age| (now - bid.observed_at).num_seconds() <= age)
+        })
     }
 
     /// Active mock bids, sorted deterministically for display and logging.
@@ -699,6 +800,109 @@ mod tests {
                 observed_at: now - Duration::hours(i as i64 + 1),
             });
         }
+    }
+
+    #[test]
+    fn cancelled_bid_above_a_lower_ceiling_can_be_replaced_during_cooldown() {
+        let now = t(12, 0);
+        let platform = Platform::CsFloat;
+        let item = item();
+        let fees = fees();
+        let config = PegBidConfig {
+            lower_to_ceiling: true,
+            ..PegBidConfig::default()
+        };
+        let mut strategy = PegBidStrategy::new(config.clone()).unwrap();
+        seed_median(&mut strategy, platform, 10_000, now);
+        strategy.ingest_buy_order(BuyOrder {
+            platform,
+            item: item.clone(),
+            float_bucket: None,
+            price: Money(8_500),
+            quantity: 1,
+            observed_at: now,
+        });
+        assert!(matches!(
+            strategy
+                .evaluate_item(platform, &item, None, &fees, now)
+                .unwrap(),
+            PegBidDecision::Placed(_)
+        ));
+
+        let now = now + Duration::seconds(1);
+        for _ in 0..4 {
+            strategy.observe_snapshot(&PriceSnapshot {
+                platform,
+                item: item.clone(),
+                float_bucket: None,
+                price: Money(8_000),
+                observed_at: now,
+            });
+        }
+        strategy.cancel_unprofitable_bids(&fees, now).unwrap();
+        assert!(strategy.active_bids().is_empty());
+        let PegBidDecision::Placed(replacement) = strategy
+            .evaluate_item(platform, &item, None, &fees, now)
+            .unwrap()
+        else {
+            panic!("safety repricing should bypass cooldown");
+        };
+        let ceiling = compute_effective_ceiling(Money(8_000), fees.get(platform), &config)
+            .unwrap()
+            .unwrap();
+        assert_eq!(replacement.order.limit_price, ceiling);
+    }
+
+    #[test]
+    fn expired_competitor_bid_does_not_cancel_a_safe_resting_bid() {
+        let now = t(12, 0);
+        let platform = Platform::CsFloat;
+        let item = item();
+        let fees = fees();
+        let mut strategy = PegBidStrategy::new(PegBidConfig {
+            max_order_age_secs: Some(1),
+            ..PegBidConfig::default()
+        })
+        .unwrap();
+        seed_median(&mut strategy, platform, 10_000, now);
+        let bid = BuyOrder {
+            platform,
+            item: item.clone(),
+            float_bucket: None,
+            price: Money(8_500),
+            quantity: 1,
+            observed_at: now,
+        };
+        strategy.ingest_buy_order(bid.clone());
+        let PegBidDecision::Placed(resting) = strategy
+            .evaluate_item(platform, &item, None, &fees, now)
+            .unwrap()
+        else {
+            panic!("expected safe resting bid");
+        };
+        strategy.ingest_buy_order(BuyOrder {
+            price: Money(9_500),
+            ..bid
+        });
+        let later = now + Duration::seconds(2);
+        assert!(matches!(
+            strategy
+                .evaluate_item(platform, &item, None, &fees, later)
+                .unwrap(),
+            PegBidDecision::Skipped(PegBidSkipReason::NoBuyOrderData)
+        ));
+        strategy.cancel_unprofitable_bids(&fees, later).unwrap();
+        assert_eq!(strategy.active_bids()[0].order.id, resting.order.id);
+        strategy.ingest_buy_order(BuyOrder {
+            platform,
+            item,
+            float_bucket: None,
+            price: Money(9_500),
+            quantity: 1,
+            observed_at: later,
+        });
+        strategy.cancel_unprofitable_bids(&fees, later).unwrap();
+        assert!(strategy.active_bids().is_empty());
     }
 
     #[test]

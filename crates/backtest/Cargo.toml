@@ -15,4 +15,5 @@ tracing.workspace = true
 zeroize = "1"
 
 [dev-dependencies]
+serde_json = { workspace = true, features = ["float_roundtrip"] }
 tracing-subscriber.workspace = true

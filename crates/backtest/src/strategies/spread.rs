@@ -1,8 +1,8 @@
-use chrono::Duration;
 use cs2_arb_core::{Order, Result};
 
 use super::{buy_order, exit_orders, pct_of, ExitRule};
 use crate::replay::{MarketView, StrategyAdapter};
+use crate::DEFAULT_TRADE_HOLD;
 
 /// Cross-market spread: buy where the all-in cost is lowest when the best
 /// net-of-fee exit elsewhere beats it by `min_edge_pct`, then sell after the hold.
@@ -25,7 +25,7 @@ impl Default for SpreadStrategy {
             max_open_per_item: 1,
             exit: ExitRule {
                 take_profit_pct: 0.0,
-                max_hold: Duration::days(14),
+                max_hold: DEFAULT_TRADE_HOLD,
             },
             next_id: 0,
         }
@@ -47,7 +47,7 @@ impl StrategyAdapter for SpreadStrategy {
     fn on_step(&mut self, view: &MarketView<'_>) -> Result<Vec<Order>> {
         let name = self.name.clone();
         let counter = &mut self.next_id;
-        let mut orders = exit_orders(view, self.exit, || Self::next_id(&name, counter))?;
+        let mut orders = exit_orders(view, self.exit, |_| false, || Self::next_id(&name, counter))?;
 
         let mut seen = Vec::new();
         for snapshot in view.batch {

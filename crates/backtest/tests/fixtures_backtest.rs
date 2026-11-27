@@ -6,8 +6,10 @@ use std::path::PathBuf;
 use chrono::Duration;
 use cs2_arb_backtest::fixtures::{load_events, load_fee_schedules, load_snapshots};
 use cs2_arb_backtest::replay::event_time;
-use cs2_arb_backtest::{replay, PerformanceReport, StrategyStats};
-use cs2_arb_core::{MarketEvent, Money, Platform, PriceSnapshot, SimulationMode};
+use cs2_arb_backtest::{
+    BacktestConfig, Backtester, DipStrategy, PerformanceReport, SpreadStrategy, StrategyStats,
+};
+use cs2_arb_core::{MarketEvent, Money, Platform, PriceSnapshot, Sale, SimulationMode};
 
 fn root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
@@ -28,7 +30,55 @@ fn inputs() -> (
 
 fn run() -> PerformanceReport {
     let (snapshots, events, fees) = inputs();
-    replay(SimulationMode, &snapshots, &events, fees).unwrap()
+    run_with_dip_tape(&snapshots, &events, fees)
+}
+
+fn run_with_dip_tape(
+    snapshots: &[PriceSnapshot],
+    events: &[MarketEvent],
+    fees: cs2_arb_core::FeeSchedules,
+) -> PerformanceReport {
+    let opened = events
+        .iter()
+        .find_map(|event| match event {
+            MarketEvent::PanicWindowOpened { opened_at, .. } => Some(*opened_at),
+            _ => None,
+        })
+        .unwrap();
+    let quote = snapshots
+        .iter()
+        .find(|quote| {
+            quote.platform == Platform::DMarket
+                && quote.item.market_hash_name == "AK-47 | Redline (Field-Tested)"
+        })
+        .unwrap();
+    let sales: Vec<_> = (0..11)
+        .map(|n| Sale {
+            id: format!("fixture-dip-{n}"),
+            platform: quote.platform,
+            item: quote.item.clone(),
+            price: quote.price,
+            float_value: Some(0.18),
+            sold_at: opened
+                - if n == 0 {
+                    Duration::days(8)
+                } else {
+                    Duration::hours(n)
+                },
+            verified: true,
+        })
+        .collect();
+    Backtester::new(BacktestConfig::new(fees))
+        .run(
+            SimulationMode,
+            snapshots,
+            events,
+            &mut [
+                Box::new(SpreadStrategy::default()),
+                Box::new(DipStrategy::with_sales(Default::default(), &sales).unwrap()),
+            ],
+        )
+        .unwrap()
 }
 
 fn check_stats(s: &StrategyStats, hold_secs: i64) {
@@ -166,7 +216,7 @@ fn fixture_backtest_report_invariants() {
     reversed.reverse();
     let mut events = events.clone();
     events.reverse();
-    let again = replay(SimulationMode, &reversed, &events, fees).unwrap();
+    let again = run_with_dip_tape(&reversed, &events, fees);
     assert_eq!(again, report);
 }
 

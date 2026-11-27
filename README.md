@@ -14,7 +14,15 @@ cs2-arb CLI
 All library crates share core's market and simulation types; sim has no network dependency.
 ```
 
-Historical snapshots plus sales, or explicitly enabled read-only listing samples, feed a time-ordered replay. The spread strategy compares identical items and float buckets across markets, net of both sides' fees and seven days of opportunity cost. The dip strategy looks for liquid items more than two standard deviations below their prior 30-day baseline during an update window. The risk manager checks position and portfolio exposure, UTC-day drawdown and the kill switch before a mock order reaches the simulator.
+Historical snapshots plus sales, or explicitly enabled read-only listing samples, feed a time-ordered replay. Spread compares identical items and float buckets across markets, net of both sides' fees and seven days of opportunity cost. Inventory is eligible for exit at its trade-lock expiry (seven days by default), provided the target venue can execute the mock exit; there is no additional 14-day wait. The risk manager checks exposure, UTC-day drawdown and the kill switch before a mock order reaches the simulator.
+
+During an update window, dip compares the current quote with the mean (μ) and **sample** standard deviation (σ, denominator *n − 1*) of prior prices in the last 30 days. By default it requires at least 10 prior observations and a price at or below μ − 2σ, and rejects prices more than 30% below μ. Live batches seed price history with completed daily medians of verified public sales so the baseline does not depend on collecting weeks of fresh asks in one batch. Dip also requires at least 10 verified sales of that item on the quoting venue in the last seven days and at least 1.5× the sales rate of the preceding 30 days (normalized to seven days). A venue with no usable baseline or current sales cannot trigger: live CSFloat and DMarket can supply individual prints; Waxpeer has no sales tape in this adapter and Skinport's unverified aggregates do not qualify. Custom offline history must explicitly include a sales tape. The maximum-drop check is an entry guard, not an executable stop-loss during a lock.
+
+The maximum entry drop is separate from the held-position stop-loss. After a dip lot unlocks, it is marked for liquidation when the median of fresh quotes for the same item and float bucket is **more than 25%** below its per-unit cost basis (including buy fees), or when the lot reaches **21 days** from purchase. Set `stop_loss_pct` and `max_hold_days` under `[dip]` to change these defaults. A marked lot waits for the best available mock exit after seller fees; no lock, liquidity, or execution check is bypassed.
+
+The backtest library's snapshot-only `replay` helper has no sales tape: it warns and dip cannot open trades. To replay dip, pass a tape to `DipStrategy::with_sales` and run it with `Backtester`, or use the CLI's `backtest --sales` option for custom history.
+
+The mock peg reads CSFloat and Waxpeer buy books and targets one cent over the best bid. It stands down if the target exceeds rolling median × (1 − margin) or a tighter ceiling needed to retain at least 7% net return after venue fees and seven-day carry. Repricing defaults to a five-minute cooldown and a two-cent minimum change. Bids rest until a verified print on the same venue crosses the limit; at the limit, the simulator models queue delay. A fill debits mock cash including purchase fees and creates a seven-day locked lot. At expiry, the separate peg inventory relister posts at the rolling median ask, falling back to the median of eligible sale prints if there are too few asks. The read-only dashboard on port 8787 shows the latest completed batch's active mock bids and locked inventory, including unlock times.
 
 The simulator requires ten verified sales in the last seven days on the order's platform and caps order size at 10% of trailing average daily volume, rounded down (so one unit needs at least 70 sales). It rejects stale listings, trade-locked items and mismatched wear or float buckets. Bought positions cannot be sold for seven days. Spread and dip results use separate simulated portfolios and risk ledgers.
 
@@ -113,12 +121,12 @@ Actual output of `cs2-arb backtest` on the bundled synthetic scenario: **50 UTC 
 
 | Metric | Combined | Spread | Dip |
 | --- | ---: | ---: | ---: |
-| Closed trades | 2 | 1 | 1 |
-| Gross realized P&L | $16.46 | $8.23 | $8.23 |
-| Net realized and total P&L | $15.30 | $7.65 | $7.65 |
-| Fees / fee drag (% of gross P&L) | $1.16 / 7.05% | $0.58 / 7.05% | $0.58 / 7.05% |
-| Average / median trade duration | 7 days / 7 days | 7 days / 7 days | 7 days / 7 days |
-| Max drawdown | $2.26 | $1.13 | $1.13 |
-| Orders submitted / filled / rejected | 4 / 4 / 0 | 2 / 2 / 0 | 2 / 2 / 0 |
+| Closed trades | 1 | 1 | 0 |
+| Gross realized P&L | $8.23 | $8.23 | $0.00 |
+| Net realized and total P&L | $7.65 | $7.65 | $0.00 |
+| Fees / fee drag (% of gross P&L) | $0.58 / 7.05% | $0.58 / 7.05% | $0.00 / n/a |
+| Average / median trade duration | 7 days / 7 days | 7 days / 7 days | n/a |
+| Max drawdown | $1.13 | $1.13 | $0.00 |
+| Orders submitted / filled / rejected | 2 / 2 / 0 | 2 / 2 / 0 | 0 / 0 / 0 |
 
-Both strategies selected the same synthetic AK-47 Redline dip in independent portfolios. The combined result is **not** a joint book, earnings forecast, or evidence of a live trading opportunity. Historical asks stand in for book prices, and market transfers after the hold are not separately simulated.
+Spread selected the synthetic AK-47 Redline; the dip strategy stood down because the uniform mock tape shows no relative volume surge. The combined result is **not** a joint book, earnings forecast, or evidence of a live trading opportunity. Historical asks stand in for book prices, and market transfers after the hold are not separately simulated.

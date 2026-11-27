@@ -179,6 +179,15 @@ function pegStats(latest) {
   node.append(table(["Metric", "Value"], metrics));
   return node;
 }
+function pegDetails(title, detail, empty) {
+  const node = panel(title, "Mock positions as of the latest completed batch.", true);
+  if (detail?.rows.length) {
+    node.append(table(detail.headers, detail.rows));
+  } else {
+    node.append(el("p", detail ? empty : "No detail available for this batch.", "hint"));
+  }
+  return node;
+}
 function watcherStats(watcher) {
   const node = panel("Steam update watcher", "CS2 public branch events and active simulated dip windows.");
   if (!watcher) {
@@ -244,6 +253,10 @@ function render() {
   chart(trend, reports.history);
   grid.append(overview(reports), trend, batchStatus(reports), marketHealth(game), pegStats(reports.latest));
   if (selected === "cs2") grid.append(watcherStats(data.watcher));
+  grid.append(
+    pegDetails("Active mock bids", reports.latest?.active_bids, "No active mock bids."),
+    pegDetails("Locked inventory", reports.latest?.locked_inventory, "No locked inventory.")
+  );
   dashboard.querySelector(".grid")?.remove();
   dashboard.prepend(grid);
 

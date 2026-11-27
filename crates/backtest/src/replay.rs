@@ -868,6 +868,7 @@ fn stats(
 
 /// The built-in strategy set used by [`replay`]: spread then dip, default parameters.
 pub fn default_strategies() -> Vec<Box<dyn StrategyAdapter>> {
+    tracing::warn!("default replay has no sales tape; dip cannot open trades");
     vec![
         Box::new(SpreadStrategy::default()),
         Box::new(DipStrategy::default()),
@@ -1215,7 +1216,8 @@ mod tests {
             // Restrict day 2 to one unit at the best ask even though verified sales allow more.
             let mut rows = snapshots.clone().map(|quote| (quote, 2, 70));
             rows[2].1 = 1;
-            let depth = depth_with_snapshots(&rows);
+            let mut depth = depth_with_snapshots(&rows);
+            add_dip_baseline_sale(&mut depth);
             let mut strategies: Vec<Box<dyn StrategyAdapter>> = vec![Box::new(
                 DipAdapter::new(
                     DipConfig {
@@ -1268,7 +1270,8 @@ mod tests {
             .zip([70, 70, 140, 0, 70])
             .map(|(quote, count)| (quote, 2, count))
             .collect::<Vec<_>>();
-        let depth = depth_with_snapshots(&rows);
+        let mut depth = depth_with_snapshots(&rows);
+        add_dip_baseline_sale(&mut depth);
         let mut strategies: Vec<Box<dyn StrategyAdapter>> = vec![Box::new(
             DipAdapter::new(
                 DipConfig {
@@ -1303,6 +1306,134 @@ mod tests {
         assert_eq!(report.trades[0].quantity, 1);
         assert_eq!(report.trades[0].net_pnl, Money(300));
         assert_eq!(report.totals.open_positions, 1);
+    }
+
+    fn add_dip_baseline_sale(depth: &mut crate::integrated::MarketDepth) {
+        depth.add_sales([cs2_arb_core::Sale {
+            id: "dip-baseline".into(),
+            platform: Platform::CsFloat,
+            item: item(),
+            price: Money(1000),
+            float_value: Some(0.18),
+            sold_at: t(-6),
+            verified: true,
+        }]);
+    }
+
+    #[test]
+    fn dip_liquidates_after_unlock_on_a_median_stop_or_maximum_age() {
+        use crate::integrated::{DipAdapter, SimFillModel};
+        use cs2_arb_strategy::{DipConfig, KillSwitch, RiskLimits};
+
+        for (max_hold_days, day_10_price, blocked, basic_exit, integrated_exit) in [
+            (21, 650, false, 10, 10),
+            (9, 750, false, 11, 11),
+            (21, 650, true, 10, 11),
+        ] {
+            let snapshots = [
+                snap(Platform::CsFloat, 0, 999),
+                snap(Platform::CsFloat, 1, 1001),
+                snap(Platform::CsFloat, 2, 900),
+                snap(Platform::CsFloat, 8, 500),
+                snap(Platform::CsFloat, 9, 675),
+                snap(Platform::CsFloat, 10, day_10_price),
+                snap(Platform::Waxpeer, 10, day_10_price + 50),
+                snap(Platform::DMarket, 10, day_10_price - 50),
+                snap(Platform::CsFloat, 11, 750),
+                snap(Platform::Waxpeer, 11, 800),
+                snap(Platform::DMarket, 11, 700),
+            ];
+            let rows = snapshots.clone().map(|quote| {
+                let sales = if blocked && (t(8)..=t(10)).contains(&quote.observed_at) {
+                    0
+                } else {
+                    70
+                };
+                (quote, 1, sales)
+            });
+            let mut depth = depth_with_snapshots(&rows);
+            add_dip_baseline_sale(&mut depth);
+            let config = DipConfig {
+                min_samples: 2,
+                min_sales_in_window: 1,
+                max_hold_days,
+                ..DipConfig::default()
+            };
+            let fees = FeeSchedules {
+                skinport: FeeSchedule::default(),
+                csfloat: FeeSchedule::default(),
+                dmarket: FeeSchedule::default(),
+                waxpeer: FeeSchedule {
+                    seller_fee_pct: 20.0,
+                    ..FeeSchedule::default()
+                },
+            };
+            let events = [
+                MarketEvent::PanicWindowOpened {
+                    branch: "test".into(),
+                    opened_at: t(2),
+                },
+                MarketEvent::PanicWindowClosed {
+                    branch: "test".into(),
+                    closed_at: t(3),
+                },
+            ];
+            let model = SimFillModel::new(
+                &depth,
+                fees.clone(),
+                RiskLimits::default(),
+                KillSwitch::new(),
+            );
+            let basic = Backtester::new(BacktestConfig::new(fees.clone()))
+                .run(
+                    SimulationMode,
+                    &snapshots,
+                    &events,
+                    &mut [Box::new(
+                        DipStrategy::with_sales(config.clone(), depth.sales()).unwrap(),
+                    )],
+                )
+                .unwrap();
+            let integrated = Backtester::with_fill_model(BacktestConfig::new(fees), model)
+                .run(
+                    SimulationMode,
+                    &snapshots,
+                    &events,
+                    &mut [Box::new(DipAdapter::new(config, &depth).unwrap())],
+                )
+                .unwrap();
+            for (report, expected_exit) in [(basic, basic_exit), (integrated, integrated_exit)] {
+                assert_eq!(report.trades.len(), 1);
+                let trade = &report.trades[0];
+                assert_eq!(trade.opened_at, t(2));
+                assert_eq!(trade.locked_until, t(9));
+                assert_eq!(trade.closed_at, t(expected_exit));
+                assert_eq!(trade.sell_platform, Platform::CsFloat);
+                assert!(trade.net_pnl.0 < 0);
+            }
+        }
+    }
+
+    #[test]
+    fn default_spread_exits_at_unlock_even_when_the_edge_has_disappeared() {
+        let snapshots = [
+            snap(Platform::CsFloat, 0, 1000),
+            snap(Platform::DMarket, 0, 1400),
+            snap(Platform::DMarket, 6, 900),
+            snap(Platform::DMarket, 7, 900),
+        ];
+        let report = Backtester::new(BacktestConfig::new(fees()))
+            .run(
+                SimulationMode,
+                &snapshots,
+                &[],
+                &mut [Box::new(SpreadStrategy::default())],
+            )
+            .unwrap();
+        assert_eq!(report.trades.len(), 1);
+        assert_eq!(report.trades[0].locked_until, t(7));
+        assert_eq!(report.trades[0].closed_at, t(7));
+        assert!(report.trades[0].net_pnl.0 < 0);
     }
 
     #[test]
@@ -1862,6 +1993,37 @@ mod tests {
         assert_eq!(report.totals.win_rate, None);
         assert_eq!(report.strategies.len(), 2);
         assert!(report.to_markdown().contains("No closed trades."));
+    }
+
+    #[test]
+    fn default_replay_warns_when_there_is_no_dip_sales_tape() {
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone, Default)]
+        struct Output(Arc<Mutex<Vec<u8>>>);
+
+        impl std::io::Write for Output {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let output = Output::default();
+        let writer = output.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            replay(SimulationMode, &daily(1, |_, _| 1000), &[], fees()).unwrap();
+        });
+        assert!(String::from_utf8_lossy(&output.0.lock().unwrap())
+            .contains("default replay has no sales tape; dip cannot open trades"));
     }
 
     #[test]

@@ -142,7 +142,7 @@ impl Settings {
             .liquidity_window_days
             .unwrap_or_else(|| SimConfig::default().liquidity.window_days);
         i64::from(simulation)
-            .max(self.dip.liquidity_window_days)
+            .max(self.dip.volume_history_days())
             .max(self.relist.lookback_days)
             .max(self.relist.volume_window_days)
             .max(self.peg_bid.lookback_days)
@@ -349,6 +349,7 @@ async fn run(
         kill_switch.clone(),
         accounts.clone(),
         &audited_markets,
+        live_platforms.is_some(),
     )?;
     if audit_enabled || live_platforms.is_some() {
         report.unverified_platform_assumptions = platform_audit::unverified(&audited_markets);
@@ -498,7 +499,15 @@ fn simulate(
     settings: Settings,
     kill_switch: KillSwitch,
 ) -> Result<PerformanceReport> {
-    simulate_with_accounts(inputs, fees, settings, kill_switch, None, &Platform::ALL)
+    simulate_with_accounts(
+        inputs,
+        fees,
+        settings,
+        kill_switch,
+        None,
+        &Platform::ALL,
+        false,
+    )
 }
 
 fn simulate_with_accounts(
@@ -508,11 +517,16 @@ fn simulate_with_accounts(
     kill_switch: KillSwitch,
     accounts: Option<VenueAccounts>,
     active_platforms: &[Platform],
+    live_batch: bool,
 ) -> Result<PerformanceReport> {
-    let mut strategies: Vec<Box<dyn StrategyAdapter>> = vec![
-        Box::new(SpreadAdapter::new(settings.spread)),
-        Box::new(DipAdapter::new(settings.dip, &inputs.depth)?),
-    ];
+    let mut dip = DipAdapter::new(settings.dip, &inputs.depth)?;
+    if live_batch {
+        if let Some(first_quote) = inputs.snapshots.iter().map(|q| q.observed_at).min() {
+            dip.seed_daily_sale_prices(inputs.depth.sales(), first_quote);
+        }
+    }
+    let mut strategies: Vec<Box<dyn StrategyAdapter>> =
+        vec![Box::new(SpreadAdapter::new(settings.spread)), Box::new(dip)];
     let mut model = SimFillModel::new(&inputs.depth, fees.clone(), settings.risk, kill_switch)
         .with_sim_config(settings.simulation.build()?);
     if let Some(accounts) = accounts {
@@ -652,13 +666,13 @@ mod tests {
     #[test]
     fn live_sales_lookback_covers_configured_simulation_window() {
         let settings: Settings =
-            toml::from_str("[simulation]\nliquidity_window_days = 14").unwrap();
-        assert_eq!(settings.live_sales_lookback_days(), 14);
+            toml::from_str("[simulation]\nliquidity_window_days = 45").unwrap();
+        assert_eq!(settings.live_sales_lookback_days(), 45);
         let settings: Settings = toml::from_str(
-            "[simulation]\nliquidity_window_days = 14\n[relist]\nlookback_days = 10\nvolume_window_days = 30",
+            "[simulation]\nliquidity_window_days = 14\n[relist]\nlookback_days = 10\nvolume_window_days = 60",
         ).unwrap();
-        assert_eq!(settings.live_sales_lookback_days(), 30);
-        assert_eq!(Settings::default().live_sales_lookback_days(), 7);
+        assert_eq!(settings.live_sales_lookback_days(), 60);
+        assert_eq!(Settings::default().live_sales_lookback_days(), 37);
     }
     const EXAMPLE_DMARKET_PUBLIC: &str =
         "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a";
@@ -729,6 +743,7 @@ transfer_out_seconds = 0
             KillSwitch::new(),
             Some(accounts),
             &selected,
+            true,
         )
         .unwrap();
         assert_eq!(report.venue_trade_holds.len(), 1);
@@ -839,7 +854,7 @@ amount = 100
         )
         .unwrap();
         assert!(report.strategy("spread").unwrap().trade_count > 0);
-        assert!(report.strategy("dip").unwrap().trade_count > 0);
+        assert_eq!(report.strategy("dip").unwrap().trade_count, 0);
         assert!(report
             .trades
             .iter()

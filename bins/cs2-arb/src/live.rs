@@ -224,7 +224,6 @@ pub async fn collect(
         None
     };
     let mut snapshots = Vec::new();
-    let mut buy_orders = Vec::new();
     let mut bid_refreshes = Vec::new();
     let mut depth = MarketDepth::default();
     for sample in 0..samples {
@@ -254,7 +253,7 @@ pub async fn collect(
                 }
                 if polls_bids(*platform, instant_sale, waxpeer_has_key) {
                     match client.poll_buy_orders(item).await {
-                        Ok((orders, observed_at)) if instant_sale => {
+                        Ok((orders, observed_at)) => {
                             record_bid_poll(
                                 &mut bid_refreshes,
                                 *platform,
@@ -263,7 +262,6 @@ pub async fn collect(
                                 observed_at.unwrap_or_else(Utc::now),
                             );
                         }
-                        Ok((orders, _)) => buy_orders.extend(orders),
                         Err(Error::RateLimited { .. }) => {}
                         Err(error) => {
                             tracing::warn!(?platform, %error, "read-only buy-orders request skipped")
@@ -310,7 +308,7 @@ pub async fn collect(
         snapshots,
         events,
         depth,
-        buy_orders,
+        buy_orders: Vec::new(),
         bid_refreshes,
         has_observed_bids: true,
     })

@@ -78,6 +78,10 @@ min_net_profit = 50
 [dip]
 lookback_days = 30
 k_sigma = 2.0
+volume_multiplier = 1.5
+max_drop_pct = 30.0
+stop_loss_pct = 25.0
+max_hold_days = 21
 require_verified_sales = true
 
 [risk]

@@ -39,9 +39,6 @@ pub struct BuyOrderFillConfig {
     pub min_recorded_sales_7d: u32,
     /// Liquidity lookback window in days. Default 7.
     pub liquidity_window_days: u32,
-    /// Whether only `sale.verified` transactions can fill bids and count toward
-    /// the liquidity gate. Default true.
-    pub require_verified_sales: bool,
     /// Minimum simulated queue latency before a price-tied bid can fill.
     /// Default 15 minutes (never instant first-in-line).
     pub tie_queue_latency_min: TimeDelta,
@@ -66,7 +63,6 @@ impl Default for BuyOrderFillConfig {
         Self {
             min_recorded_sales_7d: 15,
             liquidity_window_days: 7,
-            require_verified_sales: true,
             tie_queue_latency_min: TimeDelta::minutes(15),
             tie_queue_latency_max: TimeDelta::hours(2),
             tie_min_prints_ahead: 2,
@@ -346,7 +342,7 @@ impl BuyOrderFillSimulator {
         if sale.sold_at > now {
             return Vec::new();
         }
-        if self.config.require_verified_sales && !sale.verified {
+        if !sale.verified || sale.price.0 <= 0 {
             return Vec::new();
         }
 
@@ -667,7 +663,7 @@ impl BuyOrderFillSimulator {
             .sales_tape
             .iter()
             .filter(|sale| {
-                (!self.config.require_verified_sales || sale.verified)
+                sale.verified
                     && sale.item == order.item
                     && sale.platform == order.platform
                     && sale.sold_at > window_start

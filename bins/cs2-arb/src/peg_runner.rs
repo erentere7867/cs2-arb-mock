@@ -12,8 +12,8 @@ use cs2_arb_core::{
 use cs2_arb_sim::venues::{VenueAccounts, VenueBalance};
 use cs2_arb_sim::{BuyOrderFillConfig, BuyOrderFillSimulator};
 use cs2_arb_strategy::{
-    ActivePegBid, KillSwitch, PegBidConfig, PegBidStrategy, RealizedRelistSale, RelistConfig,
-    RelistEngine, RiskLimits, RiskManager,
+    ActivePegBid, KillSwitch, PegBidConfig, PegBidPlacement, PegBidStrategy, RealizedRelistSale,
+    RelistConfig, RelistEngine, RiskLimits, RiskManager,
 };
 use serde::Serialize;
 
@@ -213,12 +213,7 @@ impl PegBidDashboard {
 pub fn derive_offline_buy_orders(snapshots: &[PriceSnapshot]) -> Vec<BuyOrder> {
     snapshots
         .iter()
-        .filter(|q| {
-            matches!(
-                q.platform,
-                Platform::CsFloat | Platform::Skinport | Platform::Waxpeer
-            ) && q.price.0 > 0
-        })
+        .filter(|q| matches!(q.platform, Platform::CsFloat | Platform::Waxpeer) && q.price.0 > 0)
         .map(|q| {
             // Illustrative top-of-book bid at 86% of ask snapshot so peg-bidding
             // stays within the strict >= 7% net margin ceiling after fees & hold.
@@ -305,9 +300,10 @@ pub fn run_peg_bid_engine(
     let mut accounted_fee_losses = Money(0);
 
     while let Some(now) = times.pop_first() {
-        let market_tick = sorted_snapshots
+        let snapshot_tick = sorted_snapshots
             .get(snap_idx)
-            .is_some_and(|s| s.observed_at == now)
+            .is_some_and(|s| s.observed_at == now);
+        let market_tick = snapshot_tick
             || sorted_sales.get(sale_idx).is_some_and(|s| s.sold_at == now)
             || sorted_bids
                 .get(bid_idx)
@@ -366,6 +362,31 @@ pub fn run_peg_bid_engine(
             strategy.observe_snapshot(snap);
             snap_idx += 1;
         }
+        let refresh_start = refresh_idx;
+        while let Some(refresh) = bid_refreshes
+            .get(refresh_idx)
+            .filter(|refresh| refresh.at == now)
+        {
+            relist.replace_bid_book(refresh.platform, &refresh.item, &refresh.bids);
+            strategy.replace_buy_orders(refresh.platform, &refresh.item, &refresh.bids, now);
+            refresh_idx += 1;
+        }
+        let bid_start = bid_idx;
+        while bid_idx < sorted_bids.len() && sorted_bids[bid_idx].observed_at <= now {
+            bid_idx += 1;
+        }
+        let historical_bids = &sorted_bids[bid_start..bid_idx];
+        relist.observe_bids(historical_bids);
+        strategy.ingest_buy_orders(historical_bids.iter().cloned());
+        strategy.cancel_unprofitable_bids(fees, now)?;
+        cancel_discarded_bids(&strategy, &mut simulator, now)?;
+        account_bid_fee_losses(
+            &mut risk,
+            &simulator,
+            &latest_prices,
+            now,
+            &mut accounted_fee_losses,
+        )?;
 
         while sale_idx < sorted_sales.len() && sorted_sales[sale_idx].sold_at <= now {
             let sale = &sorted_sales[sale_idx];
@@ -397,20 +418,6 @@ pub fn run_peg_bid_engine(
             sale_idx += 1;
         }
 
-        let bid_start = bid_idx;
-        while bid_idx < sorted_bids.len() && sorted_bids[bid_idx].observed_at <= now {
-            bid_idx += 1;
-        }
-        relist.observe_bids(&sorted_bids[bid_start..bid_idx]);
-        let refresh_start = refresh_idx;
-        while let Some(refresh) = bid_refreshes
-            .get(refresh_idx)
-            .filter(|refresh| refresh.at == now)
-        {
-            relist.replace_bid_book(refresh.platform, &refresh.item, &refresh.bids);
-            strategy.replace_buy_orders(refresh.platform, &refresh.item, &refresh.bids, now);
-            refresh_idx += 1;
-        }
         let relist_step = relist.step(
             &sorted_sales[..sale_idx],
             &sorted_snapshots[..snap_idx],
@@ -443,74 +450,69 @@ pub fn run_peg_bid_engine(
         let unrealized = compute_unrealized_pnl(&simulator, &latest_prices);
         risk.set_unrealized_pnl(unrealized, now);
 
-        let historical_bids = &sorted_bids[bid_start..bid_idx];
-        let refreshed_bids = bid_refreshes[refresh_start..refresh_idx]
-            .iter()
-            .flat_map(|refresh| &refresh.bids);
         if !kill_switch.is_engaged()
-            && (!historical_bids.is_empty() || refreshed_bids.clone().next().is_some())
+            && (snapshot_tick || !historical_bids.is_empty() || refresh_idx > refresh_start)
         {
-            let orders = strategy.evaluate(historical_bids, fees, now)?;
-            for order in orders {
+            strategy.evaluate_with(&[], fees, now, |order, resting| {
                 let cost = fees
                     .get(order.platform)
                     .buyer_order_total(order.limit_price, order.quantity)?;
-                if simulator
+                let can_afford = simulator
                     .portfolio()
                     .available_on(order.platform)
-                    .is_some_and(|cash| cash < cost)
-                {
-                    strategy.mark_filled(&order.id);
-                    continue;
-                }
-                if let Err(reason) = risk.check(&order, now) {
-                    tracing::debug!(order_id = %order.id, %reason, "peg bid blocked by risk limits");
-                    strategy.mark_filled(&order.id);
-                    continue;
-                }
-                if simulator.place_bid(order.clone(), now).is_ok() {
-                    bids_placed += 1;
-                    if let Some(expiry) = resting_ttl.and_then(|ttl| now.checked_add_signed(ttl)) {
-                        if Some(expiry) <= replay_end {
-                            times.insert(expiry);
+                    .is_none_or(|cash| cash >= cost);
+                let accepted = can_afford
+                    && match risk.check(order, now) {
+                        Ok(()) => simulator.place_bid(order.clone(), now).is_ok(),
+                        Err(reason) => {
+                            tracing::debug!(order_id = %order.id, %reason, "peg bid blocked by risk limits");
+                            false
                         }
+                    };
+                if !accepted {
+                    let still_allowed = resting.is_some_and(|order| {
+                        simulator.active_bids().into_iter().any(|bid| {
+                            bid.order.id == order.id
+                                && risk.allows(
+                                    &cs2_arb_core::Order {
+                                        quantity: bid.remaining_quantity,
+                                        ..order.clone()
+                                    },
+                                    now,
+                                )
+                        })
+                    });
+                    return Ok(if still_allowed {
+                        PegBidPlacement::KeepResting
+                    } else {
+                        PegBidPlacement::CancelResting
+                    });
+                }
+                bids_placed += 1;
+                if let Some(expiry) = resting_ttl.and_then(|ttl| now.checked_add_signed(ttl)) {
+                    if Some(expiry) <= replay_end {
+                        times.insert(expiry);
                     }
-                    account_bid_fee_losses(
-                        &mut risk,
-                        &simulator,
-                        &latest_prices,
-                        now,
-                        &mut accounted_fee_losses,
-                    )?;
-                } else {
-                    strategy.mark_filled(&order.id);
                 }
-            }
-            // Cancel any resting simulator bids that the strategy discarded (e.g., ceiling exceeded).
-            let active_keys: std::collections::HashSet<_> = strategy
-                .active_bids()
-                .into_iter()
-                .map(|b| (b.order.platform, b.order.item.clone(), b.order.float_bucket))
-                .collect();
-            for obs in historical_bids.iter().chain(refreshed_bids) {
-                let key = (obs.platform, obs.item.clone(), obs.float_bucket);
-                if !active_keys.contains(&key) {
-                    simulator.cancel_bids_for_item(
-                        obs.platform,
-                        &obs.item,
-                        obs.float_bucket,
-                        now,
-                    )?;
-                }
-            }
-            account_bid_fee_losses(
-                &mut risk,
-                &simulator,
-                &latest_prices,
-                now,
-                &mut accounted_fee_losses,
-            )?;
+                account_bid_fee_losses(
+                    &mut risk,
+                    &simulator,
+                    &latest_prices,
+                    now,
+                    &mut accounted_fee_losses,
+                )?;
+                Ok(PegBidPlacement::Accepted)
+            })?;
         }
+        strategy.cancel_unprofitable_bids(fees, now)?;
+        cancel_discarded_bids(&strategy, &mut simulator, now)?;
+        account_bid_fee_losses(
+            &mut risk,
+            &simulator,
+            &latest_prices,
+            now,
+            &mut accounted_fee_losses,
+        )?;
     }
 
     if let Some(now) = last_now {
@@ -561,6 +563,34 @@ pub fn format_countdown(secs: i64) -> String {
     let hours = dur.num_hours() % 24;
     let mins = dur.num_minutes() % 60;
     format!("{days}d {hours:02}h {mins:02}m")
+}
+
+fn cancel_discarded_bids(
+    strategy: &PegBidStrategy,
+    simulator: &mut BuyOrderFillSimulator,
+    now: DateTime<Utc>,
+) -> Result<()> {
+    let active = strategy.active_bids();
+    let discarded: Vec<_> = simulator
+        .active_bids()
+        .into_iter()
+        .filter(|bid| {
+            !active
+                .iter()
+                .any(|resting| resting.order.id == bid.order.id)
+        })
+        .map(|bid| {
+            (
+                bid.order.platform,
+                bid.order.item.clone(),
+                bid.order.float_bucket,
+            )
+        })
+        .collect();
+    for (platform, item, bucket) in discarded {
+        simulator.cancel_bids_for_item(platform, &item, bucket, now)?;
+    }
+    Ok(())
 }
 
 fn format_money(money: Money) -> String {
@@ -899,5 +929,290 @@ mod tests {
         assert!(md.contains("Locked Inventory"));
         assert!(md.contains("Realized Buy-Order P&L"));
         assert!(md.contains("$12.99"));
+    }
+
+    #[test]
+    fn snapshot_only_tick_replaces_an_unsafe_bid_using_the_fresh_book() {
+        let placed_at = t(3, 12);
+        let repriced_at = placed_at + Duration::seconds(1);
+        let platform = Platform::CsFloat;
+        let quote = PriceSnapshot {
+            platform,
+            item: item(),
+            float_bucket: Some(FloatBucket::FieldTestedLow),
+            price: Money(10_000),
+            observed_at: placed_at,
+        };
+        let bid = BuyOrder {
+            platform,
+            item: quote.item.clone(),
+            float_bucket: quote.float_bucket,
+            price: Money(8_500),
+            quantity: 1,
+            observed_at: placed_at,
+        };
+        let snapshots = [
+            quote.clone(),
+            PriceSnapshot {
+                price: Money(6_000),
+                observed_at: repriced_at,
+                ..quote
+            },
+        ];
+        let config = PegBidConfig {
+            lower_to_ceiling: true,
+            min_median_samples: 1,
+            ..PegBidConfig::default()
+        };
+        let fees = fees();
+        let ceiling =
+            cs2_arb_strategy::compute_effective_ceiling(Money(8_000), fees.get(platform), &config)
+                .unwrap()
+                .unwrap();
+        let dashboard = run_peg_bid_engine(
+            &snapshots,
+            &[],
+            &[bid],
+            &[],
+            &fees,
+            config,
+            RelistConfig::default(),
+            RiskLimits::default(),
+            &KillSwitch::new(),
+            Some(Money(50_000)),
+            None,
+        )
+        .unwrap();
+        assert_eq!(dashboard.bids_placed, 2);
+        assert_eq!(dashboard.bids_filled, 0);
+        let [replacement] = dashboard.active_mock_bids.as_slice() else {
+            panic!("expected one replacement bid");
+        };
+        assert_eq!(replacement.updated_at, repriced_at);
+        assert_eq!(replacement.order.limit_price, ceiling);
+    }
+
+    #[test]
+    fn snapshot_only_replacement_rejected_by_risk_keeps_the_safe_resting_bid() {
+        let placed_at = t(3, 12);
+        let repriced_at = placed_at + Duration::minutes(6);
+        let platform = Platform::CsFloat;
+        let quote = PriceSnapshot {
+            platform,
+            item: item(),
+            float_bucket: Some(FloatBucket::FieldTestedLow),
+            price: Money(8_000),
+            observed_at: placed_at,
+        };
+        let bid = BuyOrder {
+            platform,
+            item: quote.item.clone(),
+            float_bucket: quote.float_bucket,
+            price: Money(8_500),
+            quantity: 1,
+            observed_at: placed_at,
+        };
+        let snapshots = [
+            quote.clone(),
+            PriceSnapshot {
+                price: Money(12_000),
+                observed_at: repriced_at,
+                ..quote
+            },
+        ];
+        let config = PegBidConfig {
+            lower_to_ceiling: true,
+            min_median_samples: 1,
+            ..PegBidConfig::default()
+        };
+        let fees = fees();
+        let ceiling =
+            cs2_arb_strategy::compute_effective_ceiling(Money(8_000), fees.get(platform), &config)
+                .unwrap()
+                .unwrap();
+        let dashboard = run_peg_bid_engine(
+            &snapshots,
+            &[],
+            &[bid],
+            &[],
+            &fees,
+            config,
+            RelistConfig::default(),
+            RiskLimits {
+                max_position_notional: Money(8_000),
+                ..RiskLimits::default()
+            },
+            &KillSwitch::new(),
+            Some(Money(50_000)),
+            None,
+        )
+        .unwrap();
+        assert_eq!(dashboard.bids_placed, 1);
+        let [resting] = dashboard.active_mock_bids.as_slice() else {
+            panic!("expected the original bid to remain active");
+        };
+        assert_eq!(resting.updated_at, placed_at);
+        assert_eq!(resting.order.limit_price, ceiling);
+    }
+
+    #[test]
+    fn rejected_replacement_cancels_the_resting_bid_if_exposure_has_increased() {
+        let placed_at = t(3, 12);
+        let repriced_at = placed_at + Duration::minutes(6);
+        let platform = Platform::CsFloat;
+        let quote = PriceSnapshot {
+            platform,
+            item: item(),
+            float_bucket: Some(FloatBucket::FieldTestedLow),
+            price: Money(8_000),
+            observed_at: placed_at,
+        };
+        let other = PriceSnapshot {
+            item: ItemId {
+                market_hash_name: "AK-47 | Slate (Field-Tested)".into(),
+                ..item()
+            },
+            price: Money(10_000),
+            ..quote.clone()
+        };
+        let bids = [
+            (&quote, Money(8_500), placed_at),
+            (&other, Money(5_000), placed_at - Duration::minutes(55)),
+        ]
+        .map(|(snapshot, price, observed_at)| BuyOrder {
+            platform,
+            item: snapshot.item.clone(),
+            float_bucket: snapshot.float_bucket,
+            price,
+            quantity: 1,
+            observed_at,
+        });
+        let mut sales = Vec::new();
+        for (snapshot, crossed_at, price) in [
+            (&other, placed_at + Duration::minutes(1), Money(4_900)),
+            (&quote, repriced_at + Duration::seconds(1), Money(7_000)),
+        ] {
+            let crossing = Sale {
+                id: format!("crossing-{}", snapshot.item.market_hash_name),
+                platform,
+                item: snapshot.item.clone(),
+                price,
+                float_value: Some(0.20),
+                sold_at: crossed_at,
+                verified: true,
+            };
+            sales.extend((0..15).map(|i| Sale {
+                id: format!("{}-{i}", crossing.id),
+                sold_at: t(2, 10),
+                ..crossing.clone()
+            }));
+            sales.push(crossing);
+        }
+        let snapshots = [
+            quote.clone(),
+            other.clone(),
+            PriceSnapshot {
+                price: Money(12_000),
+                observed_at: repriced_at,
+                ..quote
+            },
+        ];
+        let dashboard = run_peg_bid_engine(
+            &snapshots,
+            &sales,
+            &bids,
+            &[],
+            &fees(),
+            PegBidConfig {
+                lower_to_ceiling: true,
+                min_median_samples: 1,
+                lookback_days: 1,
+                ..PegBidConfig::default()
+            },
+            RelistConfig::default(),
+            RiskLimits {
+                max_total_exposure: Money(12_000),
+                ..RiskLimits::default()
+            },
+            &KillSwitch::new(),
+            Some(Money(50_000)),
+            None,
+        )
+        .unwrap();
+        assert_eq!(dashboard.bids_placed, 2);
+        assert_eq!(dashboard.bids_filled, 1);
+        assert!(dashboard.active_mock_bids.is_empty());
+        assert_eq!(
+            dashboard.locked_inventory[0].item,
+            other.item.market_hash_name
+        );
+    }
+
+    #[test]
+    fn an_empty_book_refresh_cancels_the_resting_bid_before_the_next_print() {
+        let quote = PriceSnapshot {
+            platform: Platform::CsFloat,
+            item: item(),
+            float_bucket: Some(FloatBucket::FieldTestedLow),
+            price: Money(10_000),
+            observed_at: t(3, 12),
+        };
+        let bid = BuyOrder {
+            platform: quote.platform,
+            item: quote.item.clone(),
+            float_bucket: quote.float_bucket,
+            price: Money(8_500),
+            quantity: 1,
+            observed_at: t(3, 13),
+        };
+        let mut sales: Vec<_> = (0..15)
+            .map(|n| Sale {
+                id: format!("history-{n}"),
+                platform: quote.platform,
+                item: quote.item.clone(),
+                price: quote.price,
+                float_value: Some(0.20),
+                sold_at: t(3, 10),
+                verified: true,
+            })
+            .collect();
+        sales.push(Sale {
+            id: "cross".into(),
+            price: Money(8_400),
+            sold_at: t(3, 14),
+            ..sales[0].clone()
+        });
+        let refreshes = [
+            BidRefresh {
+                at: bid.observed_at,
+                platform: bid.platform,
+                item: bid.item.clone(),
+                bids: vec![bid.clone()],
+            },
+            BidRefresh {
+                at: t(3, 14),
+                platform: bid.platform,
+                item: bid.item,
+                bids: vec![],
+            },
+        ];
+        let dashboard = run_peg_bid_engine(
+            &[quote],
+            &sales,
+            &[],
+            &refreshes,
+            &fees(),
+            PegBidConfig::default(),
+            RelistConfig::default(),
+            RiskLimits::default(),
+            &KillSwitch::new(),
+            Some(Money(50_000)),
+            None,
+        )
+        .unwrap();
+        assert_eq!(dashboard.bids_placed, 1);
+        assert_eq!(dashboard.bids_filled, 0);
+        assert!(dashboard.active_mock_bids.is_empty());
+        assert_eq!(dashboard.cash_balance, Some(Money(50_000)));
     }
 }

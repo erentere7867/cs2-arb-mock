@@ -317,8 +317,12 @@ impl RelistEngine {
 
                     let schedule = fees.get(pos.acquired_on);
                     let gross_proceeds = ask_price.checked_mul(pos.quantity)?;
-                    let seller_fee = schedule.seller_fee(gross_proceeds)?;
+                    let unit_seller_fee = schedule.seller_fee(ask_price)?;
+                    let seller_fee = unit_seller_fee.checked_mul(pos.quantity)?;
                     let net_proceeds = gross_proceeds.checked_sub(seller_fee)?;
+                    if net_proceeds.0 <= 0 {
+                        continue;
+                    }
                     let realized_net_pnl = net_proceeds.checked_sub(pos.cost_basis)?;
 
                     let record = RealizedRelistSale {

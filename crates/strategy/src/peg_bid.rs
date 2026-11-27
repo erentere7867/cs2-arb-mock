@@ -533,18 +533,16 @@ pub fn compute_effective_ceiling(
         return Ok(None);
     }
 
-    let sell_subtotal = rolling_median.checked_mul(config.quantity)?;
-    let sell_proceeds = fees.seller_proceeds(sell_subtotal)?;
-    if sell_proceeds.0 <= 0 {
+    let unit_sell_proceeds = fees.seller_proceeds(rolling_median)?;
+    if unit_sell_proceeds.0 <= 0 {
         return Ok(None);
     }
 
     let opp_fraction = config.opportunity_cost_fraction();
     let buyer_factor = 1.0 + fees.buyer_fee_pct / 100.0;
     let total_multiplier = (1.0 + target_margin + opp_fraction) * buyer_factor;
-    let per_unit_proceeds = (sell_proceeds.0 as f64
-        - fees.buyer_fixed_fee.0 as f64 * (1.0 + target_margin + opp_fraction))
-        / f64::from(config.quantity);
+    let per_unit_proceeds = unit_sell_proceeds.0 as f64
+        - fees.buyer_fixed_fee.0 as f64 * (1.0 + target_margin + opp_fraction);
     let mut candidate = ((per_unit_proceeds / total_multiplier).floor() as i64).min(raw_ceiling.0);
 
     if candidate <= 0 {
@@ -594,10 +592,10 @@ pub fn evaluate_bid_economics(
 ) -> Result<PegBidEconomics> {
     let raw_margin_ceiling =
         Money((rolling_median.0 as f64 * (1.0 - config.target_margin_fraction())).floor() as i64);
-    let buy_subtotal = unit_bid.checked_mul(config.quantity)?;
-    let buy_cost = fees.buyer_total(buy_subtotal)?;
-    let sell_subtotal = rolling_median.checked_mul(config.quantity)?;
-    let sell_proceeds = fees.seller_proceeds(sell_subtotal)?;
+    let unit_buy_cost = fees.buyer_total(unit_bid)?;
+    let buy_cost = unit_buy_cost.checked_mul(config.quantity)?;
+    let unit_sell_proceeds = fees.seller_proceeds(rolling_median)?;
+    let sell_proceeds = unit_sell_proceeds.checked_mul(config.quantity)?;
     let opportunity_cost = cents_ceil(buy_cost.0 as f64 * config.opportunity_cost_fraction())?;
     let expected_net_profit = sell_proceeds
         .checked_sub(buy_cost)?

@@ -383,7 +383,7 @@ impl RelistEngine {
                         {
                             continue;
                         }
-                        let Some(ask) = self.rolling_median_price(
+                        let Some(ask) = self.rolling_median_ask(
                             platform,
                             &pos.item,
                             pos.float_bucket,
@@ -399,7 +399,7 @@ impl RelistEngine {
                         let net = fees
                             .get(platform)
                             .seller_order_proceeds(ask, pos.quantity)?;
-                        if net <= pos.cost_basis {
+                        if self.items[&id].entry.is_none() && net <= pos.cost_basis {
                             continue;
                         }
                         let value =
@@ -678,7 +678,7 @@ impl RelistEngine {
         self.total_seller_fees
     }
 
-    fn rolling_median_price(
+    fn rolling_median_ask(
         &self,
         platform: Platform,
         item: &ItemId,
@@ -688,6 +688,21 @@ impl RelistEngine {
         now: DateTime<Utc>,
     ) -> Option<Money> {
         let cutoff = now - Duration::days(self.config.lookback_days);
+        let mut asks: Vec<i64> = snapshots
+            .iter()
+            .filter(|q| {
+                q.platform == platform
+                    && &q.item == item
+                    && q.observed_at >= cutoff
+                    && q.observed_at <= now
+                    && q.price.0 > 0
+                    && (bucket.is_none() || q.float_bucket == bucket)
+            })
+            .map(|q| q.price.0)
+            .collect();
+        if asks.len() >= self.config.min_median_samples {
+            return Some(median_cents(&mut asks));
+        }
         let mut seen_ids = std::collections::HashSet::new();
         let mut prices: Vec<i64> = sales
             .iter()
@@ -703,22 +718,6 @@ impl RelistEngine {
             })
             .map(|s| s.price.0)
             .collect();
-
-        if prices.len() < self.config.min_median_samples {
-            prices.extend(
-                snapshots
-                    .iter()
-                    .filter(|q| {
-                        q.platform == platform
-                            && &q.item == item
-                            && q.observed_at >= cutoff
-                            && q.observed_at <= now
-                            && q.price.0 > 0
-                            && (bucket.is_none() || q.float_bucket == bucket)
-                    })
-                    .map(|q| q.price.0),
-            );
-        }
 
         if prices.len() < self.config.min_median_samples {
             return None;
@@ -1130,5 +1129,42 @@ mod tests {
     fn ready_to_sell_serializes_as_ready_to_sell() {
         let json = serde_json::to_string(&InventoryStatus::ReadyToSell).unwrap();
         assert_eq!(json, "\"READY_TO_SELL\"");
+    }
+
+    #[test]
+    fn unlock_relists_at_median_ask_even_below_cost() {
+        let mut engine = RelistEngine::new(RelistConfig::default()).unwrap();
+        let acquired = t(1, 12);
+        let position = make_position(acquired);
+        let fill = cs2_arb_core::Fill {
+            order: Order {
+                id: "peg-entry".into(),
+                side: OrderSide::Buy,
+                platform: position.acquired_on,
+                item: position.item.clone(),
+                float_bucket: position.float_bucket,
+                quantity: position.quantity,
+                limit_price: position.cost_basis,
+                submitted_at: acquired,
+            },
+            quantity: position.quantity,
+            unit_price: position.cost_basis,
+            fee: Money(0),
+            filled_at: acquired,
+        };
+        engine.track_filled_position(position.clone(), &fill, Money(0));
+        let now = position.locked_until;
+        let snapshots = [7500, 8000, 8100].map(|price| PriceSnapshot {
+            platform: position.acquired_on,
+            item: position.item.clone(),
+            float_bucket: position.float_bucket,
+            price: Money(price),
+            observed_at: now,
+        });
+        let step = engine
+            .step(&make_sales(20, 10_000, now), &snapshots, &fees(), now)
+            .unwrap();
+        assert_eq!(step.unlocked, [position.id]);
+        assert_eq!(step.listed_orders[0].limit_price, Money(8000));
     }
 }

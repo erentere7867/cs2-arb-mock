@@ -10,6 +10,8 @@ const HISTORY_LIMIT: usize = 24;
 const REPORT_LIMIT: u64 = 1024 * 1024;
 const SUMMARY: &str = "## Summary";
 const PEG: &str = "### Realized Buy-Order P&L";
+const ACTIVE_BIDS: &str = "### Active Mock Bids";
+const LOCKED_INVENTORY: &str = "### Locked Inventory";
 
 #[derive(Default, Serialize)]
 struct Pnl {
@@ -35,7 +37,15 @@ struct Batch {
 struct Latest {
     strategies: Vec<Strategy>,
     peg: BTreeMap<String, String>,
+    active_bids: Option<ReportTable>,
+    locked_inventory: Option<ReportTable>,
     markdown: String,
+}
+
+#[derive(Serialize)]
+struct ReportTable {
+    headers: Vec<String>,
+    rows: Vec<Vec<String>>,
 }
 
 #[derive(Default, Serialize)]
@@ -87,6 +97,8 @@ pub fn read_game(path: &Path) -> GameReports {
                 peg: parse_metrics(&markdown, PEG)
                     .map(|(name, data)| (name.to_owned(), data[0].to_owned()))
                     .collect(),
+                active_bids: parse_detail(&markdown, ACTIVE_BIDS),
+                locked_inventory: parse_detail(&markdown, LOCKED_INVENTORY),
                 strategies,
                 markdown,
             });
@@ -131,11 +143,39 @@ fn table<'a>(report: &'a str, section: &'a str) -> impl Iterator<Item = Vec<&'a 
         .skip_while(|line| line.trim().is_empty())
         .take_while(|line| line.starts_with('|'))
         .map(|line| {
-            line.trim_matches('|')
-                .split('|')
-                .map(str::trim)
-                .collect::<Vec<_>>()
+            let body = line.strip_prefix('|').unwrap_or(line);
+            let body = body.strip_suffix('|').unwrap_or(body);
+            let mut start = 0;
+            let mut fields = Vec::new();
+            for (i, _) in body.match_indices('|') {
+                if i == 0 || body.as_bytes()[i - 1] != b'\\' {
+                    fields.push(body[start..i].trim());
+                    start = i + 1;
+                }
+            }
+            fields.push(body[start..].trim());
+            fields
         })
+}
+
+fn parse_detail(report: &str, section: &str) -> Option<ReportTable> {
+    if !report.lines().any(|line| line == section) {
+        return None;
+    }
+    let decode = |fields: Vec<&str>| {
+        fields
+            .into_iter()
+            .map(|field| field.replace("\\|", "|"))
+            .collect()
+    };
+    let mut rows = table(report, section);
+    let headers: Vec<String> = rows.next().map(decode).unwrap_or_default();
+    let rows = rows
+        .skip(1)
+        .filter(|row| row.len() == headers.len())
+        .map(decode)
+        .collect();
+    Some(ReportTable { headers, rows })
 }
 
 fn parse_metrics<'a>(
@@ -200,6 +240,29 @@ fn money(raw: &str) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_peg_detail_tables_with_escaped_item_names() {
+        let report = r"
+### Active Mock Bids
+
+| Platform | Item | Bid |
+| --- | --- | ---: |
+| CsFloat | AK-47 \| Redline | $8.50 |
+
+### Locked Inventory
+
+_None_
+";
+        let bids = parse_detail(report, ACTIVE_BIDS).unwrap();
+        assert_eq!(bids.headers, ["Platform", "Item", "Bid"]);
+        assert_eq!(bids.rows[0], ["CsFloat", "AK-47 | Redline", "$8.50"]);
+        assert!(parse_detail(report, LOCKED_INVENTORY)
+            .unwrap()
+            .rows
+            .is_empty());
+        assert!(parse_detail("", LOCKED_INVENTORY).is_none());
+    }
 
     #[test]
     fn parses_live_filename_and_signed_money() {

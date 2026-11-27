@@ -4,11 +4,12 @@
 //! [`DipConfig::per_platform`]) keep a rolling 30-day window of observed prices. A buy is
 //! signalled when **all** of:
 //!
-//! 1. `price < mean - k_sigma * std_dev` of the *prior* window (the triggering observation
+//! 1. `price <= mean - k_sigma * std_dev` of the *prior* window (the triggering observation
 //!    is excluded from its own baseline), with at least `min_samples` prior observations;
-//! 2. the item is liquid: at least `min_sales_in_window` sales of the item (any platform)
-//!    in the trailing `liquidity_window_days` (7 by default);
+//! 2. recent sales on the quote's venue meet the minimum count and exceed the preceding
+//!    baseline sales rate by the configured multiplier;
 //! 3. an update/panic window derived from [`MarketEvent`]s is active at the observation time.
+//! 4. the price is no more than `max_drop_pct` below the mean.
 
 use std::collections::HashMap;
 
@@ -34,7 +35,11 @@ pub struct DipConfig {
     pub liquidity_window_days: i64,
     /// Minimum sales in the liquidity window. Default 10.
     pub min_sales_in_window: usize,
-    /// Count only sales flagged `verified`. Default false.
+    /// Minimum recent sales rate relative to the preceding baseline. Default 1.5.
+    pub volume_multiplier: f64,
+    /// Reject quotes more than this percentage below the rolling mean. Default 30.
+    pub max_drop_pct: f64,
+    /// Count only sales flagged `verified`. Default true.
     pub require_verified_sales: bool,
     /// Units per signal. Default 1.
     pub quantity: u32,
@@ -56,7 +61,9 @@ impl Default for DipConfig {
             min_samples: 10,
             liquidity_window_days: 7,
             min_sales_in_window: 10,
-            require_verified_sales: false,
+            volume_multiplier: 1.5,
+            max_drop_pct: 30.0,
+            require_verified_sales: true,
             quantity: 1,
             branch_update_window_hours: None,
             branches: None,
@@ -77,6 +84,12 @@ impl DipConfig {
         if self.min_samples < 2 {
             return bad("min_samples must be >= 2");
         }
+        if !self.volume_multiplier.is_finite() || self.volume_multiplier < 1.5 {
+            return bad("volume_multiplier must be finite and >= 1.5");
+        }
+        if !self.max_drop_pct.is_finite() || !(0.0..100.0).contains(&self.max_drop_pct) {
+            return bad("max_drop_pct must be finite and in [0, 100)");
+        }
         if self.quantity == 0 {
             return bad("quantity must be >= 1");
         }
@@ -84,6 +97,11 @@ impl DipConfig {
             return bad("branch_update_window_hours must be > 0");
         }
         Ok(())
+    }
+
+    pub fn volume_history_days(&self) -> i64 {
+        self.lookback_days
+            .saturating_add(self.liquidity_window_days)
     }
 }
 
@@ -236,14 +254,20 @@ pub struct DipEvaluation {
     pub threshold: Option<f64>,
     pub enough_samples: bool,
     pub below_band: bool,
+    pub within_max_drop: bool,
     pub sales_in_window: usize,
+    pub baseline_volume: f64,
     pub liquid: bool,
     pub window_active: bool,
 }
 
 impl DipEvaluation {
     pub fn triggered(&self) -> bool {
-        self.enough_samples && self.below_band && self.liquid && self.window_active
+        self.enough_samples
+            && self.below_band
+            && self.within_max_drop
+            && self.liquid
+            && self.window_active
     }
 }
 
@@ -315,6 +339,12 @@ impl DipDetector {
         );
     }
 
+    pub fn record_sales(&mut self, sales: &[Sale]) {
+        for sale in sales {
+            self.record_sale(sale);
+        }
+    }
+
     /// Sales of `item` in `(at - liquidity_window, at]`.
     pub fn sales_in_window(&self, item: &ItemId, at: DateTime<Utc>) -> usize {
         let from = at - Duration::days(self.config.liquidity_window_days);
@@ -335,17 +365,6 @@ impl DipDetector {
 
     /// Evaluates `snapshot` without recording it.
     pub fn evaluate(&self, snapshot: &PriceSnapshot) -> Result<DipEvaluation> {
-        let sales = self.sales_in_window(&snapshot.item, snapshot.observed_at);
-        self.evaluate_with_liquidity(snapshot, sales)
-    }
-
-    /// Like [`Self::evaluate`] but with an externally supplied trailing sales count (e.g. a
-    /// marketplace "sales last 7 days" aggregate).
-    pub fn evaluate_with_liquidity(
-        &self,
-        snapshot: &PriceSnapshot,
-        sales_in_window: usize,
-    ) -> Result<DipEvaluation> {
         if snapshot.price.0 <= 0 {
             return Err(Error::InvalidData(
                 "dip snapshot price must be positive".into(),
@@ -367,31 +386,44 @@ impl DipDetector {
         let stats = rolling_stats(&prior);
         let threshold = stats.map(|s| s.lower_band(self.config.k_sigma));
         let price = snapshot.price.0 as f64;
+        let current_from = at - Duration::days(self.config.liquidity_window_days);
+        let baseline_from = current_from - Duration::days(self.config.lookback_days);
+        let (mut sales_in_window, mut baseline_sales) = (0, 0);
+        if let Some(records) = self.sales.get(&snapshot.item) {
+            let start = records.partition_point(|record| record.at <= baseline_from);
+            let end = records.partition_point(|record| record.at <= at);
+            for record in &records[start..end] {
+                if record.platform == snapshot.platform {
+                    if record.at > current_from {
+                        sales_in_window += 1;
+                    } else {
+                        baseline_sales += 1;
+                    }
+                }
+            }
+        }
+        let baseline_volume = f64::from(baseline_sales) * self.config.liquidity_window_days as f64
+            / self.config.lookback_days as f64;
         Ok(DipEvaluation {
             stats,
             threshold,
             enough_samples: prior.len() >= self.config.min_samples,
-            below_band: threshold.is_some_and(|t| price < t),
+            below_band: threshold.is_some_and(|t| price <= t),
+            within_max_drop: stats
+                .is_some_and(|s| price >= s.mean * (1.0 - self.config.max_drop_pct / 100.0)),
             sales_in_window,
-            liquid: sales_in_window >= self.config.min_sales_in_window,
+            baseline_volume,
+            liquid: baseline_sales > 0
+                && sales_in_window >= self.config.min_sales_in_window
+                && sales_in_window as f64 >= self.config.volume_multiplier * baseline_volume,
             window_active: self.windows.is_active(at),
         })
     }
 
     /// Evaluates `snapshot`, then adds it to its series. Returns a signal if triggered.
     pub fn observe(&mut self, snapshot: &PriceSnapshot) -> Result<Option<DipSignal>> {
-        let sales = self.sales_in_window(&snapshot.item, snapshot.observed_at);
-        self.observe_with_liquidity(snapshot, sales)
-    }
-
-    /// [`Self::observe`] with an externally supplied trailing sales count.
-    pub fn observe_with_liquidity(
-        &mut self,
-        snapshot: &PriceSnapshot,
-        sales_in_window: usize,
-    ) -> Result<Option<DipSignal>> {
-        let eval = self.evaluate_with_liquidity(snapshot, sales_in_window)?;
-        self.insert(snapshot);
+        let eval = self.evaluate(snapshot)?;
+        self.record_baseline_price(snapshot);
         self.prune(snapshot.observed_at);
         if !eval.triggered() {
             return Ok(None);
@@ -409,7 +441,10 @@ impl DipDetector {
         }))
     }
 
-    fn insert(&mut self, snapshot: &PriceSnapshot) {
+    pub fn record_baseline_price(&mut self, snapshot: &PriceSnapshot) {
+        if snapshot.price.0 <= 0 {
+            return;
+        }
         let series = self.prices.entry(self.key(snapshot)).or_default();
         let pos = series.partition_point(|(t, _)| *t <= snapshot.observed_at);
         series.insert(pos, (snapshot.observed_at, snapshot.price.0 as f64));
@@ -421,7 +456,7 @@ impl DipDetector {
             let cut = series.partition_point(|(t, _)| *t < price_from);
             series.drain(..cut);
         }
-        let sales_from = now - Duration::days(self.config.liquidity_window_days);
+        let sales_from = now - Duration::days(self.config.volume_history_days());
         for records in self.sales.values_mut() {
             let cut = records.partition_point(|r| r.at <= sales_from);
             records.drain(..cut);
@@ -540,7 +575,16 @@ mod tests {
 
     fn liquid_sales(at: DateTime<Utc>, n: usize) -> Vec<Sale> {
         (0..n)
-            .map(|i| sale(i, at - Duration::hours(i as i64 + 1)))
+            .map(|i| Sale {
+                platform: Platform::DMarket,
+                verified: true,
+                ..sale(i, at - Duration::hours(i as i64 + 1))
+            })
+            .chain(std::iter::once(Sale {
+                platform: Platform::DMarket,
+                verified: true,
+                ..sale(100, at - Duration::days(8))
+            }))
             .collect()
     }
 
@@ -626,7 +670,11 @@ mod tests {
 
     #[test]
     fn liquidity_counts_trailing_seven_days_and_verified_filter() {
-        let mut det = DipDetector::new(DipConfig::default()).unwrap();
+        let mut det = DipDetector::new(DipConfig {
+            require_verified_sales: false,
+            ..DipConfig::default()
+        })
+        .unwrap();
         let at = t0() + Duration::days(30);
         for i in 0..10 {
             det.record_sale(&sale(i, at - Duration::days(1)));
@@ -649,6 +697,47 @@ mod tests {
     }
 
     #[test]
+    fn dip_requires_same_venue_volume_surge_and_rejects_excessive_drop() {
+        let mut det = DipDetector::new(DipConfig {
+            lookback_days: 14,
+            liquidity_window_days: 7,
+            ..DipConfig::default()
+        })
+        .unwrap();
+        for day in 16..30 {
+            det.observe(&snap(day, 3000)).unwrap();
+        }
+        for event in panic_window(29, 31) {
+            det.apply_event(&event);
+        }
+        let quote = snap(30, 3000);
+        let at = quote.observed_at;
+        assert!(!det.evaluate(&quote).unwrap().triggered());
+
+        for i in 0..16 {
+            det.record_sale(&Sale {
+                platform: quote.platform,
+                verified: true,
+                ..sale(100 + i, at - Duration::days(7))
+            });
+        }
+        let recent = liquid_sales(at, 12);
+        det.record_sales(&recent[..11]);
+        det.record_sale(&Sale {
+            platform: Platform::CsFloat,
+            ..recent[11].clone()
+        });
+        let eval = det.evaluate(&quote).unwrap();
+        assert_eq!(eval.baseline_volume, 8.0);
+        assert_eq!(eval.sales_in_window, 11);
+        assert!(!eval.triggered());
+        det.record_sale(&recent[11]);
+        assert!(det.evaluate(&quote).unwrap().triggered()); // exact price and volume boundaries
+        assert!(!det.evaluate(&snap(30, 2099)).unwrap().triggered());
+        assert!(det.evaluate(&snap(30, 2100)).unwrap().triggered());
+    }
+
+    #[test]
     fn baseline_excludes_old_and_current_observations() {
         let mut det = DipDetector::new(DipConfig {
             min_sales_in_window: 0,
@@ -667,7 +756,7 @@ mod tests {
         let stats = eval.stats.unwrap();
         assert_eq!(stats.count, 30);
         assert!((stats.mean - 3000.0).abs() < 1e-9);
-        assert!(eval.below_band && eval.liquid && eval.enough_samples);
+        assert!(eval.below_band && !eval.liquid && eval.enough_samples);
         assert!(!eval.window_active);
         assert!(!eval.triggered());
     }
@@ -744,12 +833,6 @@ mod tests {
         let events: Vec<MarketEvent> =
             serde_json::from_str(include_str!("../../../data/fixtures/market_events.json"))
                 .unwrap();
-        // The fixture has no sales; treat the item as liquid via min_sales_in_window = 0.
-        let config = DipConfig {
-            min_sales_in_window: 0,
-            ..DipConfig::default()
-        };
-        let signals = evaluate_dip(&quotes, &events, &[], &config).unwrap();
         let (
             MarketEvent::PanicWindowOpened { opened_at, .. },
             MarketEvent::PanicWindowClosed { closed_at, .. },
@@ -757,6 +840,8 @@ mod tests {
         else {
             panic!("fixture layout");
         };
+        let sales = liquid_sales(*opened_at, 10);
+        let signals = evaluate_dip(&quotes, &events, &sales, &DipConfig::default()).unwrap();
         assert!(signals
             .iter()
             .any(|s| s.snapshot.platform == Platform::DMarket

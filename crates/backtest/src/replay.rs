@@ -1215,7 +1215,8 @@ mod tests {
             // Restrict day 2 to one unit at the best ask even though verified sales allow more.
             let mut rows = snapshots.clone().map(|quote| (quote, 2, 70));
             rows[2].1 = 1;
-            let depth = depth_with_snapshots(&rows);
+            let mut depth = depth_with_snapshots(&rows);
+            add_dip_baseline_sale(&mut depth);
             let mut strategies: Vec<Box<dyn StrategyAdapter>> = vec![Box::new(
                 DipAdapter::new(
                     DipConfig {
@@ -1268,7 +1269,8 @@ mod tests {
             .zip([70, 70, 140, 0, 70])
             .map(|(quote, count)| (quote, 2, count))
             .collect::<Vec<_>>();
-        let depth = depth_with_snapshots(&rows);
+        let mut depth = depth_with_snapshots(&rows);
+        add_dip_baseline_sale(&mut depth);
         let mut strategies: Vec<Box<dyn StrategyAdapter>> = vec![Box::new(
             DipAdapter::new(
                 DipConfig {
@@ -1303,6 +1305,40 @@ mod tests {
         assert_eq!(report.trades[0].quantity, 1);
         assert_eq!(report.trades[0].net_pnl, Money(300));
         assert_eq!(report.totals.open_positions, 1);
+    }
+
+    fn add_dip_baseline_sale(depth: &mut crate::integrated::MarketDepth) {
+        depth.add_sales([cs2_arb_core::Sale {
+            id: "dip-baseline".into(),
+            platform: Platform::CsFloat,
+            item: item(),
+            price: Money(1000),
+            float_value: Some(0.18),
+            sold_at: t(-6),
+            verified: true,
+        }]);
+    }
+
+    #[test]
+    fn default_spread_exits_at_unlock_even_when_the_edge_has_disappeared() {
+        let snapshots = [
+            snap(Platform::CsFloat, 0, 1000),
+            snap(Platform::DMarket, 0, 1400),
+            snap(Platform::DMarket, 6, 900),
+            snap(Platform::DMarket, 7, 900),
+        ];
+        let report = Backtester::new(BacktestConfig::new(fees()))
+            .run(
+                SimulationMode,
+                &snapshots,
+                &[],
+                &mut [Box::new(SpreadStrategy::default())],
+            )
+            .unwrap();
+        assert_eq!(report.trades.len(), 1);
+        assert_eq!(report.trades[0].locked_until, t(7));
+        assert_eq!(report.trades[0].closed_at, t(7));
+        assert!(report.trades[0].net_pnl.0 < 0);
     }
 
     #[test]

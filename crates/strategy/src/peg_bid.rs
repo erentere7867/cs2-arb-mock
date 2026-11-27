@@ -1,7 +1,7 @@
 //! Automated peg-bidding strategy (mock simulation only).
 //!
 //! Ingests read-only top-of-book buy orders from supported marketplaces (CSFloat /
-//! Skinport), computes `target_bid = max_current_bid + bid_increment`, enforces a
+//! Waxpeer), computes `target_bid = max_current_bid + bid_increment`, enforces a
 //! strict margin ceiling guaranteeing at least `target_margin_pct` (7% default)
 //! net profit after platform fees and the 7-day trade hold, and applies cooldown
 //! and debounce controls to prevent 1-cent bot-war churn.
@@ -50,7 +50,7 @@ pub struct PegBidConfig {
     pub lower_to_ceiling: bool,
     /// Units per mock buy order. Default 1.
     pub quantity: u32,
-    /// Platforms permitted for peg-bidding. Default `[CsFloat, Skinport]`.
+    /// Platforms permitted for peg-bidding. Default `[CsFloat, Waxpeer]`.
     pub allowed_platforms: Vec<Platform>,
 }
 
@@ -69,7 +69,7 @@ impl Default for PegBidConfig {
             resting_bid_ttl_secs: None,
             lower_to_ceiling: false,
             quantity: 1,
-            allowed_platforms: vec![Platform::CsFloat, Platform::Skinport, Platform::Waxpeer],
+            allowed_platforms: vec![Platform::CsFloat, Platform::Waxpeer],
         }
     }
 }
@@ -78,13 +78,13 @@ impl PegBidConfig {
     pub fn validate(&self) -> Result<()> {
         let bad = |msg: &str| Err(Error::InvalidConfig(format!("peg_bid: {msg}")));
         if !self.target_margin_pct.is_finite()
-            || self.target_margin_pct <= 0.0
+            || self.target_margin_pct < 7.0
             || self.target_margin_pct >= 100.0
         {
-            return bad("target_margin_pct must be finite and in (0, 100)");
+            return bad("target_margin_pct must be finite and in [7, 100)");
         }
-        if self.bid_increment.0 <= 0 {
-            return bad("bid_increment must be > 0");
+        if self.bid_increment != Money(1) {
+            return bad("bid_increment must be 1 cent");
         }
         if self.hold_days < 7 {
             return bad("hold_days must be >= 7 to match the mandatory 7-day CS2 trade hold");
@@ -98,8 +98,8 @@ impl PegBidConfig {
         if self.min_median_samples == 0 {
             return bad("min_median_samples must be >= 1");
         }
-        if self.cooldown_secs < 0 {
-            return bad("cooldown_secs must be >= 0");
+        if self.cooldown_secs <= 0 {
+            return bad("cooldown_secs must be > 0");
         }
         if self.min_reprice_delta.0 < 0 {
             return bad("min_reprice_delta must be >= 0");
@@ -113,8 +113,13 @@ impl PegBidConfig {
         if self.quantity == 0 {
             return bad("quantity must be >= 1");
         }
-        if self.allowed_platforms.is_empty() {
-            return bad("allowed_platforms must not be empty");
+        if self.allowed_platforms.is_empty()
+            || self
+                .allowed_platforms
+                .iter()
+                .any(|platform| !matches!(platform, Platform::CsFloat | Platform::Waxpeer))
+        {
+            return bad("allowed_platforms must contain only CSFloat or Waxpeer");
         }
         Ok(())
     }
@@ -274,6 +279,9 @@ impl PegBidStrategy {
                 })
                 .or_insert_with(|| order.clone());
         }
+        self.active_bids.retain(|key @ (venue, bid_item, _), _| {
+            *venue != platform || bid_item != item || self.top_bids.contains_key(key)
+        });
     }
 
     /// Record a verified sale into the rolling median price history.
@@ -379,6 +387,7 @@ impl PegBidStrategy {
 
         let Some((rolling_median, _)) = self.rolling_median(platform, item, float_bucket, now)
         else {
+            self.active_bids.remove(&key);
             let found = self.sample_count(platform, item, float_bucket, now);
             return Ok(PegBidDecision::Skipped(
                 PegBidSkipReason::InsufficientMedianHistory {
@@ -421,25 +430,28 @@ impl PegBidStrategy {
             &self.config,
         )?;
 
+        let mut violates_ceiling = false;
         if let Some(existing) = self.active_bids.get(&key) {
             let current = existing.order.limit_price;
             // Safety override: if the existing resting bid now violates the new margin
             // ceiling, bypass cooldown/debounce so we never stay exposed above ceiling.
-            let violates_ceiling = current > effective_ceiling;
-            if !violates_ceiling {
-                if proposed_bid == current {
-                    return Ok(PegBidDecision::Skipped(PegBidSkipReason::Unchanged));
+            violates_ceiling = current > effective_ceiling;
+            if !violates_ceiling && proposed_bid == current {
+                return Ok(PegBidDecision::Skipped(PegBidSkipReason::Unchanged));
+            }
+        }
+        if !violates_ceiling {
+            if let Some(last) = self.last_updated.get(&key) {
+                let elapsed = (now - *last).num_seconds();
+                if elapsed < self.config.cooldown_secs {
+                    return Ok(PegBidDecision::Skipped(PegBidSkipReason::CooldownActive {
+                        remaining_secs: self.config.cooldown_secs - elapsed,
+                    }));
                 }
-                if let Some(last) = self.last_updated.get(&key) {
-                    let elapsed = (now - *last).num_seconds();
-                    if elapsed < self.config.cooldown_secs {
-                        return Ok(PegBidDecision::Skipped(PegBidSkipReason::CooldownActive {
-                            remaining_secs: self.config.cooldown_secs - elapsed,
-                        }));
-                    }
-                }
-                let delta = (proposed_bid.0 - current.0).abs();
-                if delta < self.config.min_reprice_delta.0 {
+            }
+            if let Some(existing) = self.active_bids.get(&key) {
+                let current = existing.order.limit_price;
+                if (proposed_bid.0 - current.0).abs() < self.config.min_reprice_delta.0 {
                     return Ok(PegBidDecision::Skipped(PegBidSkipReason::Debounced {
                         current,
                         proposed: proposed_bid,
@@ -512,6 +524,38 @@ impl PegBidStrategy {
             .find(|(_, bid)| bid.order.id == order_id)
             .map(|(k, _)| k.clone())?;
         self.active_bids.remove(&key)
+    }
+
+    pub fn cancel_unprofitable_bids(
+        &mut self,
+        fees: &FeeSchedules,
+        now: DateTime<Utc>,
+    ) -> Result<()> {
+        let mut cancelled = Vec::new();
+        for (key @ (platform, item, bucket), active) in &self.active_bids {
+            let ceiling = match self.rolling_median(*platform, item, *bucket, now) {
+                Some((median, _)) => {
+                    compute_effective_ceiling(median, fees.get(*platform), &self.config)?
+                }
+                None => None,
+            };
+            let target_exceeds_ceiling =
+                if let (Some(ceiling), Some(top)) = (ceiling, self.top_bids.get(key)) {
+                    !self.config.lower_to_ceiling
+                        && top.price.checked_add(self.config.bid_increment)? > ceiling
+                } else {
+                    false
+                };
+            if target_exceeds_ceiling
+                || ceiling.is_none_or(|ceiling| active.order.limit_price > ceiling)
+            {
+                cancelled.push(key.clone());
+            }
+        }
+        for key in cancelled {
+            self.active_bids.remove(&key);
+        }
+        Ok(())
     }
 
     /// Active mock bids, sorted deterministically for display and logging.

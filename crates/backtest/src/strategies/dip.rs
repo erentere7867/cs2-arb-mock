@@ -1,48 +1,42 @@
-use std::collections::{HashMap, VecDeque};
-
 use chrono::Duration;
-use cs2_arb_core::{Money, Order, Result};
+use cs2_arb_core::{Money, Order, Result, Sale};
+use cs2_arb_strategy::{DipConfig, DipDetector};
 
 use super::{buy_order, exit_orders, ExitRule};
-use crate::replay::{MarketView, QuoteKey, StrategyAdapter};
+use crate::replay::{MarketView, StrategyAdapter};
 
-/// Event dip: while a panic window is open, buy a platform quote trading at
-/// least `dip_pct` below its own trailing mean, then sell after the hold once
-/// the best net exit recovers past the take-profit level.
+/// Replay adapter for the shared rolling dip detector.
 #[derive(Debug, Clone)]
 pub struct DipStrategy {
     pub name: String,
-    pub dip_pct: f64,
-    /// Number of prior quotes in the trailing mean; no signal until it is full.
-    pub lookback: usize,
-    pub require_panic_window: bool,
-    pub quantity: u32,
     pub max_open_per_item: usize,
     pub exit: ExitRule,
-    history: HashMap<QuoteKey, VecDeque<i64>>,
+    detector: DipDetector,
     next_id: u64,
 }
 
 impl Default for DipStrategy {
     fn default() -> Self {
-        Self {
+        Self::with_sales(DipConfig::default(), &[]).expect("default dip config is valid")
+    }
+}
+
+impl DipStrategy {
+    pub fn with_sales(config: DipConfig, sales: &[Sale]) -> Result<Self> {
+        let mut detector = DipDetector::new(config)?;
+        detector.record_sales(sales);
+        Ok(Self {
             name: "dip".into(),
-            dip_pct: 10.0,
-            lookback: 7,
-            require_panic_window: true,
-            quantity: 1,
             max_open_per_item: 2,
             exit: ExitRule {
                 take_profit_pct: 5.0,
                 max_hold: Duration::days(21),
             },
-            history: HashMap::new(),
+            detector,
             next_id: 0,
-        }
+        })
     }
-}
 
-impl DipStrategy {
     fn next_id(name: &str, counter: &mut u64) -> String {
         *counter += 1;
         format!("{name}-order-{counter}")
@@ -59,37 +53,28 @@ impl StrategyAdapter for DipStrategy {
         let counter = &mut self.next_id;
         let mut orders = exit_orders(view, self.exit, || Self::next_id(&name, counter))?;
 
-        let window_open = !self.require_panic_window || view.panic_window_active();
+        for event in view.new_events {
+            self.detector.apply_event(event);
+        }
         let mut planned: Vec<(&cs2_arb_core::ItemId, Option<cs2_arb_core::FloatBucket>)> =
             Vec::new();
         for snapshot in view.batch {
-            let key = QuoteKey::of(snapshot);
-            let series = self.history.entry(key).or_default();
-            if window_open && series.len() >= self.lookback && self.lookback > 0 {
-                let mean = series.iter().sum::<i64>() as f64 / series.len() as f64;
-                let threshold = mean * (1.0 - self.dip_pct / 100.0);
+            if let Some(signal) = self.detector.observe(snapshot)? {
+                let quantity = signal.order.quantity;
                 let item_key = (&snapshot.item, snapshot.float_bucket);
                 let open = view
                     .open_positions_for(&snapshot.item, snapshot.float_bucket)
                     .count()
                     + planned.iter().filter(|k| **k == item_key).count();
                 let fees = view.fees.get(snapshot.platform);
-                if (snapshot.price.0 as f64) <= threshold
-                    && open < self.max_open_per_item
-                    && fees.seller_order_proceeds(Money(mean.floor() as i64), self.quantity)?
-                        > fees.buyer_order_total(snapshot.price, self.quantity)?
+                if open < self.max_open_per_item
+                    && fees
+                        .seller_order_proceeds(Money(signal.stats.mean.floor() as i64), quantity)?
+                        > fees.buyer_order_total(snapshot.price, quantity)?
                 {
                     planned.push(item_key);
-                    orders.push(buy_order(
-                        Self::next_id(&name, counter),
-                        snapshot,
-                        self.quantity,
-                    ));
+                    orders.push(buy_order(Self::next_id(&name, counter), snapshot, quantity));
                 }
-            }
-            series.push_back(snapshot.price.0);
-            while series.len() > self.lookback {
-                series.pop_front();
             }
         }
         Ok(orders)

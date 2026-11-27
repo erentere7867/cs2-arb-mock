@@ -11,8 +11,9 @@ use cs2_arb_sim::venues::VenueTradeHold;
 use cs2_arb_sim::{wear::quote_bucket, MockExecutor, SimConfig};
 use cs2_arb_strategy::executor::execute_with_risk;
 use cs2_arb_strategy::{
-    evaluate_spread, evaluate_spread_with_holds, spread_breakdown_with_hold, DipConfig,
-    DipDetector, KillSwitch, RiskLimits, RiskManager, SpreadBreakdown, SpreadConfig, SubmitError,
+    evaluate_spread, evaluate_spread_with_holds, median_cents, spread_breakdown_with_hold,
+    DipConfig, DipDetector, KillSwitch, RiskLimits, RiskManager, SpreadBreakdown, SpreadConfig,
+    SubmitError,
 };
 
 use crate::{FillModel, FillOutcome, MarketView, QuoteKey, StrategyAdapter};
@@ -93,23 +94,6 @@ impl MarketDepth {
                 verified: true,
             })
         }));
-    }
-
-    fn verified_volume(&self, quote: &PriceSnapshot, days: i64) -> usize {
-        let after = quote.observed_at - Duration::days(days);
-        self.sales
-            .iter()
-            .filter(|sale| {
-                sale.verified
-                    && sale.platform == quote.platform
-                    && sale.item == quote.item
-                    && sale.sold_at > after
-                    && sale.sold_at <= quote.observed_at
-                    && quote_bucket(sale.item.wear_tier, sale.float_value) == Ok(quote.float_bucket)
-            })
-            .map(|sale| &sale.id)
-            .collect::<HashSet<_>>()
-            .len()
     }
 }
 
@@ -532,21 +516,52 @@ impl StrategyAdapter for SpreadAdapter {
     }
 }
 
-pub struct DipAdapter<'a> {
+pub struct DipAdapter {
     detector: DipDetector,
-    depth: &'a MarketDepth,
 }
 
-impl<'a> DipAdapter<'a> {
-    pub fn new(config: DipConfig, depth: &'a MarketDepth) -> Result<Self> {
-        Ok(Self {
-            detector: DipDetector::new(config)?,
-            depth,
-        })
+impl DipAdapter {
+    pub fn new(config: DipConfig, depth: &MarketDepth) -> Result<Self> {
+        let mut detector = DipDetector::new(config)?;
+        detector.record_sales(depth.sales());
+        Ok(Self { detector })
+    }
+
+    pub fn seed_daily_sale_prices(&mut self, sales: &[Sale], first_quote: DateTime<Utc>) {
+        let first_day = first_quote.date_naive();
+        let cutoff = first_quote - Duration::days(self.detector.config().lookback_days);
+        let mut seen = HashSet::new();
+        let mut daily: HashMap<_, Vec<_>> = HashMap::new();
+        for sale in sales
+            .iter()
+            .filter(|sale| sale.verified && sale.price.0 > 0)
+        {
+            if sale.sold_at < cutoff || sale.sold_at.date_naive() >= first_day {
+                continue;
+            }
+            let Ok(bucket) = quote_bucket(sale.item.wear_tier, sale.float_value) else {
+                continue;
+            };
+            if seen.insert((sale.platform, &sale.id)) {
+                daily
+                    .entry((sale.sold_at.date_naive(), sale.platform, &sale.item, bucket))
+                    .or_default()
+                    .push(sale.price.0);
+            }
+        }
+        for ((day, platform, item, float_bucket), mut prices) in daily {
+            self.detector.record_baseline_price(&PriceSnapshot {
+                platform,
+                item: item.clone(),
+                float_bucket,
+                price: median_cents(&mut prices),
+                observed_at: day.and_hms_opt(23, 59, 59).unwrap().and_utc(),
+            });
+        }
     }
 }
 
-impl StrategyAdapter for DipAdapter<'_> {
+impl StrategyAdapter for DipAdapter {
     fn name(&self) -> &str {
         "dip"
     }
@@ -577,10 +592,7 @@ impl StrategyAdapter for DipAdapter<'_> {
             }
         }
         for quote in view.batch {
-            let depth = self
-                .depth
-                .verified_volume(quote, self.detector.config().liquidity_window_days);
-            if let Some(signal) = self.detector.observe_with_liquidity(quote, depth)? {
+            if let Some(signal) = self.detector.observe(quote)? {
                 let schedule = view.fees.get(quote.platform);
                 let (price, quantity) = view
                     .preview_fill(self.name(), &signal.order)
@@ -659,5 +671,54 @@ fn exit_order(
         quantity: position.quantity,
         limit_price,
         submitted_at: now,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn live_dip_price_baseline_uses_completed_daily_verified_medians() {
+        let now = DateTime::parse_from_rfc3339("2025-01-30T12:00:00Z")
+            .unwrap()
+            .to_utc();
+        let item = ItemId {
+            market_hash_name: "Redline".into(),
+            wear_tier: cs2_arb_core::WearTier::FieldTested,
+        };
+        let quote = PriceSnapshot {
+            platform: Platform::DMarket,
+            item: item.clone(),
+            float_bucket: Some(FloatBucket::FieldTestedLow),
+            price: Money(750),
+            observed_at: now,
+        };
+        let sales: Vec<_> = [
+            (2, 900, true),
+            (2, 1100, true),
+            (1, 1000, true),
+            (1, 3000, false),
+            (0, 3000, true),
+            (-1, 3000, true),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(n, (days, price, verified))| Sale {
+            id: n.to_string(),
+            platform: quote.platform,
+            item: item.clone(),
+            price: Money(price),
+            float_value: Some(0.2),
+            sold_at: now - Duration::days(days),
+            verified,
+        })
+        .collect();
+        let mut adapter = DipAdapter::new(DipConfig::default(), &MarketDepth::default()).unwrap();
+        adapter.seed_daily_sale_prices(&sales, now);
+        let stats = adapter.detector.evaluate(&quote).unwrap().stats.unwrap();
+        assert_eq!(stats.count, 2);
+        assert_eq!(stats.mean, 1000.0);
+        assert_eq!(stats.std_dev, 0.0);
     }
 }

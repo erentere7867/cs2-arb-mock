@@ -268,6 +268,7 @@ async fn run(cli: Cli) -> Result<()> {
     let audited_markets = live_platforms.as_deref().unwrap_or(markets).to_vec();
     let accounts = if let Some(rules) = &settings.venue_accounts {
         rules.validate(markets)?;
+        rules.validate_transfer_venues(&audited_markets)?;
         let accounts = VenueAccounts::new(rules.clone(), fees.clone());
         for schedule in [
             &mut fees.skinport,
@@ -640,6 +641,30 @@ transfer_out_seconds = 0
         .unwrap();
         assert_eq!(report.venue_trade_holds.len(), 1);
         assert_eq!(report.venue_trade_holds[0].platform, Platform::Skinport);
+    }
+
+    #[test]
+    fn selected_live_venues_scope_scheduled_transfers() {
+        let rules: VenueAccountsConfig = toml::from_str(
+            r#"
+[[transfers]]
+at = "2025-01-08T12:00:00Z"
+from = "skinport"
+to = "csfloat"
+amount = 100
+"#,
+        )
+        .unwrap();
+        let settings: Settings = toml::from_str(r#"markets = ["skinport", "csfloat"]"#).unwrap();
+        let secrets = dmarket_secrets(None, None);
+        for market in [Market::Skinport, Market::Csfloat] {
+            let selected = settings.live_platforms(vec![market], &secrets).unwrap();
+            let error = rules.validate_transfer_venues(&selected).unwrap_err();
+            assert!(matches!(error, Error::InvalidConfig(message)
+                if message.contains("requires both venues to be selected")));
+        }
+        let selected = settings.live_platforms(vec![], &secrets).unwrap();
+        rules.validate_transfer_venues(&selected).unwrap();
     }
 
     #[test]

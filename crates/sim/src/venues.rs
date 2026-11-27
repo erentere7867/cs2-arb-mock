@@ -44,6 +44,18 @@ pub struct VenueAccountsConfig {
 }
 
 impl VenueAccountsConfig {
+    pub fn validate_transfer_venues(&self, selected: &[Platform]) -> Result<()> {
+        for transfer in &self.transfers {
+            if !selected.contains(&transfer.from) || !selected.contains(&transfer.to) {
+                return Err(Error::InvalidConfig(format!(
+                    "venue_accounts: transfer from {:?} to {:?} requires both venues to be selected",
+                    transfer.from, transfer.to
+                )));
+            }
+        }
+        Ok(())
+    }
+
     pub fn validate(&self, venues: &[Platform]) -> Result<()> {
         let bad = |message: &str| Error::InvalidConfig(format!("venue_accounts: {message}"));
         if self.venues.len() != venues.len()

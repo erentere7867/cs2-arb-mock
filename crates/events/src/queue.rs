@@ -27,8 +27,6 @@ use crate::clock::{Clock, SystemClock};
 use crate::source::AppBranchSnapshot;
 use crate::watcher::{detect_changes, Baseline, BranchChange, Detection, WatcherConfig};
 
-static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
-
 fn storage(err: impl std::fmt::Display) -> Error {
     Error::Storage(err.to_string())
 }
@@ -315,7 +313,11 @@ impl EventQueue {
             )
         };
         let pool = pool_options.connect_with(options).await.map_err(storage)?;
-        MIGRATOR.run(&pool).await.map_err(storage)?;
+        sqlx::migrate!("./migrations")
+            .set_ignore_missing(true)
+            .run(&pool)
+            .await
+            .map_err(storage)?;
         Ok(Self {
             pool,
             config: QueueConfig {

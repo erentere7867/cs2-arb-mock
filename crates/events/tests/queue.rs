@@ -31,6 +31,27 @@ fn config() -> QueueConfig {
 }
 
 #[tokio::test]
+async fn queue_reopens_with_an_unknown_applied_migration() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("events.db");
+    let location = path.to_str().unwrap();
+    EventQueue::open(location).await.unwrap().close().await;
+
+    let options = sqlx::sqlite::SqliteConnectOptions::new().filename(&path);
+    let pool = sqlx::SqlitePool::connect_with(options).await.unwrap();
+    sqlx::query(
+        "INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time)
+         VALUES (99999999999999, 'future migration', TRUE, X'', 0)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    pool.close().await;
+
+    EventQueue::open(location).await.unwrap().close().await;
+}
+
+#[tokio::test]
 async fn market_history_survives_reopen_and_prunes_by_game() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("events.db");

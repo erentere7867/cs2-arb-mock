@@ -1,4 +1,5 @@
-use std::collections::{BTreeMap, HashMap};
+use std::cmp::Reverse;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -34,15 +35,27 @@ const DETAILED_BUY_ORDERS: Endpoint = Endpoint {
     path: "/v2/buy-orders",
 };
 const BID_PAGE_SIZE: usize = 100;
-const MAX_BID_OWNERS: u32 = 100;
+const MAX_BID_ORDERS: usize = 100;
 const MAX_BID_PAGES: usize = 3;
-type BidOwners = HashMap<String, (Money, DateTime<Utc>)>;
+
+#[derive(Hash, PartialEq, Eq)]
+enum BidIdentity {
+    Id(u64),
+    Fallback {
+        owner: String,
+        price: i64,
+        page: usize,
+    },
+}
+
+type DetailedBids = HashMap<BidIdentity, (Money, DateTime<Utc>)>;
 
 fn add_detailed_bid_page(
     body: &[u8],
     item: &ItemId,
     game: &str,
-    owners: &mut BidOwners,
+    orders: &mut DetailedBids,
+    page: usize,
     observed_at: DateTime<Utc>,
 ) -> Result<usize> {
     #[derive(Deserialize)]
@@ -53,13 +66,14 @@ fn add_detailed_bid_page(
     }
     #[derive(Deserialize)]
     struct Row {
+        id: Option<u64>,
         name: String,
         game: String,
         price: Minor,
         amount: u32,
         filled: u32,
         filters: Option<serde_json::Value>,
-        by: String,
+        by: Option<String>,
     }
     let response: Response = parse_json("Waxpeer detailed buy orders", body)?;
     if !response.success {
@@ -73,14 +87,23 @@ fn add_detailed_bid_page(
             || bid.game != game
             || bid.filters.is_some()
             || bid.amount <= bid.filled
-            || bid.by.is_empty()
         {
             continue;
         }
-        let price = bid.price.cents(false)?;
+        let raw_price = bid.price.nonnegative_value()?;
+        let price = cents_from_i64(raw_price / 10)?;
         if price.0 > 0 {
-            owners
-                .entry(bid.by)
+            let key = match (bid.id, bid.by) {
+                (Some(id), _) => BidIdentity::Id(id),
+                (None, Some(owner)) if !owner.is_empty() => BidIdentity::Fallback {
+                    owner,
+                    price: raw_price,
+                    page,
+                },
+                _ => continue,
+            };
+            orders
+                .entry(key)
                 .and_modify(|old| {
                     if (observed_at, price) > (old.1, old.0) {
                         *old = (price, observed_at);
@@ -92,26 +115,19 @@ fn add_detailed_bid_page(
     Ok(count)
 }
 
-fn detailed_depth(owners: BidOwners, item: &ItemId) -> Vec<BuyOrder> {
-    let mut depth = BTreeMap::<(Money, std::cmp::Reverse<DateTime<Utc>>), u32>::new();
-    for (price, at) in owners.into_values() {
-        *depth.entry((price, std::cmp::Reverse(at))).or_default() += 1;
-    }
-    let mut remaining = MAX_BID_OWNERS;
+fn detailed_depth(orders: DetailedBids, item: &ItemId) -> Vec<BuyOrder> {
+    let mut depth: Vec<_> = orders.into_values().collect();
+    depth.sort_unstable_by_key(|&(price, at)| Reverse((price, at)));
     depth
         .into_iter()
-        .rev()
-        .map_while(|((price, std::cmp::Reverse(at)), quantity)| {
-            let quantity = remaining.min(quantity);
-            remaining -= quantity;
-            (quantity > 0).then(|| BuyOrder {
-                platform: Platform::Waxpeer,
-                item: item.clone(),
-                float_bucket: None,
-                price,
-                quantity,
-                observed_at: at,
-            })
+        .take(MAX_BID_ORDERS)
+        .map(|(price, observed_at)| BuyOrder {
+            platform: Platform::Waxpeer,
+            item: item.clone(),
+            float_bucket: None,
+            price,
+            quantity: 1,
+            observed_at,
         })
         .collect()
 }
@@ -127,7 +143,7 @@ enum Minor {
 }
 
 impl Minor {
-    fn cents(&self, ask: bool) -> Result<Money> {
+    fn nonnegative_value(&self) -> Result<i64> {
         let minor = match self {
             Self::Integer(value) => *value,
             Self::String(value) => value
@@ -137,6 +153,11 @@ impl Minor {
         if minor < 0 {
             return Err(Error::InvalidData("negative Waxpeer price".into()));
         }
+        Ok(minor)
+    }
+
+    fn cents(&self, ask: bool) -> Result<Money> {
+        let minor = self.nonnegative_value()?;
         cents_from_i64(minor / 10 + i64::from(ask && minor % 10 != 0))
     }
 }
@@ -336,7 +357,7 @@ impl MarketClient for WaxpeerClient {
                 return Ok(Vec::new());
             };
             let game = self.game_code();
-            let mut owners = HashMap::new();
+            let mut orders = HashMap::new();
             for page in 0..MAX_BID_PAGES {
                 let skip = (page * BID_PAGE_SIZE).to_string();
                 let query = query_string(&[
@@ -350,13 +371,19 @@ impl MarketClient for WaxpeerClient {
                     .http
                     .get(&DETAILED_BUY_ORDERS, &path, HeaderMap::new())
                     .await?;
-                let rows =
-                    add_detailed_bid_page(&body, item, game, &mut owners, self.http.clock().now())?;
-                if rows < BID_PAGE_SIZE || owners.len() >= MAX_BID_OWNERS as usize {
+                let rows = add_detailed_bid_page(
+                    &body,
+                    item,
+                    game,
+                    &mut orders,
+                    page,
+                    self.http.clock().now(),
+                )?;
+                if rows < BID_PAGE_SIZE || orders.len() >= MAX_BID_ORDERS {
                     break;
                 }
             }
-            return Ok(detailed_depth(owners, item));
+            return Ok(detailed_depth(orders, item));
         }
         let bids = self.fetch(&BUY_ORDERS, &self.bids, parse_bids).await?;
         Ok(bids
@@ -384,15 +411,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn detailed_depth_caps_owners_at_the_best_prices() {
+    fn detailed_depth_caps_orders_at_the_best_prices() {
         let item = ItemId {
             market_hash_name: "Alien Red".into(),
             wear_tier: cs2_arb_core::WearTier::NotApplicable,
         };
-        let owners = (0..150)
+        let orders = (0..150)
             .map(|index| {
                 (
-                    index.to_string(),
+                    BidIdentity::Id(index),
                     (
                         Money(if index < 60 { 1200 } else { 1100 }),
                         DateTime::<Utc>::UNIX_EPOCH,
@@ -400,17 +427,21 @@ mod tests {
                 )
             })
             .collect();
-        let bids = detailed_depth(owners, &item);
+        let bids = detailed_depth(orders, &item);
+        assert_eq!(bids.len(), 100);
         assert_eq!(
-            bids.iter()
-                .map(|bid| (bid.price, bid.quantity))
-                .collect::<Vec<_>>(),
-            [(Money(1200), 60), (Money(1100), 40)]
+            bids.iter().filter(|bid| bid.price == Money(1200)).count(),
+            60
         );
+        assert_eq!(
+            bids.iter().filter(|bid| bid.price == Money(1100)).count(),
+            40
+        );
+        assert!(bids.iter().all(|bid| bid.quantity == 1));
     }
 
     #[test]
-    fn detailed_depth_counts_one_funded_unit_per_distinct_unrestricted_owner() {
+    fn detailed_depth_counts_one_unit_per_distinct_unrestricted_order() {
         let item = ItemId {
             market_hash_name: "Alien Red".into(),
             wear_tier: cs2_arb_core::WearTier::NotApplicable,
@@ -421,21 +452,25 @@ mod tests {
           {"name":"Alien Red","game":"rust","price":12349,"amount":2,"filled":1,"by":"two"},
           {"name":"Alien Red","game":"rust","price":12000,"amount":4,"filled":1,"filters":null,"by":"one"}
         ]}"#;
-        let mut owners = HashMap::new();
+        let mut orders = HashMap::new();
         assert_eq!(
             add_detailed_bid_page(
                 body,
                 &item,
                 "rust",
-                &mut owners,
+                &mut orders,
+                0,
                 DateTime::<Utc>::UNIX_EPOCH
             )
             .unwrap(),
             4
         );
-        let bids = detailed_depth(owners, &item);
-        assert_eq!(bids.len(), 1);
-        assert_eq!(bids[0].quantity, 2);
-        assert_eq!(bids[0].price, Money(1234));
+        let bids = detailed_depth(orders, &item);
+        assert_eq!(
+            bids.iter()
+                .map(|bid| (bid.price, bid.quantity))
+                .collect::<Vec<_>>(),
+            [(Money(1234), 1), (Money(1234), 1), (Money(1200), 1)]
+        );
     }
 }

@@ -15,15 +15,17 @@ async fn detailed_bids_page_past_filtered_depth_on_get() {
     let clock = clock();
     let filtered = json!({"name":"Alien Red","game":"rust","price":14000,"amount":1,"filled":0,"filters":{"float_min":0.1},"by":"filtered"});
     let first_page: Vec<_> = [
-        json!({"name":"Alien Red","game":"rust","price":13000,"amount":1,"filled":0,"by":"earlier"}),
-        json!({"name":"Alien Red","game":"rust","price":12900,"amount":1,"filled":0,"by":"owner"}),
-    ].into_iter().chain(std::iter::repeat_n(filtered, 98)).collect();
+        json!({"id":1,"name":"Alien Red","game":"rust","price":13000,"amount":1,"filled":0,"by":"earlier"}),
+        json!({"id":2,"name":"Alien Red","game":"rust","price":12900,"amount":1,"filled":0,"by":"owner"}),
+        json!({"id":3,"name":"Alien Red","game":"rust","price":12800,"amount":1,"filled":0,"by":"owner"}),
+    ].into_iter().chain(std::iter::repeat_n(filtered, 97)).collect();
     for (skip, rows) in [
         ("0", first_page),
         (
             "100",
             vec![
                 json!({"name":"Alien Red","game":"rust","price":12500,"amount":5,"filled":0,"by":"owner"}),
+                json!({"id":3,"name":"Alien Red","game":"rust","price":12800,"amount":1,"filled":0,"by":"owner"}),
             ],
         ),
     ] {
@@ -51,12 +53,16 @@ async fn detailed_bids_page_past_filtered_depth_on_get() {
         wear_tier: WearTier::NotApplicable,
     };
     let bids = client.top_buy_orders(&item).await.unwrap();
-    assert_eq!(bids.len(), 2);
+    assert_eq!(bids.len(), 4);
     assert_eq!(bids[0].price, Money(1300));
     assert_eq!(bids[0].observed_at, t0() + chrono::TimeDelta::seconds(3));
-    assert_eq!(bids[1].price, Money(1250));
+    assert_eq!(bids[1].price, Money(1290));
     assert_eq!(bids[1].quantity, 1);
-    assert_eq!(bids[1].observed_at, t0() + chrono::TimeDelta::seconds(6));
+    assert_eq!(bids[1].observed_at, t0() + chrono::TimeDelta::seconds(3));
+    assert_eq!(bids[2].price, Money(1280));
+    assert_eq!(bids[2].observed_at, t0() + chrono::TimeDelta::seconds(6));
+    assert_eq!(bids[3].price, Money(1250));
+    assert_eq!(bids[3].observed_at, t0() + chrono::TimeDelta::seconds(6));
 }
 
 #[tokio::test]

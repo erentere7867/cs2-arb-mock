@@ -90,6 +90,14 @@ max_item_exposure = 25000
 max_total_exposure = 100000
 daily_drawdown_cap = 10000
 
+[market_regime]
+min_index_items = 3
+min_case_items = 2
+max_price_age_hours = 24
+short_loss_pct = 3.0
+long_loss_pct = 8.0
+item_underperformance_pct = 5.0
+
 [peg_bid]
 target_margin_pct = 7.0
 bid_increment = 1

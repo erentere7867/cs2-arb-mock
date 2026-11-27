@@ -1,6 +1,7 @@
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
 
 use chrono::TimeDelta;
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -14,6 +15,7 @@ use cs2_arb_core::{
 };
 use cs2_arb_sim::venues::{VenueAccounts, VenueAccountsConfig};
 use cs2_arb_sim::{FillLatency, LiquidityConfig, SimConfig};
+use cs2_arb_strategy::regime::{MarketRegime, RegimeConfig};
 use cs2_arb_strategy::{
     DipConfig, KillSwitch, PegBidConfig, RelistConfig, RiskLimits, SpreadConfig,
 };
@@ -121,6 +123,7 @@ struct Settings {
     dip: DipConfig,
     risk: RiskLimits,
     peg_bid: PegBidConfig,
+    market_regime: RegimeConfig,
     relist: RelistConfig,
 }
 
@@ -146,7 +149,7 @@ impl Settings {
             .max(self.relist.lookback_days)
             .max(self.relist.volume_window_days)
             .max(self.peg_bid.lookback_days)
-            .max(7)
+            .max(8)
     }
 }
 
@@ -339,6 +342,7 @@ async fn run(
     };
     let kill_switch = KillSwitch::with_defaults();
     let peg_config = settings.peg_bid.clone();
+    let regime_config = settings.market_regime.clone();
     let mut relist_config = settings.relist.clone();
     relist_config.instant_sale &= inputs.has_observed_bids;
     let risk_limits = settings.risk.clone();
@@ -366,6 +370,11 @@ async fn run(
         &kill_switch,
         None,
         accounts,
+        Some(&MarketRegime::new(
+            regime_config,
+            &inputs.snapshots,
+            inputs.depth.sales(),
+        )?),
     )?;
     peg_dashboard.log_summary();
     if let Some(directory) = output {
@@ -519,7 +528,12 @@ fn simulate_with_accounts(
     active_platforms: &[Platform],
     live_batch: bool,
 ) -> Result<PerformanceReport> {
-    let mut dip = DipAdapter::new(settings.dip, &inputs.depth)?;
+    let regime = Arc::new(MarketRegime::new(
+        settings.market_regime,
+        &inputs.snapshots,
+        inputs.depth.sales(),
+    )?);
+    let mut dip = DipAdapter::new(settings.dip, &inputs.depth)?.with_market_regime(regime);
     if live_batch {
         if let Some(first_quote) = inputs.snapshots.iter().map(|q| q.observed_at).min() {
             dip.seed_daily_sale_prices(inputs.depth.sales(), first_quote);

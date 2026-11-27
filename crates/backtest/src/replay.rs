@@ -1415,6 +1415,89 @@ mod tests {
     }
 
     #[test]
+    fn dip_regime_blocks_entries_but_allows_an_unlocked_stop_loss() {
+        use std::sync::Arc;
+
+        use crate::integrated::{DipAdapter, SimFillModel};
+        use cs2_arb_strategy::regime::{MarketRegime, RegimeConfig, RegimeStatus};
+        use cs2_arb_strategy::{DipConfig, KillSwitch, RiskLimits};
+
+        for entry_risk_off in [true, false] {
+            let quotes = [(0, 999), (1, 1001), (2, 900), (8, 1000), (9, 650)]
+                .map(|(day, price)| snap(Platform::CsFloat, day, price));
+            let mut snapshots = quotes.to_vec();
+            snapshots.push(snap(Platform::CsFloat, -5, 1000));
+            for name in ["Other One", "Other Two"] {
+                for (day, price) in [
+                    (-5, 1000),
+                    (1, 1000),
+                    (2, if entry_risk_off { 950 } else { 1000 }),
+                    (8, 1000),
+                    (9, 950),
+                ] {
+                    let mut quote = snap(Platform::CsFloat, day, price);
+                    quote.item.market_hash_name = name.into();
+                    snapshots.push(quote);
+                }
+            }
+            let mut depth = depth_with_snapshots(&quotes.map(|quote| (quote, 1, 70)));
+            add_dip_baseline_sale(&mut depth);
+            let regime = Arc::new(
+                MarketRegime::new(
+                    RegimeConfig {
+                        item_underperformance_pct: 15.0,
+                        ..RegimeConfig::default()
+                    },
+                    &snapshots,
+                    depth.sales(),
+                )
+                .unwrap(),
+            );
+            assert_eq!(regime.at(t(2)).allows(&item()), !entry_risk_off);
+            assert_eq!(regime.at(t(9)).state.status, RegimeStatus::MarketDowntrend);
+            let adapter = DipAdapter::new(
+                DipConfig {
+                    min_samples: 2,
+                    min_sales_in_window: 1,
+                    ..DipConfig::default()
+                },
+                &depth,
+            )
+            .unwrap()
+            .with_market_regime(regime);
+            let events = [MarketEvent::PanicWindowOpened {
+                branch: "test".into(),
+                opened_at: t(2),
+            }];
+            let fees = fees();
+            let model = SimFillModel::new(
+                &depth,
+                fees.clone(),
+                RiskLimits::default(),
+                KillSwitch::new(),
+            );
+            let report = Backtester::with_fill_model(BacktestConfig::new(fees), model)
+                .run(
+                    SimulationMode,
+                    &snapshots,
+                    &events,
+                    &mut [Box::new(adapter)],
+                )
+                .unwrap();
+            if entry_risk_off {
+                assert_eq!(report.totals.orders_filled, 0);
+            } else {
+                let [stop_loss] = report.trades.as_slice() else {
+                    panic!("expected one stop-loss trade")
+                };
+                assert_eq!(stop_loss.opened_at, t(2));
+                assert_eq!(stop_loss.closed_at, t(9));
+                assert!(stop_loss.net_pnl.0 < 0);
+            }
+        }
+    }
+
+    #[test]
     fn default_spread_exits_at_unlock_even_when_the_edge_has_disappeared() {
         let snapshots = [
             snap(Platform::CsFloat, 0, 1000),

@@ -1,12 +1,12 @@
 //! Wires [`PegBidStrategy`], [`BuyOrderFillSimulator`], and [`RelistEngine`] into
 //! the CLI mock simulation runner and formats the CLI dashboard/logs.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::fmt::Write as _;
 
 use chrono::{DateTime, Duration, Utc};
 use cs2_arb_core::{
-    BuyOrder, FeeSchedules, Money, Platform, PriceSnapshot, Result, Sale, SimulationMode,
+    BuyOrder, FeeSchedules, ItemId, Money, Platform, PriceSnapshot, Result, Sale, SimulationMode,
 };
 use cs2_arb_sim::{BuyOrderFillConfig, BuyOrderFillSimulator};
 use cs2_arb_strategy::{
@@ -242,6 +242,7 @@ pub fn run_peg_bid_engine(
     let mut bids_placed = 0usize;
     let mut bids_filled = 0usize;
     let mut last_now = None;
+    let mut latest_prices: HashMap<(Platform, ItemId), Money> = HashMap::new();
 
     for now in times {
         // Transition any lots whose 7-day lock expired before `now` so they are
@@ -275,12 +276,19 @@ pub fn run_peg_bid_engine(
         last_now = Some(now);
 
         while snap_idx < sorted_snapshots.len() && sorted_snapshots[snap_idx].observed_at <= now {
-            strategy.observe_snapshot(&sorted_snapshots[snap_idx]);
+            let snap = &sorted_snapshots[snap_idx];
+            if snap.price.0 > 0 {
+                latest_prices.insert((snap.platform, snap.item.clone()), snap.price);
+            }
+            strategy.observe_snapshot(snap);
             snap_idx += 1;
         }
 
         while sale_idx < sorted_sales.len() && sorted_sales[sale_idx].sold_at <= now {
             let sale = &sorted_sales[sale_idx];
+            if sale.price.0 > 0 {
+                latest_prices.insert((sale.platform, sale.item.clone()), sale.price);
+            }
             strategy.observe_sale(sale);
             for report in simulator.process_transaction(sale, now) {
                 bids_filled += 1;
@@ -318,6 +326,18 @@ pub fn run_peg_bid_engine(
                 ),
             }
         }
+
+        let unrealized_cents: i64 = simulator
+            .portfolio()
+            .positions()
+            .iter()
+            .filter_map(|pos| {
+                let mark = latest_prices.get(&(pos.acquired_on, pos.item.clone()))?;
+                let market_value = mark.0.saturating_mul(i64::from(pos.quantity));
+                Some(market_value.saturating_sub(pos.cost_basis.0))
+            })
+            .fold(0_i64, |acc, delta| acc.saturating_add(delta));
+        risk.set_unrealized_pnl(Money(unrealized_cents), now);
 
         let bid_start = bid_idx;
         while bid_idx < sorted_bids.len() && sorted_bids[bid_idx].observed_at <= now {

@@ -1,0 +1,17 @@
+[Unit]
+Description=Read-only mock market dashboard
+After=network.target
+
+[Service]
+User=ubuntu
+WorkingDirectory=/home/ubuntu/cs2-arb-mock-data
+ExecStart=/home/ubuntu/cs2-arb-mock-data/current/cs2-arb-dashboard
+Restart=on-failure
+RestartSec=5s
+UMask=0077
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+
+[Install]
+WantedBy=multi-user.target

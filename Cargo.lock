@@ -427,6 +427,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "cs2-arb-dashboard"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "clap",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tokio",
+]
+
+[[package]]
 name = "cs2-arb-events"
 version = "0.1.0"
 dependencies = [

@@ -12,7 +12,7 @@ sudo install -m 644 deploy/*.service /etc/systemd/system/
 sudo install -m 755 deploy/cs2-arb-run deploy/cs2-arb-update /usr/local/bin/
 sudo systemctl daemon-reload
 cs2-arb-update main
-sudo systemctl enable cs2-arb-watch cs2-arb-mock@cs2 cs2-arb-mock@rust
+sudo systemctl enable cs2-arb-watch cs2-arb-mock@cs2 cs2-arb-mock@rust cs2-arb-dashboard
 ```
 
 To update once the next PR lands, run **`cs2-arb-update main`** as `ubuntu`. It
@@ -33,7 +33,35 @@ To resume, remove the file and restart both mock units to clear the latched swit
 
 ## Read results
 
-Replace `REPORT.md` with a filename from the listing.
+The dashboard listens on **TCP 8787** (`0.0.0.0:8787`) once deployed.
+In Nginx Proxy Manager, create a **Proxy Host** with scheme **http**, forward
+hostname/IP set to the VPS address reachable from NPM (use the Docker host
+gateway or the VPS's private address if NPM runs in Docker), and forward
+port **8787**. Enable HTTPS and restrict access using an NPM Access List.
+The dashboard has no authentication of its own: firewall TCP 8787 so only
+the proxy can reach it, or bind to loopback if the proxy runs on the host.
+No WebSocket setup is required.
+
+The dashboard polls a local, read-only snapshot every five seconds. It uses
+the completed Markdown reports, the in-progress marker, the kill-switch file,
+the watcher's SQLite data (read-only), and, if readable by the service user,
+bounded samples from the two mock jobs' systemd journals. It displays observed
+CSFloat throttle signals, not an IP-ban diagnosis; missing journal samples or
+zero signals do not establish that CSFloat is healthy. The dashboard does not
+load the engine's `.env` or make marketplace requests. Inspect its startup
+with `sudo journalctl -u cs2-arb-dashboard -n 50`.
+
+To override the listening address or reports path, use
+`sudo systemctl edit cs2-arb-dashboard`, then restart it after saving the
+drop-in. The watcher DB and kill-switch file are found next to the reports directory.
+
+```ini
+[Service]
+Environment=CS2_ARB_DASHBOARD_BIND=127.0.0.1:8787
+Environment=CS2_ARB_DASHBOARD_REPORTS_DIR=/home/ubuntu/cs2-arb-mock-data/reports
+```
+
+For command-line inspection, replace `REPORT.md` with a filename from the listing.
 
 ```sh
 ls -1t /home/ubuntu/cs2-arb-mock-data/reports/{cs2,rust}/*.md

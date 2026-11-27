@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Mock Market Monitor</title>
+  <link rel="stylesheet" href="/dashboard.css">
+  <script src="/dashboard.js" defer></script>
+</head>
+<body>
+  <main>
+    <header class="masthead">
+      <div>
+        <p class="eyebrow">SIMULATION OPERATIONS</p>
+        <h1>Mock Market Monitor</h1>
+        <p>Batch results, market reads and Steam update signals.</p>
+      </div>
+      <div class="status">
+        <span id="connection" class="pill" role="status">Connecting</span>
+        <span id="updated" class="subtle">No snapshot yet</span>
+      </div>
+    </header>
+    <div class="toolbar">
+      <nav aria-label="Game">
+        <button type="button" data-game="cs2" aria-pressed="true">Counter-Strike 2</button>
+        <button type="button" data-game="rust" aria-pressed="false">Rust</button>
+      </nav>
+      <span id="kill" class="pill">Kill-switch file: checking</span>
+    </div>
+    <div id="dashboard"></div>
+    <footer>Mock only · No orders or market traffic from this dashboard · All times UTC</footer>
+  </main>
+</body>
+</html>

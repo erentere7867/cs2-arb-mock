@@ -406,10 +406,16 @@ impl StrategyAdapter for DipAdapter<'_> {
                 .verified_volume(quote, self.detector.config().liquidity_window_days);
             if let Some(signal) = self.detector.observe_with_liquidity(quote, depth)? {
                 let schedule = view.fees.get(quote.platform);
-                if schedule.funding.enabled()
-                    && schedule.seller_proceeds(Money(signal.stats.mean.floor() as i64))?
-                        <= schedule.buyer_total(quote.price)?
-                {
+                let quantity = signal.order.quantity;
+                let cost = quote
+                    .price
+                    .checked_mul(quantity)?
+                    .checked_add(schedule.buyer_order_fee(quote.price, quantity)?)?;
+                let mean = PriceSnapshot {
+                    price: Money(signal.stats.mean.floor() as i64),
+                    ..quote.clone()
+                };
+                if view.seller_proceeds(&mean, quantity)? <= cost {
                     continue;
                 }
                 if occupied.insert((quote.item.clone(), quote.float_bucket)) {

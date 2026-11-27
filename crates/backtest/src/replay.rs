@@ -969,6 +969,48 @@ mod tests {
     }
 
     #[test]
+    fn dip_only_buys_when_recovery_to_the_mean_covers_fees() {
+        use crate::integrated::{DipAdapter, MarketDepth};
+        use cs2_arb_core::Sale;
+        use cs2_arb_strategy::DipConfig;
+
+        let mut depth = MarketDepth::default();
+        depth.add_sales([Sale {
+            id: "baseline-sale".into(),
+            platform: Platform::CsFloat,
+            item: item(),
+            price: Money(1000),
+            float_value: Some(0.18),
+            sold_at: t(1),
+            verified: true,
+        }]);
+        for (dip_price, expected_fills) in [(990, 0), (900, 2)] {
+            let mut strategies: Vec<Box<dyn StrategyAdapter>> = vec![Box::new(
+                DipAdapter::new(
+                    DipConfig {
+                        min_samples: 2,
+                        min_sales_in_window: 1,
+                        ..DipConfig::default()
+                    },
+                    &depth,
+                )
+                .unwrap(),
+            )];
+            let snapshots = [(0, 999), (1, 1001), (2, dip_price), (9, 1000)]
+                .map(|(day, price)| snap(Platform::CsFloat, day, price));
+            let events = [MarketEvent::PanicWindowOpened {
+                branch: "test".into(),
+                opened_at: t(2),
+            }];
+            let report = Backtester::new(BacktestConfig::new(fees()))
+                .run(SimulationMode, &snapshots, &events, &mut strategies)
+                .unwrap();
+            assert_eq!(report.totals.orders_filled, expected_fills);
+            assert_eq!(report.totals.open_positions, 0);
+        }
+    }
+
+    #[test]
     fn best_exit_prefers_fresh_quote_to_expired_higher_price() {
         let stale = snap(Platform::DMarket, 0, 2000);
         let fresh = snap(Platform::Skinport, 2, 1000);

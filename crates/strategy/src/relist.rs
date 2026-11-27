@@ -13,8 +13,8 @@ use std::collections::HashMap;
 
 use chrono::{DateTime, Duration, Utc};
 use cs2_arb_core::{
-    Error, FeeSchedules, FloatBucket, ItemId, Money, Order, OrderSide, Platform, Position,
-    PriceSnapshot, Result, Sale, TradeFees,
+    BuyOrder, Error, FeeSchedules, FloatBucket, ItemId, Money, Order, OrderSide, Platform,
+    Position, PriceSnapshot, Result, Sale, TradeFees,
 };
 use serde::{Deserialize, Serialize};
 
@@ -41,6 +41,9 @@ pub struct RelistConfig {
     pub require_verified_sales: bool,
     /// Consider additional venues that have enough observed sales to fill a mock ask.
     pub cross_venue: bool,
+    pub instant_sale: bool,
+    pub maximum_bid_age_seconds: u32,
+    pub time_cost_bps_per_day: u32,
 }
 
 impl Default for RelistConfig {
@@ -53,6 +56,9 @@ impl Default for RelistConfig {
             min_listing_age_secs: 3600,
             require_verified_sales: true,
             cross_venue: false,
+            instant_sale: false,
+            maximum_bid_age_seconds: 60,
+            time_cost_bps_per_day: 0,
         }
     }
 }
@@ -140,6 +146,8 @@ pub struct RealizedRelistSale {
     pub listed_at: DateTime<Utc>,
     pub sold_at: DateTime<Utc>,
     pub trailing_volume: u32,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub instant: bool,
 }
 
 /// Outputs emitted by one monitoring tick of [`RelistEngine::step`].
@@ -162,6 +170,8 @@ pub struct RelistEngine {
     total_realized_pnl: Money,
     total_net_proceeds: Money,
     total_seller_fees: Money,
+    bids: HashMap<(Platform, ItemId, Option<FloatBucket>), Vec<BuyOrder>>,
+    balance_hold_seconds: HashMap<Platform, i64>,
 }
 
 impl RelistEngine {
@@ -174,11 +184,67 @@ impl RelistEngine {
             total_realized_pnl: Money(0),
             total_net_proceeds: Money(0),
             total_seller_fees: Money(0),
+            bids: HashMap::new(),
+            balance_hold_seconds: HashMap::new(),
         })
     }
 
     pub fn config(&self) -> &RelistConfig {
         &self.config
+    }
+
+    pub fn set_balance_hold(&mut self, platform: Platform, seconds: i64) {
+        self.balance_hold_seconds.insert(platform, seconds);
+    }
+
+    pub fn observe_bids(&mut self, bids: &[BuyOrder]) {
+        if !self.config.instant_sale {
+            return;
+        }
+        for bid in bids
+            .iter()
+            .filter(|bid| bid.platform != Platform::Skinport && bid.price.0 > 0 && bid.quantity > 0)
+        {
+            let levels = self
+                .bids
+                .entry((bid.platform, bid.item.clone(), bid.float_bucket))
+                .or_default();
+            if let Some(latest) = levels.first() {
+                if bid.observed_at < latest.observed_at {
+                    continue;
+                }
+                if bid.observed_at > latest.observed_at {
+                    levels.clear();
+                }
+            }
+            if !levels.iter().any(|level| level.price == bid.price) {
+                levels.push(bid.clone());
+            }
+        }
+    }
+
+    pub fn replace_bid_book(&mut self, platform: Platform, item: &ItemId, bids: &[BuyOrder]) {
+        if !self.config.instant_sale || platform == Platform::Skinport {
+            return;
+        }
+        self.bids
+            .retain(|(venue, bid_item, _), _| *venue != platform || bid_item != item);
+        for bid in bids.iter().filter(|bid| {
+            bid.platform == platform && &bid.item == item && bid.price.0 > 0 && bid.quantity > 0
+        }) {
+            self.bids
+                .entry((platform, item.clone(), bid.float_bucket))
+                .or_default()
+                .push(bid.clone());
+        }
+    }
+
+    fn time_adjusted(&self, platform: Platform, net: Money, wait: i64) -> i128 {
+        let wait =
+            i128::from(wait) + i128::from(*self.balance_hold_seconds.get(&platform).unwrap_or(&0));
+        let fraction =
+            ((wait * i128::from(self.config.time_cost_bps_per_day)) / 86_400).min(10_000);
+        i128::from(net.0) * (10_000 - fraction)
     }
 
     /// Register a newly filled simulated position. Starts `LOCKED` if `now < locked_until`,
@@ -268,6 +334,10 @@ impl RelistEngine {
         fees: &FeeSchedules,
         now: DateTime<Utc>,
     ) -> Result<()> {
+        if self.config.instant_sale {
+            self.transition_expired_locks(now);
+            return Ok(());
+        }
         self.advance(sales, snapshots, fees, now, false)?;
         Ok(())
     }
@@ -290,7 +360,7 @@ impl RelistEngine {
 
         for id in ids {
             let status = self.items[&id].status.clone();
-            match status {
+            let (oid, platform, ask_price, listed_at, trailing_vol, bid_level) = match status {
                 InventoryStatus::ReadyToSell => {
                     let pos = self.items[&id].position.clone();
                     if pos.is_trade_locked_at(now) {
@@ -302,7 +372,7 @@ impl RelistEngine {
                             .into_iter()
                             .filter(|p| self.config.cross_venue && *p != pos.acquired_on),
                     ) {
-                        if self.config.cross_venue
+                        if (self.config.cross_venue || self.config.instant_sale)
                             && self.trailing_volume(
                                 platform,
                                 &pos.item,
@@ -332,38 +402,98 @@ impl RelistEngine {
                         if net <= pos.cost_basis {
                             continue;
                         }
-                        if best.is_none_or(|(_, _, best_net)| net > best_net) {
-                            best = Some((platform, ask, net));
+                        let value =
+                            self.time_adjusted(platform, net, self.config.min_listing_age_secs);
+                        if best.is_none_or(|(_, _, best_value)| value > best_value) {
+                            best = Some((platform, ask, value));
                         }
                     }
-                    let Some((platform, ask_price, _)) = best else {
-                        continue;
-                    };
-                    let oid = order_id(
-                        "relist-ask",
-                        &[platform_slug(platform), &pos.item.market_hash_name],
-                        pos.float_bucket,
-                        now,
-                    );
-                    let order = Order {
-                        id: oid.clone(),
-                        side: OrderSide::Sell,
-                        platform,
-                        item: pos.item.clone(),
-                        float_bucket: pos.float_bucket,
-                        quantity: pos.quantity,
-                        limit_price: ask_price,
-                        submitted_at: now,
-                    };
-                    if let Some(tracked) = self.items.get_mut(&id) {
-                        tracked.status = InventoryStatus::Listed {
-                            order_id: oid,
-                            ask_price,
-                            listed_at: now,
-                            sell_platform: (platform != pos.acquired_on).then_some(platform),
-                        };
+                    let ask_value = best.map_or(0, |(_, _, value)| value);
+                    let mut instant = None;
+                    for platform in Platform::ALL {
+                        if platform != pos.acquired_on && !self.config.cross_venue {
+                            continue;
+                        }
+                        let key = (platform, pos.item.clone(), pos.float_bucket);
+                        let plain = (platform, pos.item.clone(), None);
+                        for key in [
+                            Some(key),
+                            (pos.float_bucket.is_some()
+                                && matches!(platform, Platform::DMarket | Platform::Waxpeer))
+                            .then_some(plain),
+                        ]
+                        .into_iter()
+                        .flatten()
+                        {
+                            let Some(levels) = self.bids.get(&key) else {
+                                continue;
+                            };
+                            for (index, bid) in levels.iter().enumerate() {
+                                if bid.quantity < pos.quantity
+                                    || bid.observed_at > now
+                                    || now - bid.observed_at
+                                        > Duration::seconds(i64::from(
+                                            self.config.maximum_bid_age_seconds,
+                                        ))
+                                {
+                                    continue;
+                                }
+                                let net = fees
+                                    .get(platform)
+                                    .seller_order_proceeds(bid.price, pos.quantity)?;
+                                let value = self.time_adjusted(platform, net, 0);
+                                if net > pos.cost_basis
+                                    && value > 0
+                                    && value >= ask_value
+                                    && instant
+                                        .as_ref()
+                                        .is_none_or(|(_, _, _, best_value)| value > *best_value)
+                                {
+                                    instant = Some((key.clone(), index, bid.price, value));
+                                }
+                            }
+                        }
                     }
-                    result.listed_orders.push(order);
+                    if let Some((key, index, price, _)) = instant {
+                        (
+                            format!("instant-{}-{now}", pos.id),
+                            key.0,
+                            price,
+                            now,
+                            0,
+                            Some((key, index)),
+                        )
+                    } else {
+                        let Some((platform, ask_price, _)) = best else {
+                            continue;
+                        };
+                        let oid = order_id(
+                            "relist-ask",
+                            &[platform_slug(platform), &pos.item.market_hash_name],
+                            pos.float_bucket,
+                            now,
+                        );
+                        let order = Order {
+                            id: oid.clone(),
+                            side: OrderSide::Sell,
+                            platform,
+                            item: pos.item.clone(),
+                            float_bucket: pos.float_bucket,
+                            quantity: pos.quantity,
+                            limit_price: ask_price,
+                            submitted_at: now,
+                        };
+                        if let Some(tracked) = self.items.get_mut(&id) {
+                            tracked.status = InventoryStatus::Listed {
+                                order_id: oid,
+                                ask_price,
+                                listed_at: now,
+                                sell_platform: (platform != pos.acquired_on).then_some(platform),
+                            };
+                        }
+                        result.listed_orders.push(order);
+                        continue;
+                    }
                 }
                 InventoryStatus::Listed {
                     order_id: oid,
@@ -398,68 +528,73 @@ impl RelistEngine {
                     if !has_crossing_print && !volume_fill_ok {
                         continue;
                     }
-
-                    let schedule = fees.get(platform);
-                    let gross_proceeds = ask_price.checked_mul(pos.quantity)?;
-                    let seller_fee = schedule.seller_order_fee(ask_price, pos.quantity)?;
-                    let net_proceeds = gross_proceeds.checked_sub(seller_fee)?;
-                    if net_proceeds.0 <= 0 {
-                        continue;
-                    }
-                    let realized_net_pnl = net_proceeds.checked_sub(pos.cost_basis)?;
-                    if realized_net_pnl.0 <= 0 {
-                        continue;
-                    }
-                    let (entry_schedule, entry_deposit, entry_fee) = self.items[&id].entry.map_or(
-                        (Default::default(), Money(0), Money(0)),
-                        |(deposit, fee)| (fees.get(pos.acquired_on), deposit, fee),
-                    );
-                    let fee_breakdown = TradeFees::from_allocated_trade(
-                        entry_schedule,
-                        schedule,
-                        entry_fee,
-                        seller_fee,
-                        entry_deposit,
-                        ask_price,
-                        pos.quantity,
-                    )?;
-
-                    let record = RealizedRelistSale {
-                        position_id: pos.id.clone(),
-                        order_id: oid,
-                        item: pos.item.clone(),
-                        float_bucket: pos.float_bucket,
-                        platform,
-                        quantity: pos.quantity,
-                        cost_basis: pos.cost_basis,
-                        ask_price,
-                        gross_proceeds,
-                        seller_fee,
-                        fee_breakdown,
-                        net_proceeds,
-                        realized_net_pnl,
-                        listed_at,
-                        sold_at: now,
-                        trailing_volume: trailing_vol,
-                    };
-
-                    self.total_realized_pnl =
-                        self.total_realized_pnl.checked_add(realized_net_pnl)?;
-                    self.total_net_proceeds = self.total_net_proceeds.checked_add(net_proceeds)?;
-                    self.total_seller_fees = self.total_seller_fees.checked_add(seller_fee)?;
-                    self.realized_sales.push(record.clone());
-                    if let Some(tracked) = self.items.get_mut(&id) {
-                        tracked.status = InventoryStatus::Sold {
-                            sold_at: now,
-                            ask_price,
-                            net_proceeds,
-                            realized_net_pnl,
-                        };
-                    }
-                    result.realized_sales.push(record);
+                    (oid, platform, ask_price, listed_at, trailing_vol, None)
                 }
-                InventoryStatus::Locked { .. } | InventoryStatus::Sold { .. } => {}
+                InventoryStatus::Locked { .. } | InventoryStatus::Sold { .. } => continue,
+            };
+
+            let pos = self.items[&id].position.clone();
+            let schedule = fees.get(platform);
+            let gross_proceeds = ask_price.checked_mul(pos.quantity)?;
+            let seller_fee = schedule.seller_order_fee(ask_price, pos.quantity)?;
+            let net_proceeds = gross_proceeds.checked_sub(seller_fee)?;
+            if net_proceeds.0 <= 0 {
+                continue;
             }
+            let realized_net_pnl = net_proceeds.checked_sub(pos.cost_basis)?;
+            if realized_net_pnl.0 <= 0 {
+                continue;
+            }
+            let (entry_schedule, entry_deposit, entry_fee) = self.items[&id].entry.map_or(
+                (Default::default(), Money(0), Money(0)),
+                |(deposit, fee)| (fees.get(pos.acquired_on), deposit, fee),
+            );
+            let fee_breakdown = TradeFees::from_allocated_trade(
+                entry_schedule,
+                schedule,
+                entry_fee,
+                seller_fee,
+                entry_deposit,
+                ask_price,
+                pos.quantity,
+            )?;
+
+            let record = RealizedRelistSale {
+                position_id: pos.id.clone(),
+                order_id: oid,
+                item: pos.item.clone(),
+                float_bucket: pos.float_bucket,
+                platform,
+                quantity: pos.quantity,
+                cost_basis: pos.cost_basis,
+                ask_price,
+                gross_proceeds,
+                seller_fee,
+                fee_breakdown,
+                net_proceeds,
+                realized_net_pnl,
+                listed_at,
+                sold_at: now,
+                trailing_volume: trailing_vol,
+                instant: bid_level.is_some(),
+            };
+
+            self.total_realized_pnl = self.total_realized_pnl.checked_add(realized_net_pnl)?;
+            self.total_net_proceeds = self.total_net_proceeds.checked_add(net_proceeds)?;
+            self.total_seller_fees = self.total_seller_fees.checked_add(seller_fee)?;
+            if let Some((key, index)) = bid_level {
+                self.bids.get_mut(&key).expect("selected bid book")[index].quantity -= pos.quantity;
+            }
+            self.realized_sales.push(record.clone());
+            if let Some(tracked) = self.items.get_mut(&id) {
+                tracked.status = InventoryStatus::Sold {
+                    sold_at: now,
+                    ask_price,
+                    net_proceeds,
+                    realized_net_pnl,
+                };
+            }
+            result.realized_sales.push(record);
         }
 
         Ok(result)
@@ -729,6 +864,149 @@ mod tests {
             assert_eq!(breakdown.crypto_deposit, Money(100));
             assert_eq!(breakdown.platform_buy, Money(50));
         }
+    }
+
+    #[test]
+    fn empty_bid_refresh_prevents_instant_sale_into_recent_depth() {
+        let acquired = t(1, 12);
+        let now = t(8, 12);
+        let mut engine = RelistEngine::new(RelistConfig {
+            instant_sale: true,
+            ..RelistConfig::default()
+        })
+        .unwrap();
+        engine.track_position(make_position(acquired), acquired);
+        engine.observe_bids(&[BuyOrder {
+            platform: Platform::CsFloat,
+            item: item(),
+            float_bucket: None,
+            price: Money(12_000),
+            quantity: 1,
+            observed_at: now - Duration::seconds(1),
+        }]);
+        engine.replace_bid_book(Platform::CsFloat, &item(), &[]);
+        let step = engine
+            .step(&make_sales(20, 10_000, now), &[], &fees(), now)
+            .unwrap();
+        assert!(step.realized_sales.is_empty());
+        assert_eq!(step.listed_orders.len(), 1);
+    }
+
+    #[test]
+    fn bid_refresh_preserves_distinct_page_ages() {
+        let acquired = t(1, 12);
+        let now = t(8, 12);
+        for (max_age, first_page_age, expected) in [
+            (2, 1, Money(13_000)),
+            (2, 3, Money(12_000)),
+            (0, 1, Money(12_000)),
+        ] {
+            let mut engine = RelistEngine::new(RelistConfig {
+                instant_sale: true,
+                maximum_bid_age_seconds: max_age,
+                ..RelistConfig::default()
+            })
+            .unwrap();
+            engine.track_position(make_position(acquired), acquired);
+            engine.replace_bid_book(
+                Platform::CsFloat,
+                &item(),
+                &[
+                    BuyOrder {
+                        platform: Platform::CsFloat,
+                        item: item(),
+                        float_bucket: None,
+                        price: Money(13_000),
+                        quantity: 1,
+                        observed_at: now - Duration::seconds(first_page_age),
+                    },
+                    BuyOrder {
+                        platform: Platform::CsFloat,
+                        item: item(),
+                        float_bucket: None,
+                        price: Money(12_000),
+                        quantity: 1,
+                        observed_at: now,
+                    },
+                ],
+            );
+            let step = engine
+                .step(&make_sales(20, 10_000, now), &[], &fees(), now)
+                .unwrap();
+            assert_eq!(step.realized_sales[0].ask_price, expected);
+        }
+    }
+
+    #[test]
+    fn instant_sale_compares_waiting_value_and_consumes_observed_depth_once() {
+        let acquired = t(1, 12);
+        let now = t(8, 12);
+        let mut engine = RelistEngine::new(RelistConfig {
+            instant_sale: true,
+            min_listing_age_secs: 86_400,
+            time_cost_bps_per_day: 200,
+            ..RelistConfig::default()
+        })
+        .unwrap();
+        let bid = BuyOrder {
+            platform: Platform::CsFloat,
+            item: item(),
+            float_bucket: None,
+            price: Money(9_900),
+            quantity: 1,
+            observed_at: now,
+        };
+        engine.track_position(make_position(acquired), acquired);
+        let mut second = make_position(acquired);
+        second.id = "peg-bid-2#pos".into();
+        engine.track_position(second, acquired);
+        engine.observe_bids(std::slice::from_ref(&bid));
+        let sales = make_sales(20, 10_000, now);
+        engine.list_at_unlock(&sales, &[], &fees(), now).unwrap();
+        assert!(engine.realized_sales().is_empty());
+        assert_eq!(engine.ready_to_sell().len(), 2);
+        let step = engine
+            .step(&make_sales(20, 10_000, now), &[], &fees(), now)
+            .unwrap();
+        assert_eq!(step.realized_sales.len(), 1);
+        assert_eq!(step.realized_sales[0].ask_price, Money(9_900));
+        assert_eq!(step.listed_orders.len(), 1);
+        assert_eq!(step.listed_orders[0].limit_price, Money(10_000));
+        let mut third = make_position(acquired);
+        third.id = "peg-bid-3#pos".into();
+        engine.track_position(third, acquired);
+        engine.observe_bids(&[bid]);
+        let later = engine
+            .step(&make_sales(20, 10_000, now), &[], &fees(), now)
+            .unwrap();
+        assert!(later.realized_sales.is_empty());
+        assert_eq!(later.listed_orders.len(), 1);
+    }
+
+    #[test]
+    fn listing_wins_when_the_bid_discount_exceeds_waiting_cost() {
+        let acquired = t(1, 12);
+        let now = t(8, 12);
+        let mut engine = RelistEngine::new(RelistConfig {
+            instant_sale: true,
+            time_cost_bps_per_day: 200,
+            ..RelistConfig::default()
+        })
+        .unwrap();
+        engine.track_position(make_position(acquired), acquired);
+        engine.observe_bids(&[BuyOrder {
+            platform: Platform::CsFloat,
+            item: item(),
+            float_bucket: None,
+            price: Money(9_900),
+            quantity: 1,
+            observed_at: now,
+        }]);
+        let step = engine
+            .step(&make_sales(20, 10_000, now), &[], &fees(), now)
+            .unwrap();
+        assert!(step.realized_sales.is_empty());
+        assert_eq!(step.listed_orders[0].limit_price, Money(10_000));
     }
 
     #[test]

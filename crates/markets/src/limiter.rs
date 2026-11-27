@@ -1,5 +1,5 @@
-//! Local sliding-window limiter (used for Skinport's documented 8 requests / 5 minutes per
-//! endpoint). Uses `tokio::time::Instant`, so it follows paused tokio time in tests.
+//! Local sliding-window limiter. Skinport's listings and sales history share 8 requests
+//! per 5 minutes. Uses `tokio::time::Instant`, so it follows paused tokio time in tests.
 
 use std::collections::VecDeque;
 use std::sync::Mutex;

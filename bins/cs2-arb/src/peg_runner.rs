@@ -9,12 +9,20 @@ use cs2_arb_core::{
     BuyOrder, FeeSchedules, FloatBucket, ItemId, Money, Platform, PriceSnapshot, Result, Sale,
     SimulationMode,
 };
+use cs2_arb_sim::venues::{VenueAccounts, VenueBalance};
 use cs2_arb_sim::{BuyOrderFillConfig, BuyOrderFillSimulator};
 use cs2_arb_strategy::{
     ActivePegBid, KillSwitch, PegBidConfig, PegBidStrategy, RealizedRelistSale, RelistConfig,
     RelistEngine, RiskLimits, RiskManager,
 };
 use serde::Serialize;
+
+pub struct BidRefresh {
+    pub at: DateTime<Utc>,
+    pub platform: Platform,
+    pub item: ItemId,
+    pub bids: Vec<BuyOrder>,
+}
 
 /// One trade-locked inventory entry displayed on the dashboard.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -43,7 +51,11 @@ pub struct PegBidDashboard {
     #[serde(skip_serializing_if = "money_is_zero")]
     pub prepaid_open_bid_fees: Money,
     pub total_seller_fees: Money,
+    #[serde(skip_serializing_if = "money_is_zero")]
+    pub transfer_fees_paid: Money,
     pub cash_balance: Option<Money>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub venue_balances: Vec<VenueBalance>,
 }
 
 impl PegBidDashboard {
@@ -184,6 +196,14 @@ impl PegBidDashboard {
                 .iter()
                 .filter_map(|s| s.fee_breakdown.map(|f| (s.position_id.as_str(), f))),
         );
+        cs2_arb_backtest::report::write_venue_balances(
+            &mut out,
+            std::iter::once(("peg-bid", self.venue_balances.as_slice())),
+        );
+        cs2_arb_backtest::report::write_transfer_fees(
+            &mut out,
+            std::iter::once(("peg-bid", self.transfer_fees_paid)),
+        );
         out
     }
 }
@@ -222,12 +242,14 @@ pub fn run_peg_bid_engine(
     snapshots: &[PriceSnapshot],
     sales: &[Sale],
     buy_orders: &[BuyOrder],
+    bid_refreshes: &[BidRefresh],
     fees: &FeeSchedules,
     peg_config: PegBidConfig,
     relist_config: RelistConfig,
     risk_limits: RiskLimits,
     kill_switch: &KillSwitch,
     starting_cash: Option<Money>,
+    accounts: Option<VenueAccounts>,
 ) -> Result<PegBidDashboard> {
     let resting_ttl = peg_config
         .resting_bid_ttl_secs
@@ -240,6 +262,14 @@ pub fn run_peg_bid_engine(
     };
     let mut simulator = BuyOrderFillSimulator::new(SimulationMode, sim_config, fees, 730)?;
     let mut relist = RelistEngine::new(relist_config)?;
+    if let Some(accounts) = accounts {
+        for platform in Platform::ALL {
+            if let Some(seconds) = accounts.sale_balance_hold(platform) {
+                relist.set_balance_hold(platform, seconds);
+            }
+        }
+        simulator.set_venue_accounts(accounts);
+    }
 
     let mut sorted_snapshots = snapshots.to_vec();
     sorted_snapshots.sort_by_key(|s| s.observed_at);
@@ -254,16 +284,20 @@ pub fn run_peg_bid_engine(
 
     let mut sorted_bids = buy_orders.to_vec();
     sorted_bids.sort_by_key(|b| b.observed_at);
+    let mut bid_refreshes: Vec<_> = bid_refreshes.iter().collect();
+    bid_refreshes.sort_by_key(|refresh| refresh.at);
 
     let mut times: BTreeSet<DateTime<Utc>> = BTreeSet::new();
     times.extend(sorted_snapshots.iter().map(|s| s.observed_at));
     times.extend(sorted_sales.iter().map(|s| s.sold_at));
     times.extend(sorted_bids.iter().map(|b| b.observed_at));
+    times.extend(bid_refreshes.iter().map(|refresh| refresh.at));
     let replay_end = times.last().copied();
 
     let mut snap_idx = 0usize;
     let mut sale_idx = 0usize;
     let mut bid_idx = 0usize;
+    let mut refresh_idx = 0usize;
     let mut bids_placed = 0usize;
     let mut bids_filled = 0usize;
     let mut last_now = None;
@@ -277,7 +311,10 @@ pub fn run_peg_bid_engine(
             || sorted_sales.get(sale_idx).is_some_and(|s| s.sold_at == now)
             || sorted_bids
                 .get(bid_idx)
-                .is_some_and(|b| b.observed_at == now);
+                .is_some_and(|b| b.observed_at == now)
+            || bid_refreshes
+                .get(refresh_idx)
+                .is_some_and(|refresh| refresh.at == now);
         if !market_tick
             && !resting_ttl.is_some_and(|ttl| {
                 simulator
@@ -299,6 +336,7 @@ pub fn run_peg_bid_engine(
             )?;
         }
 
+        simulator.advance_venue_accounts(now)?;
         last_now = Some(now);
 
         if let Some(ttl) = resting_ttl {
@@ -359,6 +397,20 @@ pub fn run_peg_bid_engine(
             sale_idx += 1;
         }
 
+        let bid_start = bid_idx;
+        while bid_idx < sorted_bids.len() && sorted_bids[bid_idx].observed_at <= now {
+            bid_idx += 1;
+        }
+        relist.observe_bids(&sorted_bids[bid_start..bid_idx]);
+        let refresh_start = refresh_idx;
+        while let Some(refresh) = bid_refreshes
+            .get(refresh_idx)
+            .filter(|refresh| refresh.at == now)
+        {
+            relist.replace_bid_book(refresh.platform, &refresh.item, &refresh.bids);
+            strategy.replace_buy_orders(refresh.platform, &refresh.item, &refresh.bids, now);
+            refresh_idx += 1;
+        }
         let relist_step = relist.step(
             &sorted_sales[..sale_idx],
             &sorted_snapshots[..snap_idx],
@@ -391,15 +443,26 @@ pub fn run_peg_bid_engine(
         let unrealized = compute_unrealized_pnl(&simulator, &latest_prices);
         risk.set_unrealized_pnl(unrealized, now);
 
-        let bid_start = bid_idx;
-        while bid_idx < sorted_bids.len() && sorted_bids[bid_idx].observed_at <= now {
-            bid_idx += 1;
-        }
-
-        if !kill_switch.is_engaged() && bid_start < bid_idx {
-            let batch = &sorted_bids[bid_start..bid_idx];
-            let orders = strategy.evaluate(batch, fees, now)?;
+        let historical_bids = &sorted_bids[bid_start..bid_idx];
+        let refreshed_bids = bid_refreshes[refresh_start..refresh_idx]
+            .iter()
+            .flat_map(|refresh| &refresh.bids);
+        if !kill_switch.is_engaged()
+            && (!historical_bids.is_empty() || refreshed_bids.clone().next().is_some())
+        {
+            let orders = strategy.evaluate(historical_bids, fees, now)?;
             for order in orders {
+                let cost = fees
+                    .get(order.platform)
+                    .buyer_order_total(order.limit_price, order.quantity)?;
+                if simulator
+                    .portfolio()
+                    .available_on(order.platform)
+                    .is_some_and(|cash| cash < cost)
+                {
+                    strategy.mark_filled(&order.id);
+                    continue;
+                }
                 if let Err(reason) = risk.check(&order, now) {
                     tracing::debug!(order_id = %order.id, %reason, "peg bid blocked by risk limits");
                     strategy.mark_filled(&order.id);
@@ -429,7 +492,7 @@ pub fn run_peg_bid_engine(
                 .into_iter()
                 .map(|b| (b.order.platform, b.order.item.clone(), b.order.float_bucket))
                 .collect();
-            for obs in batch {
+            for obs in historical_bids.iter().chain(refreshed_bids) {
                 let key = (obs.platform, obs.item.clone(), obs.float_bucket);
                 if !active_keys.contains(&key) {
                     simulator.cancel_bids_for_item(
@@ -450,6 +513,9 @@ pub fn run_peg_bid_engine(
         }
     }
 
+    if let Some(now) = last_now {
+        simulator.advance_venue_accounts(now)?;
+    }
     let active_mock_bids = strategy.active_bids().into_iter().cloned().collect();
     let locked_inventory = match last_now {
         Some(as_of) => relist
@@ -482,7 +548,9 @@ pub fn run_peg_bid_engine(
             .checked_sub(simulator.realized_bid_fee_losses())?,
         prepaid_open_bid_fees: simulator.unallocated_buy_fees(),
         total_seller_fees: relist.total_seller_fees(),
+        transfer_fees_paid: simulator.portfolio().transfer_fees_paid(),
         cash_balance: simulator.cash(),
+        venue_balances: simulator.portfolio().venue_balances()?,
     })
 }
 
@@ -675,6 +743,7 @@ mod tests {
             &snapshots,
             &sales,
             &bids,
+            &[],
             &fees(),
             PegBidConfig {
                 resting_bid_ttl_secs: Some(7 * 86_400 + 4 * 3_600),
@@ -686,6 +755,7 @@ mod tests {
             },
             RiskLimits::default(),
             &KillSwitch::new(),
+            None,
             None,
         )
         .unwrap();
@@ -749,12 +819,14 @@ mod tests {
             &snapshots,
             &sales,
             &buy_orders,
+            &[],
             &fees(),
             PegBidConfig::default(),
             RelistConfig::default(),
             RiskLimits::default(),
             &KillSwitch::new(),
             Some(Money(50_000)),
+            None,
         )
         .unwrap();
         assert_eq!(mid_dashboard.bids_placed, 1);
@@ -799,12 +871,14 @@ mod tests {
             &snapshots,
             &sales,
             &buy_orders,
+            &[],
             &fees(),
             PegBidConfig::default(),
             RelistConfig::default(),
             RiskLimits::default(),
             &KillSwitch::new(),
             Some(Money(50_000)),
+            None,
         )
         .unwrap();
 

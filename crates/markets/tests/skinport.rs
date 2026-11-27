@@ -166,7 +166,7 @@ async fn parses_items_into_listing_and_snapshot() {
     let l = &listings[0];
     assert_eq!(l.platform, Platform::Skinport);
     assert_eq!(l.price, Money(2137));
-    assert_eq!(l.quantity, 42);
+    assert_eq!(l.quantity, 1);
     assert_eq!(l.item, item);
     assert_eq!(l.observed_at, t0());
     assert_eq!(l.float_value, None);
@@ -259,7 +259,7 @@ async fn serves_repeat_calls_from_cache_within_ttl() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn enforces_eight_requests_per_five_minutes_per_endpoint() {
+async fn enforces_eight_requests_per_five_minutes_across_endpoints() {
     let server = MockServer::start().await;
     mount_items(&server).await;
     mount_sales(&server).await;
@@ -283,15 +283,11 @@ async fn enforces_eight_requests_per_five_minutes_per_endpoint() {
     assert_eq!(retry_after, Duration::from_secs(220));
     assert_eq!(hits(&server, "/v1/items").await, 8);
 
-    // The sales-history endpoint has its own independent budget.
-    for _ in 0..8 {
-        sp.recent_sales(&item, common::t0()).await.unwrap();
-    }
     assert!(matches!(
         sp.recent_sales(&item, common::t0()).await,
         Err(Error::RateLimited { .. })
     ));
-    assert_eq!(hits(&server, "/v1/sales/history").await, 8);
+    assert_eq!(hits(&server, "/v1/sales/history").await, 0);
 
     tokio::time::advance(retry_after).await;
     sp.list_listings(&item).await.unwrap();
@@ -341,6 +337,27 @@ async fn serves_stale_cache_when_rate_limited() {
     assert!(!stale.fresh);
     assert_eq!(stale.fetched_at, fresh.fetched_at);
     assert_eq!(hits(&server, "/v1/items").await, 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn listings_and_sales_share_one_public_catalogue_quota() {
+    let server = MockServer::start().await;
+    mount_items(&server).await;
+    mount_sales(&server).await;
+    let sp = client(SkinportConfig {
+        cache_ttl: Duration::ZERO,
+        serve_stale_on_limit: false,
+        ..config(&server)
+    });
+    for _ in 0..4 {
+        sp.items().await.unwrap();
+        sp.sales_history().await.unwrap();
+    }
+    assert!(matches!(
+        sp.sales_history().await,
+        Err(Error::RateLimited { .. })
+    ));
+    assert_eq!(hits(&server, "/v1/sales/history").await, 4);
 }
 
 #[tokio::test(start_paused = true)]

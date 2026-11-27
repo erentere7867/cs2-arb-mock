@@ -18,7 +18,10 @@ pub mod peg_bid;
 pub mod relist;
 pub mod risk;
 
-pub use arbitrage::{evaluate_spread, spread_breakdown, SpreadBreakdown, SpreadConfig};
+pub use arbitrage::{
+    evaluate_spread, evaluate_spread_with_holds, spread_breakdown, spread_breakdown_with_hold,
+    SpreadBreakdown, SpreadConfig,
+};
 pub use dip::{
     evaluate_dip, rolling_stats, DipConfig, DipDetector, DipEvaluation, DipSignal, EventWindows,
     RollingStats,

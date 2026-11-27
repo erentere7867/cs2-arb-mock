@@ -12,7 +12,7 @@ use serde::Serialize;
 
 use crate::book::MarketBook;
 use crate::clock::Clock;
-use crate::config::{valve_trade_hold, SimConfig};
+use crate::config::SimConfig;
 use crate::fees::{FeeBreakdown, PlatformFees};
 use crate::liquidity::{self, LiquidityStats};
 use crate::portfolio::{proportional_cost, LedgerEntry, Portfolio};
@@ -51,6 +51,7 @@ pub struct MockExecutor {
     order_fees: Option<FeeSchedules>,
     clock: Arc<dyn Clock>,
     rng: SplitMix64,
+    replay_schedules_fills: bool,
     book: MarketBook,
     portfolio: Portfolio,
     filled_order_ids: HashSet<String>,
@@ -58,6 +59,14 @@ pub struct MockExecutor {
 }
 
 impl MockExecutor {
+    pub fn set_venue_accounts(&mut self, accounts: crate::venues::VenueAccounts) {
+        self.portfolio.set_venue_accounts(accounts);
+    }
+
+    pub fn advance_venue_accounts(&mut self, at: DateTime<Utc>) -> Result<()> {
+        self.portfolio.advance_venue_accounts(at)
+    }
+
     /// Build an executor from core fee schedules (as loaded from config).
     pub fn new(
         mode: SimulationMode,
@@ -87,6 +96,7 @@ impl MockExecutor {
             order_fees: None,
             clock,
             rng: SplitMix64::new(seed),
+            replay_schedules_fills: false,
             book: MarketBook::new(),
             filled_order_ids: HashSet::new(),
             rejections: Vec::new(),
@@ -95,6 +105,12 @@ impl MockExecutor {
 
     pub fn config(&self) -> &SimConfig {
         &self.config
+    }
+
+    /// Execute at the current replay clock; the replay schedules orders before submitting them.
+    pub fn with_replay_scheduling(mut self) -> Self {
+        self.replay_schedules_fills = true;
+        self
     }
 
     pub fn fees(&self) -> &PlatformFees {
@@ -325,11 +341,19 @@ impl MockExecutor {
         now - listing.observed_at > self.config.max_listing_age
     }
 
-    fn fill_time(&mut self, now: DateTime<Utc>) -> DateTime<Utc> {
+    pub fn sample_fill_time(&mut self, now: DateTime<Utc>) -> DateTime<Utc> {
         let latency = self.config.fill_latency;
         let span_ms = (latency.max - latency.min).num_milliseconds().max(0) as u64;
         let offset = self.rng.below(span_ms.saturating_add(1)) as i64;
         now + latency.min + TimeDelta::milliseconds(offset)
+    }
+
+    fn fill_time(&mut self, now: DateTime<Utc>) -> DateTime<Utc> {
+        if self.replay_schedules_fills {
+            now
+        } else {
+            self.sample_fill_time(now)
+        }
     }
 
     fn buy_level(
@@ -418,7 +442,7 @@ impl MockExecutor {
             listings: mut level,
         } = self.buy_level(order, target, now)?;
         let fees = self.execution_fees(order, best_ask, quantity)?;
-        if let Some(cash) = self.portfolio.cash() {
+        if let Some(cash) = self.portfolio.available_on(order.platform) {
             if fees.net > cash {
                 return Err(Rejection::InsufficientFunds {
                     required: fees.net,
@@ -450,7 +474,7 @@ impl MockExecutor {
             quantity,
             cost_basis: fees.net,
             acquired_at: filled_at,
-            locked_until: filled_at + valve_trade_hold(),
+            locked_until: self.portfolio.trade_unlock(order.platform, filled_at)?,
         };
         let entry = LedgerEntry {
             seq: self.portfolio.next_seq(),

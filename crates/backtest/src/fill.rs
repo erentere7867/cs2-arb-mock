@@ -6,6 +6,7 @@ use std::collections::{BTreeSet, HashMap};
 
 use chrono::{DateTime, Duration, Utc};
 use cs2_arb_core::{FeeSchedule, Fill, Money, Order, OrderSide, PriceSnapshot, Result};
+use cs2_arb_sim::venues::{VenueBalance, VenueTradeHold};
 
 use crate::replay::{MarketView, QuoteKey};
 
@@ -22,8 +23,29 @@ pub enum FillOutcome {
 /// Pluggable simulated execution. The real `cs2-arb-sim` can be adapted to this
 /// trait at integration time (for example by synthesizing a `Listing` from the quote).
 pub trait FillModel {
+    /// Schedule an order without changing inventory, cash, or risk.
+    fn schedule_fill(&self, _strategy: &str, now: DateTime<Utc>) -> DateTime<Utc> {
+        now
+    }
+
+    fn venue_trade_holds(&self) -> Option<Vec<VenueTradeHold>> {
+        None
+    }
+
     fn preview_fill(&self, _strategy: &str, order: &Order) -> Option<(Money, u32)> {
         Some((order.limit_price, order.quantity))
+    }
+
+    fn venue_balances(&self, _strategy: &str) -> Result<Vec<VenueBalance>> {
+        Ok(Vec::new())
+    }
+
+    fn transfer_fees_paid(&self, _strategy: &str) -> Money {
+        Money(0)
+    }
+
+    fn available_cash(&self, _strategy: &str, _platform: cs2_arb_core::Platform) -> Option<Money> {
+        None
     }
 
     fn add_quote_update_times(&self, _times: &mut BTreeSet<DateTime<Utc>>) {}

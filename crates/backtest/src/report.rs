@@ -47,6 +47,8 @@ pub struct StrategyStats {
     pub orders_submitted: u32,
     pub orders_filled: u32,
     pub orders_rejected: u32,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub orders_pending: u32,
     /// Closed round trips.
     pub trade_count: u32,
     pub winning_trades: u32,
@@ -85,6 +87,10 @@ pub struct StrategyStats {
     pub final_equity: Money,
 }
 
+fn is_zero(value: &u32) -> bool {
+    *value == 0
+}
+
 /// Replay coverage.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReplayWindow {
@@ -100,13 +106,22 @@ pub struct ReplayWindow {
 pub struct PerformanceReport {
     pub disclaimer: String,
     pub window: ReplayWindow,
+    /// Uniform hold, or zero if reporting configured venue holds instead.
     pub trade_hold_secs: i64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub venue_trade_holds: Vec<cs2_arb_sim::venues::VenueTradeHold>,
     /// All strategies combined. Drawdown is computed on the combined equity curve.
     pub totals: StrategyStats,
     /// Per-strategy breakdown, in the order the strategies were supplied.
     pub strategies: Vec<StrategyStats>,
     /// Closed trades in close order.
     pub trades: Vec<TradeRecord>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub venue_balances: std::collections::BTreeMap<String, Vec<cs2_arb_sim::venues::VenueBalance>>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub transfer_fees_paid: std::collections::BTreeMap<String, Money>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unverified_platform_assumptions: Vec<String>,
 }
 
 impl PerformanceReport {
@@ -126,17 +141,39 @@ impl PerformanceReport {
         let mut out = String::new();
         let _ = writeln!(out, "# Backtest performance report\n");
         let _ = writeln!(out, "> {}\n", self.disclaimer);
+        if !self.unverified_platform_assumptions.is_empty() {
+            let _ = writeln!(out, "## UNVERIFIED platform assumptions\n");
+            for item in &self.unverified_platform_assumptions {
+                let _ = writeln!(out, "- {item}");
+            }
+            let _ = writeln!(out);
+        }
         let w = &self.window;
         let _ = writeln!(
             out,
-            "Window: {} → {} · {} steps · {} snapshots · {}/{} events delivered · trade hold {}\n",
+            "Window: {} → {} · {} steps · {} snapshots · {}/{} events delivered · {}\n",
             w.start.map_or("n/a".into(), |t| t.to_rfc3339()),
             w.end.map_or("n/a".into(), |t| t.to_rfc3339()),
             w.steps,
             w.snapshots,
             w.events_delivered,
             w.events_total,
-            fmt_duration(self.trade_hold_secs as f64),
+            if self.venue_trade_holds.is_empty() {
+                format!("trade hold {}", fmt_duration(self.trade_hold_secs as f64))
+            } else {
+                format!(
+                    "trade holds by venue: {}",
+                    self.venue_trade_holds
+                        .iter()
+                        .map(|hold| format!(
+                            "{} {}",
+                            platform_name(hold.platform),
+                            fmt_duration(hold.seconds as f64)
+                        ))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            },
         );
 
         let _ = writeln!(out, "## Summary\n");
@@ -204,6 +241,13 @@ impl PerformanceReport {
             }
             out.push('\n');
         }
+        if self.totals.orders_pending != 0 {
+            out.push_str("| Orders pending |");
+            for c in &columns {
+                let _ = write!(out, " {} |", c.orders_pending);
+            }
+            out.push('\n');
+        }
 
         let _ = writeln!(out, "\n## Trades\n");
         if self.trades.is_empty() {
@@ -243,7 +287,59 @@ impl PerformanceReport {
                 .iter()
                 .filter_map(|t| t.fee_breakdown.map(|f| (t.position_id.as_str(), f))),
         );
+        write_venue_balances(
+            &mut out,
+            self.venue_balances
+                .iter()
+                .map(|(name, rows)| (name.as_str(), rows.as_slice())),
+        );
+        write_transfer_fees(
+            &mut out,
+            self.transfer_fees_paid
+                .iter()
+                .map(|(name, amount)| (name.as_str(), *amount)),
+        );
         out
+    }
+}
+
+pub fn write_transfer_fees<'a>(out: &mut String, fees: impl Iterator<Item = (&'a str, Money)>) {
+    let mut fees = fees.filter(|(_, amount)| amount.0 != 0).peekable();
+    if fees.peek().is_some() {
+        let _ = writeln!(
+            out,
+            "\n| Simulation | Total transfer fees |\n| --- | ---: |"
+        );
+        for (simulation, amount) in fees {
+            let _ = writeln!(out, "| {simulation} | {} |", fmt_money(amount));
+        }
+    }
+}
+
+pub fn write_venue_balances<'a>(
+    out: &mut String,
+    accounts: impl Iterator<Item = (&'a str, &'a [cs2_arb_sim::venues::VenueBalance])>,
+) {
+    let mut accounts = accounts.filter(|(_, rows)| !rows.is_empty()).peekable();
+    if accounts.peek().is_none() {
+        return;
+    }
+    let _ = writeln!(out, "\n### Mock venue balances\n");
+    let _ = writeln!(
+        out,
+        "| Simulation | Venue | Available | Pending |\n| --- | --- | ---: | ---: |"
+    );
+    for (name, rows) in accounts {
+        for row in rows {
+            let _ = writeln!(
+                out,
+                "| {} | {} | {} | {} |",
+                name,
+                platform_name(row.platform),
+                fmt_money(row.available),
+                fmt_money(row.pending)
+            );
+        }
     }
 }
 

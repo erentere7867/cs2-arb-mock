@@ -240,6 +240,42 @@ impl PegBidStrategy {
         }
     }
 
+    pub fn replace_buy_orders(
+        &mut self,
+        platform: Platform,
+        item: &ItemId,
+        orders: &[BuyOrder],
+        now: DateTime<Utc>,
+    ) {
+        self.top_bids
+            .retain(|(venue, bid_item, _), _| *venue != platform || bid_item != item);
+        if !self.config.allowed_platforms.contains(&platform) {
+            return;
+        }
+        let max_age = self.config.max_order_age_secs;
+        let fresh = |observed_at: DateTime<Utc>| {
+            observed_at <= now && max_age.is_none_or(|age| (now - observed_at).num_seconds() <= age)
+        };
+        for order in orders.iter().filter(|order| {
+            order.platform == platform
+                && &order.item == item
+                && order.price.0 > 0
+                && order.quantity > 0
+                && fresh(order.observed_at)
+        }) {
+            self.top_bids
+                .entry((platform, item.clone(), order.float_bucket))
+                .and_modify(|best| {
+                    if !fresh(best.observed_at)
+                        || (order.price, order.observed_at) > (best.price, best.observed_at)
+                    {
+                        *best = order.clone();
+                    }
+                })
+                .or_insert_with(|| order.clone());
+        }
+    }
+
     /// Record a verified sale into the rolling median price history.
     pub fn observe_sale(&mut self, sale: &Sale) {
         if !sale.verified || sale.price.0 <= 0 {
@@ -663,6 +699,38 @@ mod tests {
                 observed_at: now - Duration::hours(i as i64 + 1),
             });
         }
+    }
+
+    #[test]
+    fn refresh_uses_the_highest_fresh_bid_across_pages() {
+        let now = t(12, 0);
+        let venue = Platform::CsFloat;
+        let item = item();
+        let mut strategy = PegBidStrategy::new(PegBidConfig {
+            max_order_age_secs: Some(2),
+            ..PegBidConfig::default()
+        })
+        .unwrap();
+        let bid = |price, age| BuyOrder {
+            platform: venue,
+            item: item.clone(),
+            float_bucket: None,
+            price: Money(price),
+            quantity: 1,
+            observed_at: now - Duration::seconds(age),
+        };
+        strategy.replace_buy_orders(
+            venue,
+            &item,
+            &[bid(9000, 3), bid(8500, 1), bid(8400, 0)],
+            now,
+        );
+        assert_eq!(
+            strategy.top_bids[&(venue, item.clone(), None)].price,
+            Money(8500)
+        );
+        strategy.replace_buy_orders(venue, &item, &[], now);
+        assert!(strategy.top_bids.is_empty());
     }
 
     #[test]

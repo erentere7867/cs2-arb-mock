@@ -1,7 +1,7 @@
 //! Deterministic historical replay of price snapshots and market events through
 //! one or more strategies and a simulated fill model.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use chrono::{DateTime, Duration, Utc};
 use cs2_arb_core::{
@@ -135,6 +135,14 @@ pub struct MarketView<'a> {
 }
 
 impl<'a> MarketView<'a> {
+    pub fn venue_trade_holds(&self) -> Option<Vec<cs2_arb_sim::venues::VenueTradeHold>> {
+        self.fill_model.venue_trade_holds()
+    }
+
+    pub fn available_cash(&self, strategy: &str, platform: Platform) -> Option<Money> {
+        self.fill_model.available_cash(strategy, platform)
+    }
+
     pub fn latest_quotes(&self) -> impl Iterator<Item = &'a PriceSnapshot> + '_ {
         self.latest.values()
     }
@@ -211,6 +219,10 @@ pub trait StrategyAdapter {
     /// Unique name, used for the per-strategy breakdown.
     fn name(&self) -> &str;
 
+    fn validate(&self, _fill_model: &dyn FillModel) -> Result<()> {
+        Ok(())
+    }
+
     /// Decide on simulated orders for this step. Buys fill on `order.platform`
     /// against the latest quote; sells consume this strategy's unlocked
     /// positions for the same item and float bucket in FIFO order.
@@ -234,6 +246,7 @@ struct Lot {
 #[derive(Default)]
 struct Book {
     lots: Vec<Lot>,
+    pending: BTreeMap<DateTime<Utc>, Vec<Order>>,
     next_position: u64,
     trades: Vec<TradeRecord>,
     submitted: u32,
@@ -284,6 +297,7 @@ impl<F: FillModel> Backtester<F> {
                     strategy.name()
                 )));
             }
+            strategy.validate(&self.fill_model)?;
         }
         if let Some(bad) = snapshots.iter().find(|s| s.price.0 < 0) {
             return Err(Error::InvalidData(format!(
@@ -311,7 +325,9 @@ impl<F: FillModel> Backtester<F> {
         let first = times.first().copied();
         let last = times.last().copied();
 
-        for now in times {
+        let market_times = times.clone();
+        while let Some(now) = times.pop_first() {
+            let market_tick = market_times.contains(&now);
             let end = start
                 + snapshots[start..]
                     .iter()
@@ -322,7 +338,7 @@ impl<F: FillModel> Backtester<F> {
                 latest.insert(QuoteKey::of(snapshot), snapshot.clone());
             }
             let first_new_event = delivered;
-            while delivered < events.len() && event_time(&events[delivered]) <= now {
+            while market_tick && delivered < events.len() && event_time(&events[delivered]) <= now {
                 delivered += 1;
             }
 
@@ -342,32 +358,37 @@ impl<F: FillModel> Backtester<F> {
                     fill_model: &self.fill_model,
                 };
                 self.fill_model.prepare_step(strategy.name(), &view)?;
+                for order in book.pending.remove(&now).into_iter().flatten() {
+                    self.book_execution(strategy.as_mut(), book, &order, &view)?;
+                }
+                if !market_tick {
+                    continue;
+                }
+                let positions: Vec<_> = book.lots.iter().map(|lot| lot.position.clone()).collect();
+                let view = MarketView {
+                    positions: &positions,
+                    ..view
+                };
                 let orders = strategy.on_step(&view)?;
                 for order in orders {
                     book.submitted += 1;
-                    match self.execute(strategy.name(), book, &order, &latest, now)? {
-                        Ok(fill) => {
-                            self.fill_model.after_fill(strategy.name(), &view, &fill)?;
-                            book.filled += 1;
-                            tracing::debug!(
-                                strategy = strategy.name(),
-                                order = %order.id,
-                                side = ?order.side,
-                                price = fill.unit_price.0,
-                                "simulated fill"
-                            );
-                            strategy.on_fill(&fill);
+                    if book.pending.values().flatten().any(|pending| {
+                        pending.side == order.side
+                            && pending.item == order.item
+                            && pending.float_bucket == order.float_bucket
+                    }) {
+                        book.rejected += 1;
+                        strategy.on_reject(&order, "another order for this item is pending");
+                        continue;
+                    }
+                    let at = self.fill_model.schedule_fill(strategy.name(), now);
+                    if at > now {
+                        book.pending.entry(at).or_default().push(order);
+                        if Some(at) <= last {
+                            times.insert(at);
                         }
-                        Err(reason) => {
-                            book.rejected += 1;
-                            tracing::debug!(
-                                strategy = strategy.name(),
-                                order = %order.id,
-                                %reason,
-                                "simulated order rejected"
-                            );
-                            strategy.on_reject(&order, &reason);
-                        }
+                    } else {
+                        self.book_execution(strategy.as_mut(), book, &order, &view)?;
                     }
                 }
             }
@@ -388,6 +409,29 @@ impl<F: FillModel> Backtester<F> {
             events_total: events.len() as u32,
         };
         self.build_report(window, strategies, &books, &latest)
+    }
+
+    fn book_execution(
+        &self,
+        strategy: &mut dyn StrategyAdapter,
+        book: &mut Book,
+        order: &Order,
+        view: &MarketView<'_>,
+    ) -> Result<()> {
+        match self.execute(strategy.name(), book, order, view.latest, view.now)? {
+            Ok(fill) => {
+                self.fill_model.after_fill(strategy.name(), view, &fill)?;
+                book.filled += 1;
+                tracing::debug!(strategy = strategy.name(), order = %order.id, side = ?order.side, price = fill.unit_price.0, "simulated fill");
+                strategy.on_fill(&fill);
+            }
+            Err(reason) => {
+                book.rejected += 1;
+                tracing::debug!(strategy = strategy.name(), order = %order.id, %reason, "simulated order rejected");
+                strategy.on_reject(order, &reason);
+            }
+        }
+        Ok(())
     }
 
     /// Outer `Result` is a hard error; inner `Err` is a rejection reason.
@@ -636,7 +680,7 @@ impl<F: FillModel> Backtester<F> {
         let mut total_unrealized = Money(0);
         let mut total_open_basis = Money(0);
         let mut total_open = 0u32;
-        let (mut submitted, mut filled, mut rejected) = (0u32, 0u32, 0u32);
+        let (mut submitted, mut filled, mut rejected, mut pending) = (0u32, 0u32, 0u32, 0u32);
 
         for (strategy, book) in strategies.iter().zip(books) {
             let unrealized = match window.end {
@@ -648,11 +692,12 @@ impl<F: FillModel> Backtester<F> {
                 .iter()
                 .try_fold(Money(0), |acc, l| acc.checked_add(l.position.cost_basis))?;
             let open = book.lots.len() as u32;
+            let book_pending = book.pending.values().map(Vec::len).sum::<usize>() as u32;
             per_strategy.push(stats(
                 strategy.name(),
                 &book.trades,
                 &book.equity,
-                (book.submitted, book.filled, book.rejected),
+                (book.submitted, book.filled, book.rejected, book_pending),
                 (open, open_basis, unrealized),
             )?);
             for (sum, point) in combined_equity.iter_mut().zip(&book.equity) {
@@ -664,6 +709,7 @@ impl<F: FillModel> Backtester<F> {
             submitted += book.submitted;
             filled += book.filled;
             rejected += book.rejected;
+            pending += book_pending;
             all_trades.extend(book.trades.iter().cloned());
         }
         // Stable sort keeps strategy order for trades closed at the same instant.
@@ -672,16 +718,41 @@ impl<F: FillModel> Backtester<F> {
             "all",
             &all_trades,
             &combined_equity,
-            (submitted, filled, rejected),
+            (submitted, filled, rejected, pending),
             (total_open, total_open_basis, total_unrealized),
         )?;
+        let venue_trade_holds = self.fill_model.venue_trade_holds();
         Ok(PerformanceReport {
             disclaimer: REPORT_DISCLAIMER.to_owned(),
             window,
-            trade_hold_secs: hold_secs(&self.fill_model),
+            trade_hold_secs: if venue_trade_holds.is_none() {
+                hold_secs(&self.fill_model)
+            } else {
+                0
+            },
+            venue_trade_holds: venue_trade_holds.unwrap_or_default(),
             totals,
             strategies: per_strategy,
             trades: all_trades,
+            unverified_platform_assumptions: Vec::new(),
+            transfer_fees_paid: strategies
+                .iter()
+                .filter_map(|strategy| {
+                    let fees = self.fill_model.transfer_fees_paid(strategy.name());
+                    (fees.0 != 0).then(|| (strategy.name().to_owned(), fees))
+                })
+                .collect(),
+            venue_balances: strategies
+                .iter()
+                .map(|strategy| {
+                    self.fill_model
+                        .venue_balances(strategy.name())
+                        .map(|b| (strategy.name().to_owned(), b))
+                })
+                .collect::<Result<std::collections::BTreeMap<_, _>>>()?
+                .into_iter()
+                .filter(|(_, b)| !b.is_empty())
+                .collect(),
         })
     }
 }
@@ -741,7 +812,7 @@ fn stats(
     name: &str,
     trades: &[TradeRecord],
     equity: &[Money],
-    (submitted, filled, rejected): (u32, u32, u32),
+    (submitted, filled, rejected, pending): (u32, u32, u32, u32),
     (open_positions, open_cost_basis, unrealized_pnl): (u32, Money, Money),
 ) -> Result<StrategyStats> {
     let sum = |f: fn(&TradeRecord) -> Money| {
@@ -766,6 +837,7 @@ fn stats(
         orders_submitted: submitted,
         orders_filled: filled,
         orders_rejected: rejected,
+        orders_pending: pending,
         trade_count: count,
         winning_trades,
         losing_trades,
@@ -1036,6 +1108,96 @@ mod tests {
     }
 
     #[test]
+    fn cli_latency_executes_at_the_due_tick_and_leaves_late_orders_pending() {
+        use crate::integrated::SimFillModel;
+        use cs2_arb_sim::{FillLatency, SimConfig};
+        use cs2_arb_strategy::{KillSwitch, RiskLimits};
+
+        let rows = [
+            (snap(Platform::CsFloat, 0, 1000), 1, 70),
+            (snap(Platform::CsFloat, 1, 1000), 1, 70),
+        ];
+        let depth = depth_with_snapshots(&rows);
+        let latency = Duration::seconds(3);
+        let log = std::rc::Rc::default();
+        let model = SimFillModel::new(&depth, fees(), RiskLimits::default(), KillSwitch::new())
+            .with_sim_config(SimConfig {
+                fill_latency: FillLatency {
+                    min: latency,
+                    max: latency,
+                },
+                ..SimConfig::default()
+            });
+        let report = Backtester::with_fill_model(BacktestConfig::new(fees()), model)
+            .run(
+                SimulationMode,
+                &rows.map(|(q, _, _)| q),
+                &[],
+                &mut [Box::new(Scripted {
+                    name: "s".into(),
+                    script: (0..=1)
+                        .map(|day| (day, order(OrderSide::Buy, Platform::CsFloat, 1, 1000, day)))
+                        .collect(),
+                    log: std::rc::Rc::clone(&log),
+                })],
+            )
+            .unwrap();
+        let log = log.borrow();
+        assert_eq!(log.fills.len(), 1);
+        assert_eq!(log.fills[0].filled_at, t(0) + latency);
+        assert!(log.rejects.is_empty());
+        assert_eq!(report.window.end, Some(t(1)));
+        assert_eq!(report.window.steps, 3);
+        assert_eq!(report.totals.orders_submitted, 2);
+        assert_eq!(report.totals.orders_filled, 1);
+        assert_eq!(report.totals.orders_pending, 1);
+        assert_eq!(report.strategies[0].orders_pending, 1);
+        assert!(report.to_markdown().contains("| Orders pending | 1 | 1 |"));
+        assert_eq!(report.totals.open_positions, 1);
+    }
+
+    #[test]
+    fn single_sample_reports_every_delayed_order_as_pending() {
+        use crate::integrated::{SimFillModel, SpreadAdapter};
+        use cs2_arb_sim::{FillLatency, SimConfig};
+        use cs2_arb_strategy::{KillSwitch, RiskLimits, SpreadConfig};
+
+        let rows = [
+            (snap(Platform::CsFloat, 0, 1000), 1, 70),
+            (snap(Platform::DMarket, 0, 1400), 1, 70),
+        ];
+        let depth = depth_with_snapshots(&rows);
+        let latency = Duration::seconds(3);
+        let model = SimFillModel::new(&depth, fees(), RiskLimits::default(), KillSwitch::new())
+            .with_sim_config(SimConfig {
+                fill_latency: FillLatency {
+                    min: latency,
+                    max: latency,
+                },
+                ..SimConfig::default()
+            });
+        let report = Backtester::with_fill_model(BacktestConfig::new(fees()), model)
+            .run(
+                SimulationMode,
+                &rows.map(|(quote, _, _)| quote),
+                &[],
+                &mut [Box::new(SpreadAdapter::new(SpreadConfig::default()))],
+            )
+            .unwrap();
+        assert_eq!(report.window.steps, 1);
+        assert_eq!(report.window.end, Some(t(0)));
+        assert_eq!(report.totals.orders_submitted, 1);
+        assert_eq!(report.totals.orders_filled, 0);
+        assert_eq!(report.totals.orders_rejected, 0);
+        assert_eq!(report.totals.orders_pending, 1);
+        assert_eq!(report.totals.final_equity, Money(0));
+        assert!(report.to_markdown().contains("| Orders pending | 1 | 1 |"));
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["totals"]["orders_pending"], 1);
+        assert_eq!(json["strategies"][0]["orders_pending"], 1);
+    }
+
+    #[test]
     fn dip_only_buys_when_recovery_to_the_mean_covers_fees() {
         use crate::integrated::{DipAdapter, SimFillModel};
         use cs2_arb_strategy::{DipConfig, KillSwitch, RiskLimits};
@@ -1183,6 +1345,124 @@ mod tests {
         assert_eq!(report.trades[0].closed_at, t(8));
         assert_eq!(report.trades[0].quantity, 1);
         assert_eq!(report.trades[0].net_pnl, Money(95));
+    }
+
+    #[test]
+    fn spread_exits_at_venue_unlock_even_before_strategy_hold() {
+        use crate::integrated::{SimFillModel, SpreadAdapter};
+        use cs2_arb_sim::venues::{VenueAccounts, VenueAccountsConfig, VenueConfig};
+        use cs2_arb_strategy::{KillSwitch, RiskLimits, SpreadConfig};
+
+        let rows = [
+            (snap(Platform::CsFloat, 0, 1000), 1, 70),
+            (snap(Platform::DMarket, 0, 1400), 1, 70),
+            (snap(Platform::DMarket, 1, 1400), 1, 70),
+        ];
+        let depth = depth_with_snapshots(&rows);
+        let snapshots = rows.map(|(quote, _, _)| quote);
+        let accounts = VenueAccounts::new(
+            VenueAccountsConfig {
+                venues: [Platform::CsFloat, Platform::DMarket]
+                    .into_iter()
+                    .map(|platform| {
+                        (
+                            platform,
+                            VenueConfig {
+                                starting_cash: Money(5000),
+                                trade_hold_seconds: if platform == Platform::CsFloat {
+                                    86_400
+                                } else {
+                                    172_800
+                                },
+                                sale_balance_hold_seconds: 0,
+                                transfer_in_seconds: 0,
+                                transfer_out_seconds: 0,
+                            },
+                        )
+                    })
+                    .collect(),
+                transfers: vec![],
+            },
+            fees(),
+        );
+        for use_accounts in [false, true] {
+            let mut model =
+                SimFillModel::new(&depth, fees(), RiskLimits::default(), KillSwitch::new());
+            if use_accounts {
+                model = model.with_venue_accounts(accounts.clone());
+            }
+            let report = Backtester::with_fill_model(BacktestConfig::new(fees()), model)
+                .run(
+                    SimulationMode,
+                    &snapshots,
+                    &[],
+                    &mut [Box::new(SpreadAdapter::new(SpreadConfig {
+                        price_drift_pct_per_day: 5.0,
+                        ..SpreadConfig::default()
+                    }))],
+                )
+                .unwrap();
+            assert_eq!(report.trades.len(), usize::from(use_accounts));
+            assert_eq!(
+                report.totals.orders_filled,
+                if use_accounts { 2 } else { 0 }
+            );
+            if use_accounts {
+                assert_eq!(
+                    report
+                        .venue_trade_holds
+                        .iter()
+                        .map(|hold| (hold.platform, hold.seconds))
+                        .collect::<Vec<_>>(),
+                    [(Platform::CsFloat, 86_400), (Platform::DMarket, 172_800)]
+                );
+                assert!(report.to_markdown().contains("trade holds by venue"));
+            } else {
+                assert!(report.venue_trade_holds.is_empty());
+                assert_eq!(report.trade_hold_secs, 7 * 86_400);
+            }
+        }
+    }
+
+    #[test]
+    fn spread_rejects_invalid_venue_drift_before_any_replay_tick() {
+        use crate::integrated::{MarketDepth, SimFillModel, SpreadAdapter};
+        use cs2_arb_sim::venues::{VenueAccounts, VenueAccountsConfig, VenueConfig};
+        use cs2_arb_strategy::{KillSwitch, RiskLimits, SpreadConfig};
+
+        let depth = MarketDepth::default();
+        let model = SimFillModel::new(&depth, fees(), RiskLimits::default(), KillSwitch::new())
+            .with_venue_accounts(VenueAccounts::new(
+                VenueAccountsConfig {
+                    venues: [(
+                        Platform::CsFloat,
+                        VenueConfig {
+                            starting_cash: Money(5_000),
+                            trade_hold_seconds: 10 * 86_400,
+                            sale_balance_hold_seconds: 0,
+                            transfer_in_seconds: 0,
+                            transfer_out_seconds: 0,
+                        },
+                    )]
+                    .into(),
+                    transfers: vec![],
+                },
+                fees(),
+            ));
+        let error = Backtester::with_fill_model(BacktestConfig::new(fees()), model)
+            .run(
+                SimulationMode,
+                &[],
+                &[],
+                &mut [Box::new(SpreadAdapter::new(SpreadConfig {
+                    price_drift_pct_per_day: 10.0,
+                    ..SpreadConfig::default()
+                }))],
+            )
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidConfig(message)
+            if message.contains("csfloat venue hold (864000 seconds)")
+            && message.contains("total drift over the hold must be below 100%")));
     }
 
     #[test]

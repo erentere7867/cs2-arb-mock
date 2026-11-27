@@ -23,7 +23,7 @@ use cs2_arb_core::{
 };
 use serde::Serialize;
 
-use crate::config::{valve_trade_hold, LiquidityConfig, LiquidityScope};
+use crate::config::{LiquidityConfig, LiquidityScope};
 use crate::executor::ExecutionReport;
 use crate::fees::{PlatformFees, RoundingMode};
 use crate::liquidity::LiquidityStats;
@@ -143,6 +143,14 @@ pub struct BuyOrderFillSimulator {
 }
 
 impl BuyOrderFillSimulator {
+    pub fn set_venue_accounts(&mut self, accounts: crate::venues::VenueAccounts) {
+        self.portfolio.set_venue_accounts(accounts);
+    }
+
+    pub fn advance_venue_accounts(&mut self, at: DateTime<Utc>) -> Result<()> {
+        self.portfolio.advance_venue_accounts(at)
+    }
+
     pub fn new(
         mode: SimulationMode,
         config: BuyOrderFillConfig,
@@ -446,7 +454,7 @@ impl BuyOrderFillSimulator {
                 continue;
             };
 
-            if let Some(cash) = self.portfolio.cash() {
+            if let Some(cash) = self.portfolio.available_on(order.platform) {
                 if paid > cash {
                     self.rejections.push(RejectionRecord {
                         order_id: order.id.clone(),
@@ -465,6 +473,9 @@ impl BuyOrderFillSimulator {
             };
 
             let filled_at = sale.sold_at;
+            let Ok(locked_until) = self.portfolio.trade_unlock(order.platform, filled_at) else {
+                continue;
+            };
             let fill_index = order.quantity - remaining_quantity + 1;
             let position_id = if order.quantity == 1 {
                 format!("{}#pos", order.id)
@@ -479,7 +490,7 @@ impl BuyOrderFillSimulator {
                 quantity: fill_qty,
                 cost_basis: fees.net,
                 acquired_at: filled_at,
-                locked_until: filled_at + valve_trade_hold(),
+                locked_until,
             };
             let entry = LedgerEntry {
                 seq: self.portfolio.next_seq(),

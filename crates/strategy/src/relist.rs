@@ -460,7 +460,7 @@ impl RelistEngine {
                 (!self.config.require_verified_sales || s.verified)
                     && s.platform == platform
                     && &s.item == item
-                    && s.sold_at > cutoff
+                    && s.sold_at >= cutoff
                     && s.sold_at <= now
                     && s.price.0 > 0
                     && matches_bucket(bucket, s.float_value)
@@ -476,7 +476,7 @@ impl RelistEngine {
                     .filter(|q| {
                         q.platform == platform
                             && &q.item == item
-                            && q.observed_at > cutoff
+                            && q.observed_at >= cutoff
                             && q.observed_at <= now
                             && q.price.0 > 0
                             && (bucket.is_none() || q.float_bucket == bucket)

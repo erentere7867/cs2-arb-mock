@@ -53,7 +53,7 @@ fn parse_detailed_bids(
         price: Minor,
         amount: u32,
         filled: u32,
-        filters: serde_json::Value,
+        filters: Option<serde_json::Value>,
         by: String,
     }
     let response: Response = parse_json("Waxpeer detailed buy orders", body)?;
@@ -67,7 +67,7 @@ fn parse_detailed_bids(
     for bid in response.orders {
         if bid.name != item.market_hash_name
             || bid.game != game
-            || !bid.filters.is_null()
+            || bid.filters.is_some()
             || bid.amount <= bid.filled
             || bid.by.is_empty()
         {
@@ -358,7 +358,7 @@ mod tests {
         let body = br#"{"success":true,"orders":[
           {"name":"Alien Red","game":"rust","price":13500,"amount":5,"filled":0,"filters":{"paint_seeds":[1]},"by":"filtered"},
           {"name":"Alien Red","game":"rust","price":12349,"amount":5,"filled":1,"filters":null,"by":"one"},
-          {"name":"Alien Red","game":"rust","price":12349,"amount":2,"filled":1,"filters":null,"by":"two"},
+          {"name":"Alien Red","game":"rust","price":12349,"amount":2,"filled":1,"by":"two"},
           {"name":"Alien Red","game":"rust","price":12000,"amount":4,"filled":1,"filters":null,"by":"one"}
         ]}"#;
         let bids = parse_detailed_bids(body, &item, "rust", DateTime::<Utc>::UNIX_EPOCH).unwrap();

@@ -111,6 +111,7 @@ pub async fn collect(
         });
     }
     let mut snapshots = Vec::new();
+    let mut buy_orders = Vec::new();
     let mut depth = MarketDepth::default();
     for sample in 0..samples {
         if sample > 0 {
@@ -131,6 +132,14 @@ pub async fn collect(
                     Ok(sales) => depth.add_sales(sales),
                     Err(error) => {
                         tracing::warn!(?platform, %error, "read-only sales request skipped")
+                    }
+                }
+                if matches!(platform, Platform::CsFloat | Platform::Skinport) {
+                    match client.top_buy_orders(item).await {
+                        Ok(orders) => buy_orders.extend(orders),
+                        Err(error) => {
+                            tracing::warn!(?platform, %error, "read-only buy-orders request skipped")
+                        }
                     }
                 }
                 books.push((*platform, item.clone(), listings));
@@ -176,5 +185,6 @@ pub async fn collect(
         snapshots,
         events,
         depth,
+        buy_orders,
     })
 }

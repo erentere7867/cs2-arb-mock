@@ -226,3 +226,30 @@ async fn retries_5xx_but_records_and_does_not_retry_429() {
     ));
     server.verify().await;
 }
+
+#[tokio::test]
+async fn parses_read_only_top_buy_orders_sorted_highest_first() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/buy-orders"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": [
+                { "market_hash_name": "AK-47 | Redline (Field-Tested)", "price": 2100, "qty": 2 },
+                { "market_hash_name": "AK-47 | Redline (Field-Tested)", "price": 2250, "qty": 1 },
+                { "market_hash_name": "AWP | Asiimov (Field-Tested)", "price": 9900, "qty": 1 }
+            ]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let gate = Arc::new(RecordingGate::default());
+    let cf = client(&server, None, gate);
+    let orders = cf.top_buy_orders(&redline()).await.unwrap();
+    assert_eq!(orders.len(), 2);
+    assert_eq!(orders[0].price, Money(2250));
+    assert_eq!(orders[0].quantity, 1);
+    assert_eq!(orders[1].price, Money(2100));
+    assert_eq!(orders[1].quantity, 2);
+    server.verify().await;
+}

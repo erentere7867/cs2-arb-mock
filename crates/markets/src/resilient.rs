@@ -3,7 +3,7 @@ use std::future::Future;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use cs2_arb_core::{
-    Error, FeeSchedule, ItemId, Listing, MarketClient, PriceSnapshot, Result, Sale,
+    BuyOrder, Error, FeeSchedule, ItemId, Listing, MarketClient, PriceSnapshot, Result, Sale,
 };
 use cs2_arb_net::{retry_with_backoff, RetryError, RetryPolicy, TokioClock};
 use rand::{rngs::StdRng, SeedableRng};
@@ -54,5 +54,9 @@ impl<M: MarketClient> MarketClient for ResilientMarket<M> {
 
     async fn fees(&self) -> Result<FeeSchedule> {
         self.inner.fees().await
+    }
+
+    async fn top_buy_orders(&self, item: &ItemId) -> Result<Vec<BuyOrder>> {
+        self.read(|| self.inner.top_buy_orders(item)).await
     }
 }

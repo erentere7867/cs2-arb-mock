@@ -61,3 +61,22 @@ max_position_notional = 10000
 max_item_exposure = 25000
 max_total_exposure = 100000
 daily_drawdown_cap = 10000
+
+[peg_bid]
+target_margin_pct = 7.0
+bid_increment = 1
+hold_days = 7
+annual_opportunity_rate_pct = 10.0
+lookback_days = 7
+min_median_samples = 3
+cooldown_secs = 300
+min_reprice_delta = 2
+lower_to_ceiling = false
+
+[relist]
+lookback_days = 7
+min_median_samples = 1
+volume_window_days = 7
+min_sales_for_ask_fill = 15
+min_listing_age_secs = 3600
+require_verified_sales = true

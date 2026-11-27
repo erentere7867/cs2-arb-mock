@@ -365,6 +365,21 @@ impl PegBidStrategy {
         fees: &FeeSchedules,
         now: DateTime<Utc>,
     ) -> Result<PegBidDecision> {
+        let decision = self.propose_item(platform, item, float_bucket, fees, now)?;
+        if let PegBidDecision::Placed(active) = &decision {
+            self.record_placement(active.clone());
+        }
+        Ok(decision)
+    }
+
+    fn propose_item(
+        &mut self,
+        platform: Platform,
+        item: &ItemId,
+        float_bucket: Option<FloatBucket>,
+        fees: &FeeSchedules,
+        now: DateTime<Utc>,
+    ) -> Result<PegBidDecision> {
         if !self.config.allowed_platforms.contains(&platform) {
             return Ok(PegBidDecision::Skipped(
                 PegBidSkipReason::PlatformNotAllowed(platform),
@@ -475,9 +490,14 @@ impl PegBidStrategy {
             expected_net_margin_pct: economics.expected_net_margin_pct,
             updated_at: now,
         };
-        self.active_bids.insert(key.clone(), active.clone());
-        self.last_updated.insert(key, now);
         Ok(PegBidDecision::Placed(active))
+    }
+
+    fn record_placement(&mut self, active: ActivePegBid) {
+        let order = &active.order;
+        let key = (order.platform, order.item.clone(), order.float_bucket);
+        self.last_updated.insert(key.clone(), active.updated_at);
+        self.active_bids.insert(key, active);
     }
 
     /// Ingest a batch of top-of-book buy orders and emit mock `Order`s for every
@@ -487,6 +507,17 @@ impl PegBidStrategy {
         buy_orders: &[BuyOrder],
         fees: &FeeSchedules,
         now: DateTime<Utc>,
+    ) -> Result<Vec<Order>> {
+        self.evaluate_with(buy_orders, fees, now, |_| Ok(true))
+    }
+
+    /// Evaluate bids and record only placements accepted by the caller.
+    pub fn evaluate_with(
+        &mut self,
+        buy_orders: &[BuyOrder],
+        fees: &FeeSchedules,
+        now: DateTime<Utc>,
+        mut place: impl FnMut(&Order) -> Result<bool>,
     ) -> Result<Vec<Order>> {
         self.ingest_buy_orders(buy_orders.iter().cloned());
         let mut keys: Vec<BookKey> = self.top_bids.keys().cloned().collect();
@@ -498,10 +529,14 @@ impl PegBidStrategy {
         });
         let mut orders = Vec::new();
         for (platform, item, bucket) in keys {
-            if let PegBidDecision::Placed(active) =
-                self.evaluate_item(platform, &item, bucket, fees, now)?
-            {
-                orders.push(active.order);
+            let PegBidDecision::Placed(active) =
+                self.propose_item(platform, &item, bucket, fees, now)?
+            else {
+                continue;
+            };
+            if place(&active.order)? {
+                orders.push(active.order.clone());
+                self.record_placement(active);
             }
         }
         Ok(orders)

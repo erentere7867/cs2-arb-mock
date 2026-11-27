@@ -453,8 +453,7 @@ pub fn run_peg_bid_engine(
         if !kill_switch.is_engaged()
             && (snapshot_tick || !historical_bids.is_empty() || refresh_idx > refresh_start)
         {
-            let orders = strategy.evaluate(&[], fees, now)?;
-            for order in orders {
+            strategy.evaluate_with(&[], fees, now, |order| {
                 let cost = fees
                     .get(order.platform)
                     .buyer_order_total(order.limit_price, order.quantity)?;
@@ -463,32 +462,30 @@ pub fn run_peg_bid_engine(
                     .available_on(order.platform)
                     .is_some_and(|cash| cash < cost)
                 {
-                    strategy.mark_filled(&order.id);
-                    continue;
+                    return Ok(false);
                 }
-                if let Err(reason) = risk.check(&order, now) {
+                if let Err(reason) = risk.check(order, now) {
                     tracing::debug!(order_id = %order.id, %reason, "peg bid blocked by risk limits");
-                    strategy.mark_filled(&order.id);
-                    continue;
+                    return Ok(false);
                 }
-                if simulator.place_bid(order.clone(), now).is_ok() {
-                    bids_placed += 1;
-                    if let Some(expiry) = resting_ttl.and_then(|ttl| now.checked_add_signed(ttl)) {
-                        if Some(expiry) <= replay_end {
-                            times.insert(expiry);
-                        }
+                if simulator.place_bid(order.clone(), now).is_err() {
+                    return Ok(false);
+                }
+                bids_placed += 1;
+                if let Some(expiry) = resting_ttl.and_then(|ttl| now.checked_add_signed(ttl)) {
+                    if Some(expiry) <= replay_end {
+                        times.insert(expiry);
                     }
-                    account_bid_fee_losses(
-                        &mut risk,
-                        &simulator,
-                        &latest_prices,
-                        now,
-                        &mut accounted_fee_losses,
-                    )?;
-                } else {
-                    strategy.mark_filled(&order.id);
                 }
-            }
+                account_bid_fee_losses(
+                    &mut risk,
+                    &simulator,
+                    &latest_prices,
+                    now,
+                    &mut accounted_fee_losses,
+                )?;
+                Ok(true)
+            })?;
         }
         strategy.cancel_unprofitable_bids(fees, now)?;
         cancel_discarded_bids(&strategy, &mut simulator, now)?;
@@ -976,6 +973,69 @@ mod tests {
         };
         assert_eq!(replacement.updated_at, repriced_at);
         assert_eq!(replacement.order.limit_price, ceiling);
+    }
+
+    #[test]
+    fn snapshot_only_replacement_rejected_by_risk_keeps_the_safe_resting_bid() {
+        let placed_at = t(3, 12);
+        let repriced_at = placed_at + Duration::minutes(6);
+        let platform = Platform::CsFloat;
+        let quote = PriceSnapshot {
+            platform,
+            item: item(),
+            float_bucket: Some(FloatBucket::FieldTestedLow),
+            price: Money(8_000),
+            observed_at: placed_at,
+        };
+        let bid = BuyOrder {
+            platform,
+            item: quote.item.clone(),
+            float_bucket: quote.float_bucket,
+            price: Money(8_500),
+            quantity: 1,
+            observed_at: placed_at,
+        };
+        let snapshots = [
+            quote.clone(),
+            PriceSnapshot {
+                price: Money(12_000),
+                observed_at: repriced_at,
+                ..quote
+            },
+        ];
+        let config = PegBidConfig {
+            lower_to_ceiling: true,
+            min_median_samples: 1,
+            ..PegBidConfig::default()
+        };
+        let fees = fees();
+        let ceiling =
+            cs2_arb_strategy::compute_effective_ceiling(Money(8_000), fees.get(platform), &config)
+                .unwrap()
+                .unwrap();
+        let dashboard = run_peg_bid_engine(
+            &snapshots,
+            &[],
+            &[bid],
+            &[],
+            &fees,
+            config,
+            RelistConfig::default(),
+            RiskLimits {
+                max_position_notional: Money(8_000),
+                ..RiskLimits::default()
+            },
+            &KillSwitch::new(),
+            Some(Money(50_000)),
+            None,
+        )
+        .unwrap();
+        assert_eq!(dashboard.bids_placed, 1);
+        let [resting] = dashboard.active_mock_bids.as_slice() else {
+            panic!("expected the original bid to remain active");
+        };
+        assert_eq!(resting.updated_at, placed_at);
+        assert_eq!(resting.order.limit_price, ceiling);
     }
 
     #[test]

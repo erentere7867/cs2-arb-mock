@@ -140,6 +140,7 @@ impl Settings {
         i64::from(simulation)
             .max(self.dip.liquidity_window_days)
             .max(self.relist.lookback_days)
+            .max(self.relist.volume_window_days)
             .max(self.peg_bid.lookback_days)
             .max(7)
     }
@@ -523,6 +524,10 @@ mod tests {
         let settings: Settings =
             toml::from_str("[simulation]\nliquidity_window_days = 14").unwrap();
         assert_eq!(settings.live_sales_lookback_days(), 14);
+        let settings: Settings = toml::from_str(
+            "[simulation]\nliquidity_window_days = 14\n[relist]\nlookback_days = 10\nvolume_window_days = 30",
+        ).unwrap();
+        assert_eq!(settings.live_sales_lookback_days(), 30);
         assert_eq!(Settings::default().live_sales_lookback_days(), 7);
     }
     use super::*;

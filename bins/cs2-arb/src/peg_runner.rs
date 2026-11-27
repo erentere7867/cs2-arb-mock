@@ -291,6 +291,9 @@ pub fn run_peg_bid_engine(
                     (snap.platform, snap.item.clone(), snap.float_bucket),
                     snap.price,
                 );
+                if snap.float_bucket.is_some() {
+                    latest_prices.insert((snap.platform, snap.item.clone(), None), snap.price);
+                }
             }
             strategy.observe_snapshot(snap);
             snap_idx += 1;
@@ -301,6 +304,9 @@ pub fn run_peg_bid_engine(
             if sale.price.0 > 0 {
                 let bucket = sale.float_value.and_then(FloatBucket::from_float);
                 latest_prices.insert((sale.platform, sale.item.clone(), bucket), sale.price);
+                if bucket.is_some() {
+                    latest_prices.insert((sale.platform, sale.item.clone(), None), sale.price);
+                }
             }
             strategy.observe_sale(sale);
             for report in simulator.process_transaction(sale, now) {

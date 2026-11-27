@@ -131,6 +131,20 @@ struct SimulationSettings {
     maximum_adv_fraction_bps: Option<u32>,
 }
 
+impl Settings {
+    fn live_sales_lookback_days(&self) -> i64 {
+        let simulation = self
+            .simulation
+            .liquidity_window_days
+            .unwrap_or_else(|| SimConfig::default().liquidity.window_days);
+        i64::from(simulation)
+            .max(self.dip.liquidity_window_days)
+            .max(self.relist.lookback_days)
+            .max(self.peg_bid.lookback_days)
+            .max(7)
+    }
+}
+
 impl SimulationSettings {
     fn build(&self) -> Result<SimConfig> {
         let defaults = SimConfig::default();
@@ -264,6 +278,7 @@ async fn run(cli: Cli) -> Result<()> {
                         .then_some((database.as_str(), settings.dip.branch_update_window_hours)),
                     game,
                     settings.relist.instant_sale,
+                    settings.live_sales_lookback_days(),
                 )
                 .await?
             } else {
@@ -502,6 +517,13 @@ fn write_reports(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn live_sales_lookback_covers_configured_simulation_window() {
+        let settings: Settings =
+            toml::from_str("[simulation]\nliquidity_window_days = 14").unwrap();
+        assert_eq!(settings.live_sales_lookback_days(), 14);
+        assert_eq!(Settings::default().live_sales_lookback_days(), 7);
+    }
     use super::*;
 
     #[test]

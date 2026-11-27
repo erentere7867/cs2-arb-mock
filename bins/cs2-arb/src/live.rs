@@ -156,7 +156,10 @@ pub async fn collect(
     branch_updates: Option<(&str, Option<i64>)>,
     game: Game,
     instant_sale: bool,
+    sales_lookback_days: i64,
 ) -> Result<Inputs> {
+    let sales_lookback = TimeDelta::try_days(sales_lookback_days)
+        .ok_or_else(|| Error::InvalidConfig("live sales lookback is out of range".into()))?;
     let assets = bundled_snapshots(game)?;
     let mut seen = HashSet::new();
     let items: Vec<ItemId> = assets
@@ -188,7 +191,9 @@ pub async fn collect(
         if sample > 0 {
             tokio::time::sleep(Duration::from_secs(interval_seconds)).await;
         }
-        let since = Utc::now() - TimeDelta::days(7);
+        let since = Utc::now()
+            .checked_sub_signed(sales_lookback)
+            .ok_or_else(|| Error::InvalidConfig("live sales cutoff is out of range".into()))?;
         let mut books = Vec::new();
         for (platform, client) in &clients {
             for item in &items {

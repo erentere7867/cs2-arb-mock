@@ -102,10 +102,11 @@ pub struct ExactFeeSchedule {
 pub struct FeeBreakdown {
     pub quantity: u32,
     pub unit_price: Money,
+    /// Whole-cent average fee per unit. Use `fee` for accounting.
     pub unit_fee: Money,
     /// `quantity * unit_price`.
     pub gross: Money,
-    /// `quantity * unit_fee`.
+    /// Total fee for the fill.
     pub fee: Money,
     /// Buy: `gross + fee` (cash paid). Sell: `gross - fee` (cash received).
     pub net: Money,

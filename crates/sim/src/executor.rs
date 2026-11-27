@@ -43,6 +43,7 @@ pub struct MockExecutor {
     _mode: SimulationMode,
     config: SimConfig,
     fees: PlatformFees,
+    order_fees: Option<FeeSchedules>,
     clock: Arc<dyn Clock>,
     rng: SplitMix64,
     book: MarketBook,
@@ -78,6 +79,7 @@ impl MockExecutor {
             portfolio: Portfolio::new(config.starting_cash),
             config,
             fees,
+            order_fees: None,
             clock,
             rng: SplitMix64::new(seed),
             book: MarketBook::new(),
@@ -92,6 +94,53 @@ impl MockExecutor {
 
     pub fn fees(&self) -> &PlatformFees {
         &self.fees
+    }
+
+    /// Charge platform fees once per order and funding fees per unit during replay.
+    pub fn with_order_fees(mut self, schedules: FeeSchedules) -> Self {
+        self.order_fees = Some(schedules);
+        self
+    }
+
+    pub fn buy_cost_at_limit(&self, order: &Order) -> Result<Money> {
+        Ok(self
+            .execution_fees(order, order.limit_price, order.quantity)?
+            .net)
+    }
+
+    fn execution_fees(
+        &self,
+        order: &Order,
+        unit_price: Money,
+        quantity: u32,
+    ) -> Result<FeeBreakdown> {
+        let Some(schedules) = &self.order_fees else {
+            let schedule = self.fees.get(order.platform);
+            return match order.side {
+                OrderSide::Buy => schedule.buy(unit_price, quantity),
+                OrderSide::Sell => schedule.sell(unit_price, quantity),
+            };
+        };
+        let schedule = schedules.get(order.platform);
+        let gross = unit_price.checked_mul(quantity)?;
+        let (fee, net) = match order.side {
+            OrderSide::Buy => {
+                let fee = schedule.buyer_order_fee(unit_price, quantity)?;
+                (fee, gross.checked_add(fee)?)
+            }
+            OrderSide::Sell => {
+                let fee = schedule.seller_order_fee(unit_price, quantity)?;
+                (fee, gross.checked_sub(fee)?)
+            }
+        };
+        Ok(FeeBreakdown {
+            quantity,
+            unit_price,
+            unit_fee: Money(fee.0.checked_div(i64::from(quantity)).unwrap_or(0)),
+            gross,
+            fee,
+            net,
+        })
     }
 
     pub fn now(&self) -> DateTime<Utc> {
@@ -323,7 +372,7 @@ impl MockExecutor {
         let depth: u64 = level.iter().map(|(_, q)| u64::from(*q)).sum();
         let quantity = u32::try_from(depth.min(u64::from(target))).unwrap_or(target);
 
-        let fees = self.fees.get(order.platform).buy(best_ask, quantity)?;
+        let fees = self.execution_fees(order, best_ask, quantity)?;
         if let Some(cash) = self.portfolio.cash() {
             if fees.net > cash {
                 return Err(Rejection::InsufficientFunds {
@@ -501,11 +550,8 @@ impl MockExecutor {
                 reference,
             });
         }
-        let fees = self
-            .fees
-            .get(order.platform)
-            .sell(order.limit_price, target)?;
-        if fees.unit_fee >= fees.unit_price {
+        let fees = self.execution_fees(order, order.limit_price, target)?;
+        if fees.net.0 <= 0 {
             return Err(Rejection::NonPositiveProceeds {
                 unit_price: fees.unit_price,
                 unit_fee: fees.unit_fee,

@@ -16,11 +16,7 @@ pub trait SimExecutor {
 
 impl SimExecutor for cs2_arb_sim::MockExecutor {
     fn buy_cost_at_limit(&self, order: &Order) -> cs2_arb_core::Result<Money> {
-        Ok(self
-            .fees()
-            .get(order.platform)
-            .buy(order.limit_price, order.quantity)?
-            .net)
+        cs2_arb_sim::MockExecutor::buy_cost_at_limit(self, order)
     }
 
     fn submit(&mut self, order: Order) -> Result<Fill, String> {

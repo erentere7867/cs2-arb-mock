@@ -1040,7 +1040,7 @@ mod tests {
     }
 
     #[test]
-    fn simulator_marks_multi_unit_lots_and_ranks_exits_with_per_unit_fees() {
+    fn simulator_marks_multi_unit_lots_and_ranks_exits_with_per_order_fees() {
         use crate::integrated::{MarketDepth, SimFillModel};
         use cs2_arb_strategy::{KillSwitch, RiskLimits};
 
@@ -1084,7 +1084,7 @@ mod tests {
             .best_exit(&csfloat.item, csfloat.float_bucket, 2)
             .unwrap()
             .unwrap();
-        assert_eq!((venue, proceeds), (Platform::CsFloat, Money(2000)));
+        assert_eq!((venue, proceeds), (Platform::Skinport, Money(2030)));
         let lot = Lot {
             position: Position {
                 id: "lot".into(),
@@ -1100,7 +1100,7 @@ mod tests {
             entry_fee: Money(0),
         };
         let replay = Backtester::with_fill_model(BacktestConfig::new(fees.clone()), model);
-        assert_eq!(replay.mark(&lot, &latest, t(0)).unwrap(), Money(2000));
+        assert_eq!(replay.mark(&lot, &latest, t(0)).unwrap(), Money(2030));
     }
 
     #[test]

@@ -188,6 +188,35 @@ fn assert_accounting_identity(portfolio: &Portfolio) {
 
 // ---------------------------------------------------------------- happy path
 
+#[test]
+fn replay_charges_platform_fees_per_order_and_funding_fees_per_unit() {
+    let mut fees = test_fees();
+    fees.csfloat.funding.crypto_deposit.fixed = Money(11);
+    fees.skinport.seller_fixed_fee = Money(5);
+    fees.skinport.funding.crypto_withdrawal.fixed = Money(7);
+    let mut h = harness_with(SimConfig::default(), fees.clone(), 1)
+        .liquid_csfloat(140)
+        .with_listing(listing(
+            "replay",
+            Platform::CsFloat,
+            1000,
+            2,
+            Some(LOW_FLOAT),
+        ));
+    h.exec = h.exec.with_order_fees(fees);
+
+    let buy = buy("replay-buy", 2, 1000);
+    assert_eq!(h.exec.buy_cost_at_limit(&buy).unwrap(), Money(2074));
+    assert_eq!(h.exec.submit(buy).unwrap().fee, Money(74));
+    h.clock.advance(TimeDelta::days(7));
+    h.refresh_sales(Platform::Skinport, 140, Some(LOW_FLOAT), "sale");
+    assert_eq!(
+        h.exec.submit(sell("replay-sell", 2, 1000)).unwrap().fee,
+        Money(179)
+    );
+    assert_accounting_identity(h.exec.portfolio());
+}
+
 /// Worked example (buy): CSFloat listing at $10.00, buyer fee 2.5% + 2c.
 /// fee = round(1000 * 0.025) + 2 = 25 + 2 = 27c; cash out 1027c; basis 1027c.
 #[test]

@@ -6,7 +6,8 @@ use std::fmt::Write as _;
 
 use chrono::{DateTime, Duration, Utc};
 use cs2_arb_core::{
-    BuyOrder, FeeSchedules, ItemId, Money, Platform, PriceSnapshot, Result, Sale, SimulationMode,
+    BuyOrder, FeeSchedules, FloatBucket, ItemId, Money, Platform, Position, PriceSnapshot, Result,
+    Sale, SimulationMode,
 };
 use cs2_arb_sim::{BuyOrderFillConfig, BuyOrderFillSimulator};
 use cs2_arb_strategy::{
@@ -242,7 +243,7 @@ pub fn run_peg_bid_engine(
     let mut bids_placed = 0usize;
     let mut bids_filled = 0usize;
     let mut last_now = None;
-    let mut latest_prices: HashMap<(Platform, ItemId), Money> = HashMap::new();
+    let mut latest_prices: HashMap<(Platform, ItemId, Option<FloatBucket>), Money> = HashMap::new();
 
     for now in times {
         // Transition any lots whose 7-day lock expired before `now` so they are
@@ -278,7 +279,10 @@ pub fn run_peg_bid_engine(
         while snap_idx < sorted_snapshots.len() && sorted_snapshots[snap_idx].observed_at <= now {
             let snap = &sorted_snapshots[snap_idx];
             if snap.price.0 > 0 {
-                latest_prices.insert((snap.platform, snap.item.clone()), snap.price);
+                latest_prices.insert(
+                    (snap.platform, snap.item.clone(), snap.float_bucket),
+                    snap.price,
+                );
             }
             strategy.observe_snapshot(snap);
             snap_idx += 1;
@@ -287,7 +291,8 @@ pub fn run_peg_bid_engine(
         while sale_idx < sorted_sales.len() && sorted_sales[sale_idx].sold_at <= now {
             let sale = &sorted_sales[sale_idx];
             if sale.price.0 > 0 {
-                latest_prices.insert((sale.platform, sale.item.clone()), sale.price);
+                let bucket = sale.float_value.and_then(FloatBucket::from_float);
+                latest_prices.insert((sale.platform, sale.item.clone(), bucket), sale.price);
             }
             strategy.observe_sale(sale);
             for report in simulator.process_transaction(sale, now) {
@@ -327,17 +332,8 @@ pub fn run_peg_bid_engine(
             }
         }
 
-        let unrealized_cents: i64 = simulator
-            .portfolio()
-            .positions()
-            .iter()
-            .filter_map(|pos| {
-                let mark = latest_prices.get(&(pos.acquired_on, pos.item.clone()))?;
-                let market_value = mark.0.saturating_mul(i64::from(pos.quantity));
-                Some(market_value.saturating_sub(pos.cost_basis.0))
-            })
-            .fold(0_i64, |acc, delta| acc.saturating_add(delta));
-        risk.set_unrealized_pnl(Money(unrealized_cents), now);
+        let unrealized = compute_unrealized_pnl(simulator.portfolio().positions(), &latest_prices);
+        risk.set_unrealized_pnl(unrealized, now);
 
         let bid_start = bid_idx;
         while bid_idx < sorted_bids.len() && sorted_bids[bid_idx].observed_at <= now {
@@ -424,6 +420,21 @@ fn format_money(money: Money) -> String {
 
 fn escape_md_cell(value: &str) -> String {
     value.replace('|', "\\|")
+}
+
+fn compute_unrealized_pnl(
+    positions: &[Position],
+    latest_prices: &HashMap<(Platform, ItemId, Option<FloatBucket>), Money>,
+) -> Money {
+    let cents: i64 = positions
+        .iter()
+        .filter_map(|pos| {
+            let mark = latest_prices.get(&(pos.acquired_on, pos.item.clone(), pos.float_bucket))?;
+            let market_value = mark.0.saturating_mul(i64::from(pos.quantity));
+            Some(market_value.saturating_sub(pos.cost_basis.0))
+        })
+        .fold(0_i64, |acc, delta| acc.saturating_add(delta));
+    Money(cents)
 }
 
 #[cfg(test)]

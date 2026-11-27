@@ -18,8 +18,8 @@ use std::collections::HashSet;
 
 use chrono::{DateTime, TimeDelta, Utc};
 use cs2_arb_core::{
-    Error, FeeSchedules, Fill, Money, Order, OrderSide, Platform, Position, Result, Sale,
-    SimulationMode,
+    Error, FeeSchedules, Fill, FloatBucket, ItemId, Money, Order, OrderSide, Platform, Position,
+    Result, Sale, SimulationMode,
 };
 use serde::Serialize;
 
@@ -196,6 +196,29 @@ impl BuyOrderFillSimulator {
                 self.sales_tape.push(sale);
             }
         }
+    }
+
+    /// Cancel any resting passive buy orders for the given `(platform, item, float_bucket)`.
+    ///
+    /// Returns the number of resting bids cancelled.
+    pub fn cancel_bids_for_item(
+        &mut self,
+        platform: Platform,
+        item: &ItemId,
+        float_bucket: Option<FloatBucket>,
+    ) -> usize {
+        let mut cancelled = 0;
+        for existing in &mut self.resting_bids {
+            if existing.status == BuyOrderStatus::Resting
+                && existing.order.platform == platform
+                && &existing.order.item == item
+                && existing.order.float_bucket == float_bucket
+            {
+                existing.status = BuyOrderStatus::Cancelled;
+                cancelled += 1;
+            }
+        }
+        cancelled
     }
 
     /// Place (or reprice) a passive mock buy order. Never fills immediately.

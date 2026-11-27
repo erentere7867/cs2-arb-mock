@@ -263,10 +263,23 @@ pub fn run_peg_bid_engine(
         }
 
         if !kill_switch.is_engaged() && bid_start < bid_idx {
-            let orders = strategy.evaluate(&sorted_bids[bid_start..bid_idx], fees, now)?;
+            let batch = &sorted_bids[bid_start..bid_idx];
+            let orders = strategy.evaluate(batch, fees, now)?;
             for order in orders {
                 if simulator.place_bid(order, now).is_ok() {
                     bids_placed += 1;
+                }
+            }
+            // Cancel any resting simulator bids that the strategy discarded (e.g., ceiling exceeded).
+            let active_keys: std::collections::HashSet<_> = strategy
+                .active_bids()
+                .into_iter()
+                .map(|b| (b.order.platform, b.order.item.clone(), b.order.float_bucket))
+                .collect();
+            for obs in batch {
+                let key = (obs.platform, obs.item.clone(), obs.float_bucket);
+                if !active_keys.contains(&key) {
+                    simulator.cancel_bids_for_item(obs.platform, &obs.item, obs.float_bucket);
                 }
             }
         }

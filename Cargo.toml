@@ -9,6 +9,7 @@ members = [
     "crates/strategy",
     "crates/backtest",
     "bins/cs2-arb",
+    "bins/cs2-arb-dashboard",
 ]
 
 [workspace.package]

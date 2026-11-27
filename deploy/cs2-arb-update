@@ -27,12 +27,23 @@ git fetch --prune origin
 revision=$(git rev-parse --verify "refs/remotes/origin/$branch^{commit}")
 git switch --detach "$revision"
 cargo="$HOME/.cargo/bin/cargo"
-target_dir=$("$cargo" metadata --locked --format-version 1 --no-deps | jq -er '.target_directory')
-"$cargo" build --locked --release --bin cs2-arb
+metadata=$("$cargo" metadata --locked --format-version 1 --no-deps)
+target_dir=$(jq -er '.target_directory' <<< "$metadata")
+dashboard=$(jq -r 'any(.packages[].targets[]; .name == "cs2-arb-dashboard" and (.kind | index("bin") != null))' <<< "$metadata")
+bins=(--bin cs2-arb)
+units=(cs2-arb-watch.service cs2-arb-mock@cs2.service cs2-arb-mock@rust.service)
+if [[ $dashboard == true ]]; then
+    bins+=(--bin cs2-arb-dashboard)
+    units+=(cs2-arb-dashboard.service)
+fi
+"$cargo" build --locked --release "${bins[@]}"
 
 stage=$(mktemp -d "$data/releases/.stage.XXXXXXXX")
 trap 'rm -rf -- "$stage"' EXIT
 install -m 700 "$target_dir/release/cs2-arb" "$stage/cs2-arb"
+if [[ $dashboard == true ]]; then
+    install -m 700 "$target_dir/release/cs2-arb-dashboard" "$stage/cs2-arb-dashboard"
+fi
 install -D -m 600 config/default.toml "$stage/config/default.toml"
 install -m 600 config/rust.toml "$stage/config/rust.toml"
 printf '%s %s\n' "$branch" "$revision" > "$stage/revision"
@@ -41,6 +52,12 @@ mv -T -- "$stage" "$release"
 ln -s -- "$release" "$stage"
 mv -Tf -- "$stage" "$data/current"
 
-units=(cs2-arb-watch.service cs2-arb-mock@cs2.service cs2-arb-mock@rust.service)
+if [[ $dashboard == false ]] && systemctl is-active --quiet cs2-arb-dashboard.service; then
+    sudo systemctl stop cs2-arb-dashboard.service
+fi
 sudo systemctl restart "${units[@]}"
 systemctl --no-pager --lines=0 status "${units[@]}"
+if [[ $dashboard == true ]] && ! systemctl is-enabled --quiet cs2-arb-dashboard.service; then
+    printf '%s\n' 'First dashboard rollout: run sudo systemctl enable --now cs2-arb-dashboard.' \
+        'See deploy/README.md for optional journal access for the dashboard process running as ubuntu.'
+fi

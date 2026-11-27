@@ -6,7 +6,7 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use cs2_arb_core::{Error, Platform, Result};
 use reqwest::header::{HeaderMap, HeaderValue};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, MutexGuard};
 use tokio::time::Instant;
 
 use crate::clock::Clock;
@@ -15,13 +15,20 @@ use crate::gate::{Endpoint, RequestGate};
 /// Delay assumed for a 429 that carries no usable retry hint.
 const DEFAULT_429_RETRY: Duration = Duration::from_secs(60);
 const RETRY_BODY_LIMIT: usize = 4096;
+const MAX_QUOTA_WAIT: Duration = Duration::from_secs(3);
+
+#[derive(Clone, Copy)]
+enum Cooldown {
+    WaitUntil(Instant),
+    RejectUntil(Instant),
+}
 
 pub(crate) struct HttpCore {
     client: reqwest::Client,
     base_url: String,
     gate: Arc<dyn RequestGate>,
     clock: Arc<dyn Clock>,
-    cooldown: Mutex<Option<Instant>>,
+    cooldown: Mutex<Option<Cooldown>>,
 }
 
 impl HttpCore {
@@ -76,11 +83,10 @@ impl HttpCore {
         path_and_query: &str,
         headers: impl FnOnce(DateTime<Utc>) -> Result<HeaderMap>,
     ) -> Result<Vec<u8>> {
-        check_cooldown(*self.cooldown.lock().await)?;
+        drop(self.ready().await?);
         self.gate.acquire(endpoint).await?;
         // Hold admissions until the response headers (and any 429 hint) are known.
-        let mut cooldown = self.cooldown.lock().await;
-        check_cooldown(*cooldown)?;
+        let mut cooldown = self.ready().await?;
         let url = format!("{}{}", self.base_url, path_and_query);
         let mut response = self
             .client
@@ -104,7 +110,9 @@ impl HttpCore {
             };
             let received_at = Instant::now();
             // Keep a safe cooldown even if the caller cancels while reading the error body.
-            *cooldown = Some(received_at + DEFAULT_429_RETRY.max(minimum));
+            *cooldown = Some(Cooldown::RejectUntil(
+                received_at + DEFAULT_429_RETRY.max(minimum),
+            ));
             let hint = match retry_after {
                 Some(delay) => Some(delay),
                 None => tokio::time::timeout(
@@ -120,7 +128,7 @@ impl HttpCore {
                 .unwrap_or(DEFAULT_429_RETRY)
                 .max(minimum)
                 .min(Duration::from_secs(u32::MAX.into()));
-            *cooldown = Some(received_at + retry_after);
+            *cooldown = Some(Cooldown::RejectUntil(received_at + retry_after));
             self.gate.on_response(endpoint, status, Some(retry_after));
             tracing::warn!(
                 endpoint = endpoint.name,
@@ -133,7 +141,12 @@ impl HttpCore {
         if (200..300).contains(&status) && quota_exhausted(response.headers()) {
             if let Some(delay) = retry_after.or(reset) {
                 let delay = delay.min(Duration::from_secs(u32::MAX.into()));
-                *cooldown = Some(Instant::now() + delay);
+                let until = Instant::now() + delay;
+                *cooldown = Some(if delay <= MAX_QUOTA_WAIT {
+                    Cooldown::WaitUntil(until)
+                } else {
+                    Cooldown::RejectUntil(until)
+                });
             }
         }
         self.gate
@@ -158,16 +171,27 @@ impl HttpCore {
             .map_err(|e| Error::Network(format!("{}: {}", endpoint.name, e.without_url())))?;
         Ok(body.to_vec())
     }
-}
-
-fn check_cooldown(until: Option<Instant>) -> Result<()> {
-    if let Some(retry_after) = until.and_then(|until| until.checked_duration_since(Instant::now()))
-    {
-        if !retry_after.is_zero() {
-            return Err(Error::RateLimited { retry_after });
+    async fn ready(&self) -> Result<MutexGuard<'_, Option<Cooldown>>> {
+        loop {
+            let mut cooldown = self.cooldown.lock().await;
+            let now = Instant::now();
+            match *cooldown {
+                Some(Cooldown::WaitUntil(until)) if now < until => {
+                    drop(cooldown);
+                    tokio::time::sleep_until(until).await;
+                }
+                Some(Cooldown::RejectUntil(until)) if now < until => {
+                    return Err(Error::RateLimited {
+                        retry_after: until - now,
+                    });
+                }
+                _ => {
+                    *cooldown = None;
+                    return Ok(cooldown);
+                }
+            }
         }
     }
-    Ok(())
 }
 
 fn header_number(headers: &HeaderMap, name: &'static str) -> Option<i64> {

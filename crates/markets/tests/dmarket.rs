@@ -6,7 +6,8 @@ use std::time::Duration;
 use common::*;
 use cs2_arb_core::{Error, Game, ItemId, MarketClient, Money, Platform, WearTier};
 use cs2_arb_markets::dmarket::{string_to_sign, DMarketClient, DMarketConfig, DMarketCredentials};
-use cs2_arb_markets::NoopGate;
+use cs2_arb_markets::{NetGate, NoopGate};
+use cs2_arb_net::{NetConfig, TokioClock};
 use ed25519_dalek::{Signature, SigningKey, Verifier};
 use serde_json::json;
 use wiremock::matchers::{method, path, query_param};
@@ -163,7 +164,7 @@ fn offer(
 }
 
 #[tokio::test(start_paused = true)]
-async fn exhausted_quota_stops_reads_until_dmarket_reset() {
+async fn short_quota_reset_waits_without_dropping_dmarket_sales() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/marketplace-api/v2/offers"))
@@ -173,19 +174,56 @@ async fn exhausted_quota_stops_reads_until_dmarket_reset() {
                 .insert_header("RateLimit-Reset", "1")
                 .set_body_json(json!({"items": []})),
         )
-        .expect(2)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/trade-aggregator/v1/last-sales"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "sales": [{"price": "1.00", "date": "1748779199"}]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let limiter =
+        NetConfig::from_toml("[rate_limits.dmarket.default]\nmax_requests = 1\nwindow_seconds = 1")
+            .unwrap()
+            .build_limiter(Arc::new(TokioClock))
+            .unwrap();
+    let dm = client_with_gate(&server, Arc::new(NetGate(Arc::new(limiter))), clock());
+    assert!(dm.list_listings(&redline()).await.unwrap().is_empty());
+    let item = redline();
+    let sales = dm.recent_sales(&item, t0() - chrono::Duration::days(1));
+    tokio::pin!(sales);
+    assert!(tokio::time::timeout(Duration::from_millis(999), &mut sales)
+        .await
+        .is_err());
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    assert_eq!(sales.await.unwrap().len(), 1);
+    assert_eq!(server.received_requests().await.unwrap().len(), 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn long_quota_reset_skips_dmarket_reads() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/marketplace-api/v2/offers"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("RateLimit-Remaining", "0")
+                .insert_header("RateLimit-Reset", "60")
+                .set_body_json(json!({"items": []})),
+        )
+        .expect(1)
         .mount(&server)
         .await;
     let dm = client(&server);
     assert!(dm.list_listings(&redline()).await.unwrap().is_empty());
     assert!(matches!(
         dm.recent_sales(&redline(), t0()).await,
-        Err(Error::RateLimited { retry_after }) if retry_after == Duration::from_secs(1)
+        Err(Error::RateLimited { retry_after }) if retry_after == Duration::from_secs(60)
     ));
     assert_eq!(server.received_requests().await.unwrap().len(), 1);
-    tokio::time::advance(Duration::from_secs(1)).await;
-    assert!(dm.list_listings(&redline()).await.unwrap().is_empty());
-    assert_eq!(server.received_requests().await.unwrap().len(), 2);
 }
 
 #[tokio::test]

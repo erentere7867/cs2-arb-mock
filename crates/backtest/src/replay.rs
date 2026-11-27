@@ -139,6 +139,10 @@ impl<'a> MarketView<'a> {
         self.fill_model.uses_venue_holds()
     }
 
+    pub fn venue_trade_holds(&self) -> Vec<cs2_arb_sim::venues::VenueTradeHold> {
+        self.fill_model.venue_trade_holds()
+    }
+
     pub fn available_cash(&self, strategy: &str, platform: Platform) -> Option<Money> {
         self.fill_model.available_cash(strategy, platform)
     }
@@ -1350,10 +1354,17 @@ mod tests {
                     SimulationMode,
                     &snapshots,
                     &[],
-                    &mut [Box::new(SpreadAdapter::new(SpreadConfig::default()))],
+                    &mut [Box::new(SpreadAdapter::new(SpreadConfig {
+                        price_drift_pct_per_day: 5.0,
+                        ..SpreadConfig::default()
+                    }))],
                 )
                 .unwrap();
             assert_eq!(report.trades.len(), usize::from(use_accounts));
+            assert_eq!(
+                report.totals.orders_filled,
+                if use_accounts { 2 } else { 0 }
+            );
             if use_accounts {
                 assert_eq!(
                     report

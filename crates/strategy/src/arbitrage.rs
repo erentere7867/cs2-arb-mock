@@ -59,6 +59,10 @@ impl Default for SpreadConfig {
 
 impl SpreadConfig {
     pub fn validate(&self) -> Result<()> {
+        self.validate_for_hold(f64::from(self.hold_days))
+    }
+
+    fn validate_for_hold(&self, hold_days: f64) -> Result<()> {
         let bad = |msg: &str| Err(Error::InvalidConfig(format!("spread: {msg}")));
         if !self.annual_opportunity_rate_pct.is_finite() || self.annual_opportunity_rate_pct < 0.0 {
             return bad("annual_opportunity_rate_pct must be finite and >= 0");
@@ -66,7 +70,7 @@ impl SpreadConfig {
         if !self.price_drift_pct_per_day.is_finite() || self.price_drift_pct_per_day < 0.0 {
             return bad("price_drift_pct_per_day must be finite and >= 0");
         }
-        if self.price_drift_pct_per_day * f64::from(self.hold_days) >= 100.0 {
+        if self.price_drift_pct_per_day * hold_days >= 100.0 {
             return bad("total drift over the hold must be below 100%");
         }
         if self.sell_undercut.0 < 0 {
@@ -187,7 +191,20 @@ pub fn spread_breakdown(
     fees: &FeeSchedules,
     config: &SpreadConfig,
 ) -> Result<SpreadBreakdown> {
-    config.validate()?;
+    spread_breakdown_with_hold(buy, sell, fees, config, None)
+}
+
+pub fn spread_breakdown_with_hold(
+    buy: &PriceSnapshot,
+    sell: &PriceSnapshot,
+    fees: &FeeSchedules,
+    config: &SpreadConfig,
+    hold: Option<Duration>,
+) -> Result<SpreadBreakdown> {
+    let hold_days = hold.map_or(f64::from(config.hold_days), |hold| {
+        hold.num_seconds() as f64 / 86_400.0
+    });
+    config.validate_for_hold(hold_days)?;
     if buy.item != sell.item
         || !comparable_wear(
             buy.item.wear_tier,
@@ -213,14 +230,16 @@ pub fn spread_breakdown(
 
     let buy_fees = fees.get(buy.platform);
     let sell_fees = fees.get(sell.platform);
-    let drifted_price = cents_floor(sell_price.0 as f64 * (1.0 - config.drift_fraction()))?;
+    let drift_fraction = config.price_drift_pct_per_day / 100.0 * hold_days;
+    let drifted_price = cents_floor(sell_price.0 as f64 * (1.0 - drift_fraction))?;
     let qty = config.quantity;
     let buy_cost = buy_fees.buyer_order_total(buy.price, qty)?;
     let sell_proceeds = sell_fees.seller_order_proceeds(drifted_price, qty)?;
     let drift_haircut = sell_fees
         .seller_order_proceeds(sell_price, qty)?
         .checked_sub(sell_proceeds)?;
-    let opportunity_cost = cents_ceil(buy_cost.0 as f64 * config.opportunity_cost_fraction())?;
+    let opportunity_fraction = config.annual_opportunity_rate_pct / 100.0 * hold_days / 365.0;
+    let opportunity_cost = cents_ceil(buy_cost.0 as f64 * opportunity_fraction)?;
     let expected_net_profit = sell_proceeds
         .checked_sub(buy_cost)?
         .checked_sub(opportunity_cost)?;
@@ -257,6 +276,17 @@ pub fn evaluate_spread(
     now: DateTime<Utc>,
 ) -> Result<Vec<SpreadBreakdown>> {
     config.validate()?;
+    evaluate_spread_with_holds(quotes, fees, config, now, |_| None)
+}
+
+pub fn evaluate_spread_with_holds(
+    quotes: &[PriceSnapshot],
+    fees: &FeeSchedules,
+    config: &SpreadConfig,
+    now: DateTime<Utc>,
+    hold: impl Fn(Platform) -> Option<Duration>,
+) -> Result<Vec<SpreadBreakdown>> {
+    config.validate_for_hold(0.0)?;
     let oldest = config
         .max_quote_age_secs
         .map(|age| now - Duration::seconds(age));
@@ -289,7 +319,7 @@ pub fn evaluate_spread(
                 if buy.platform == sell.platform {
                     continue;
                 }
-                match spread_breakdown(buy, sell, fees, config) {
+                match spread_breakdown_with_hold(buy, sell, fees, config, hold(buy.platform)) {
                     Ok(breakdown)
                         if breakdown.expected_net_profit > config.min_net_profit
                             && (breakdown.expected_net_profit.0 > 0

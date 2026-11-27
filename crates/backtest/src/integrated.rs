@@ -10,8 +10,8 @@ use cs2_arb_core::{
 use cs2_arb_sim::{wear::quote_bucket, MockExecutor, SimConfig};
 use cs2_arb_strategy::executor::execute_with_risk;
 use cs2_arb_strategy::{
-    evaluate_spread, DipConfig, DipDetector, KillSwitch, RiskLimits, RiskManager, SpreadConfig,
-    SubmitError,
+    evaluate_spread, evaluate_spread_with_holds, spread_breakdown_with_hold, DipConfig,
+    DipDetector, KillSwitch, RiskLimits, RiskManager, SpreadConfig, SubmitError,
 };
 
 use crate::{FillModel, FillOutcome, MarketView, QuoteKey, StrategyAdapter};
@@ -410,7 +410,23 @@ impl StrategyAdapter for SpreadAdapter {
         }
         let quotes: Vec<_> = view.latest_quotes().cloned().collect();
         let mut executable = Vec::new();
-        for candidate in evaluate_spread(&quotes, view.fees, &self.config, view.now)? {
+        let venue_holds = view.venue_trade_holds();
+        let hold = |platform| {
+            view.uses_venue_holds().then(|| {
+                venue_holds
+                    .iter()
+                    .find(|hold| hold.platform == platform)
+                    .map_or_else(cs2_arb_sim::valve_trade_hold, |hold| {
+                        chrono::Duration::seconds(hold.seconds)
+                    })
+            })
+        };
+        let candidates = if view.uses_venue_holds() {
+            evaluate_spread_with_holds(&quotes, view.fees, &self.config, view.now, hold)?
+        } else {
+            evaluate_spread(&quotes, view.fees, &self.config, view.now)?
+        };
+        for candidate in candidates {
             let order = candidate.buy_order(view.now);
             let actual = view.preview_fill(self.name(), &order);
             let candidate = if let Some((price, quantity)) = actual {
@@ -432,7 +448,7 @@ impl StrategyAdapter for SpreadAdapter {
                     quantity,
                     ..self.config.clone()
                 };
-                cs2_arb_strategy::spread_breakdown(
+                spread_breakdown_with_hold(
                     &PriceSnapshot {
                         price,
                         ..buy.clone()
@@ -440,6 +456,7 @@ impl StrategyAdapter for SpreadAdapter {
                     sell,
                     view.fees,
                     &config,
+                    hold(candidate.buy_platform),
                 )?
             } else {
                 candidate

@@ -180,6 +180,12 @@ impl FillModel for SimFillModel<'_> {
         self.venue_accounts.is_some()
     }
 
+    fn venue_trade_holds(&self) -> Vec<cs2_arb_sim::venues::VenueTradeHold> {
+        self.venue_accounts
+            .as_ref()
+            .map_or_else(Vec::new, cs2_arb_sim::venues::VenueAccounts::trade_holds)
+    }
+
     fn preview_fill(&self, strategy: &str, order: &Order) -> Option<(Money, u32)> {
         self.sessions
             .borrow()

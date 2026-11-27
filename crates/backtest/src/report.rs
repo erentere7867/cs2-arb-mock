@@ -100,7 +100,10 @@ pub struct ReplayWindow {
 pub struct PerformanceReport {
     pub disclaimer: String,
     pub window: ReplayWindow,
+    /// Uniform hold, or zero if reporting configured venue holds instead.
     pub trade_hold_secs: i64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub venue_trade_holds: Vec<cs2_arb_sim::venues::VenueTradeHold>,
     /// All strategies combined. Drawdown is computed on the combined equity curve.
     pub totals: StrategyStats,
     /// Per-strategy breakdown, in the order the strategies were supplied.
@@ -140,14 +143,29 @@ impl PerformanceReport {
         let w = &self.window;
         let _ = writeln!(
             out,
-            "Window: {} → {} · {} steps · {} snapshots · {}/{} events delivered · trade hold {}\n",
+            "Window: {} → {} · {} steps · {} snapshots · {}/{} events delivered · {}\n",
             w.start.map_or("n/a".into(), |t| t.to_rfc3339()),
             w.end.map_or("n/a".into(), |t| t.to_rfc3339()),
             w.steps,
             w.snapshots,
             w.events_delivered,
             w.events_total,
-            fmt_duration(self.trade_hold_secs as f64),
+            if self.venue_trade_holds.is_empty() {
+                format!("trade hold {}", fmt_duration(self.trade_hold_secs as f64))
+            } else {
+                format!(
+                    "trade holds by venue: {}",
+                    self.venue_trade_holds
+                        .iter()
+                        .map(|hold| format!(
+                            "{} {}",
+                            platform_name(hold.platform),
+                            fmt_duration(hold.seconds as f64)
+                        ))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            },
         );
 
         let _ = writeln!(out, "## Summary\n");

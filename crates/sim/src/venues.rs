@@ -87,6 +87,12 @@ pub struct VenueBalance {
     pub pending: Money,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VenueTradeHold {
+    pub platform: Platform,
+    pub seconds: i64,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct VenueAccounts {
     rules: VenueAccountsConfig,
@@ -125,6 +131,21 @@ impl VenueAccounts {
 
     pub fn trade_unlock(&self, platform: Platform, at: DateTime<Utc>) -> Result<DateTime<Utc>> {
         after(at, self.venue(platform)?.trade_hold_seconds)
+    }
+
+    pub fn trade_holds(&self) -> Vec<VenueTradeHold> {
+        Platform::ALL
+            .into_iter()
+            .filter_map(|platform| {
+                self.rules
+                    .venues
+                    .get(&platform)
+                    .map(|venue| VenueTradeHold {
+                        platform,
+                        seconds: venue.trade_hold_seconds,
+                    })
+            })
+            .collect()
     }
 
     pub fn debit(&mut self, platform: Platform, amount: Money) -> Result<()> {

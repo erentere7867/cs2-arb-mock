@@ -714,10 +714,16 @@ impl<F: FillModel> Backtester<F> {
             (submitted, filled, rejected),
             (total_open, total_open_basis, total_unrealized),
         )?;
+        let venue_trade_holds = self.fill_model.venue_trade_holds();
         Ok(PerformanceReport {
             disclaimer: REPORT_DISCLAIMER.to_owned(),
             window,
-            trade_hold_secs: hold_secs(&self.fill_model),
+            trade_hold_secs: if venue_trade_holds.is_empty() {
+                hold_secs(&self.fill_model)
+            } else {
+                0
+            },
+            venue_trade_holds,
             totals,
             strategies: per_strategy,
             trades: all_trades,
@@ -1304,7 +1310,11 @@ mod tests {
                             platform,
                             VenueConfig {
                                 starting_cash: Money(5000),
-                                trade_hold_seconds: 86_400,
+                                trade_hold_seconds: if platform == Platform::CsFloat {
+                                    86_400
+                                } else {
+                                    172_800
+                                },
                                 sale_balance_hold_seconds: 0,
                                 transfer_in_seconds: 0,
                                 transfer_out_seconds: 0,
@@ -1331,6 +1341,20 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(report.trades.len(), usize::from(use_accounts));
+            if use_accounts {
+                assert_eq!(
+                    report
+                        .venue_trade_holds
+                        .iter()
+                        .map(|hold| (hold.platform, hold.seconds))
+                        .collect::<Vec<_>>(),
+                    [(Platform::CsFloat, 86_400), (Platform::DMarket, 172_800)]
+                );
+                assert!(report.to_markdown().contains("trade holds by venue"));
+            } else {
+                assert!(report.venue_trade_holds.is_empty());
+                assert_eq!(report.trade_hold_secs, 7 * 86_400);
+            }
         }
     }
 

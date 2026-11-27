@@ -6,7 +6,7 @@ use std::collections::{BTreeSet, HashMap};
 
 use chrono::{DateTime, Duration, Utc};
 use cs2_arb_core::{FeeSchedule, Fill, Money, Order, OrderSide, PriceSnapshot, Result};
-use cs2_arb_sim::venues::VenueBalance;
+use cs2_arb_sim::venues::{VenueBalance, VenueTradeHold};
 
 use crate::replay::{MarketView, QuoteKey};
 
@@ -30,6 +30,10 @@ pub trait FillModel {
 
     fn uses_venue_holds(&self) -> bool {
         false
+    }
+
+    fn venue_trade_holds(&self) -> Vec<VenueTradeHold> {
+        Vec::new()
     }
 
     fn preview_fill(&self, _strategy: &str, order: &Order) -> Option<(Money, u32)> {

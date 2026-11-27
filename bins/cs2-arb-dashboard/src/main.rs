@@ -17,8 +17,12 @@ use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::{TokioIo, TokioTimer};
 use serde::Serialize;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
+
+const HEADER_TIMEOUT: Duration = Duration::from_secs(5);
+const CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Parser)]
 #[command(about = "Read-only dashboard for CS2 and Rust mock batches")]
@@ -129,6 +133,22 @@ fn route<B>(request: Request<B>, snapshot: &RwLock<Bytes>) -> Response<Full<Byte
     response.body(Full::new(body)).expect("static headers")
 }
 
+async fn serve_client<T: AsyncRead + AsyncWrite + Unpin>(
+    stream: T,
+    state: &RwLock<Bytes>,
+    deadline: Duration,
+) -> Result<Result<(), hyper::Error>, tokio::time::error::Elapsed> {
+    let connection = http1::Builder::new()
+        .timer(TokioTimer::new())
+        .header_read_timeout(HEADER_TIMEOUT)
+        .keep_alive(false)
+        .serve_connection(
+            TokioIo::new(stream),
+            service_fn(|request| async move { Ok::<_, Infallible>(route(request, state)) }),
+        );
+    tokio::time::timeout(deadline, connection).await
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
@@ -155,15 +175,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let state = Arc::clone(&state);
         tokio::spawn(async move {
             let _slot = slot;
-            let _ = http1::Builder::new()
-                .timer(TokioTimer::new())
-                .header_read_timeout(Duration::from_secs(5))
-                .keep_alive(false)
-                .serve_connection(
-                    TokioIo::new(stream),
-                    service_fn(|request| async { Ok::<_, Infallible>(route(request, &state)) }),
-                )
-                .await;
+            let _ = serve_client(stream, &state, CONNECTION_TIMEOUT).await;
         });
     }
 }
@@ -172,6 +184,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 mod tests {
     use super::*;
     use http_body_util::BodyExt;
+    use tokio::io::{duplex, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn disconnects_clients_that_do_not_read_the_response() {
+        let (mut client, server) = duplex(128);
+        let state = RwLock::new(Bytes::from(vec![0; 1024]));
+        client
+            .write_all(b"GET /api/dashboard HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+
+        assert!(serve_client(server, &state, Duration::from_millis(50))
+            .await
+            .is_err());
+    }
 
     #[tokio::test]
     async fn serves_only_explicit_get_routes() {

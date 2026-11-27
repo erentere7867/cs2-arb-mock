@@ -228,6 +228,15 @@ pub trait StrategyAdapter {
     /// positions for the same item and float bucket in FIFO order.
     fn on_step(&mut self, view: &MarketView<'_>) -> Result<Vec<Order>>;
 
+    /// Return a rejection reason if an order may no longer execute after simulated latency.
+    fn delayed_execution_rejection(
+        &self,
+        _order: &Order,
+        _view: &MarketView<'_>,
+    ) -> Option<&'static str> {
+        None
+    }
+
     fn on_fill(&mut self, _fill: &Fill) {}
 
     fn on_reject(&mut self, _order: &Order, _reason: &str) {}
@@ -359,6 +368,12 @@ impl<F: FillModel> Backtester<F> {
                 };
                 self.fill_model.prepare_step(strategy.name(), &view)?;
                 for order in book.pending.remove(&now).into_iter().flatten() {
+                    if let Some(reason) = strategy.delayed_execution_rejection(&order, &view) {
+                        book.rejected += 1;
+                        tracing::debug!(strategy = strategy.name(), order = %order.id, %reason, "simulated order rejected");
+                        strategy.on_reject(&order, reason);
+                        continue;
+                    }
                     self.book_execution(strategy.as_mut(), book, &order, &view)?;
                 }
                 if !market_tick {
@@ -1507,6 +1522,114 @@ mod tests {
                 assert_eq!(stop_loss.closed_at, t(9));
                 assert!(stop_loss.net_pnl.0 < 0);
             }
+        }
+    }
+
+    #[test]
+    fn delayed_dip_buy_rechecks_market_and_item_at_execution() {
+        use std::sync::Arc;
+
+        use crate::integrated::{DipAdapter, SimFillModel};
+        use cs2_arb_sim::{FillLatency, SimConfig};
+        use cs2_arb_strategy::regime::{MarketRegime, RegimeConfig, RegimeStatus};
+        use cs2_arb_strategy::{DipConfig, KillSwitch, RiskLimits};
+
+        let queued_at = t(2);
+        let changed_at = queued_at + Duration::seconds(2);
+        let latency = Duration::seconds(3);
+        for (market_price, item_price, due_status, allowed) in [
+            (1000, 900, RegimeStatus::RiskOn, true),
+            (800, 900, RegimeStatus::MarketDowntrend, false),
+            (1000, 700, RegimeStatus::RiskOn, false),
+        ] {
+            let mut changed = snap(Platform::CsFloat, 2, item_price);
+            changed.observed_at = changed_at;
+            let quotes = [
+                snap(Platform::CsFloat, -5, 1000),
+                snap(Platform::CsFloat, 0, 999),
+                snap(Platform::CsFloat, 1, 1001),
+                snap(Platform::CsFloat, 2, 900),
+                changed,
+            ];
+            let mut snapshots = quotes.to_vec();
+            for name in ["Other One", "Other Two"] {
+                for at in [t(-5), t(1), queued_at, changed_at] {
+                    let mut quote = snap(
+                        Platform::CsFloat,
+                        2,
+                        if at == changed_at { market_price } else { 1000 },
+                    );
+                    quote.item.market_hash_name = name.into();
+                    quote.observed_at = at;
+                    snapshots.push(quote);
+                }
+            }
+            let mut end_quote = snapshots.last().unwrap().clone();
+            end_quote.observed_at = queued_at + latency + Duration::seconds(1);
+            snapshots.push(end_quote);
+            let mut depth = depth_with_snapshots(&quotes.map(|quote| (quote, 1, 70)));
+            add_dip_baseline_sale(&mut depth);
+            let regime = Arc::new(
+                MarketRegime::new(
+                    RegimeConfig {
+                        item_underperformance_pct: 15.0,
+                        ..RegimeConfig::default()
+                    },
+                    &snapshots,
+                    depth.sales(),
+                )
+                .unwrap(),
+            );
+            assert!(regime.at(queued_at).allows(&item()));
+            let at_due_time = regime.at(queued_at + latency);
+            assert_eq!(at_due_time.state.status, due_status);
+            assert_eq!(at_due_time.allows(&item()), allowed);
+            let adapter = DipAdapter::new(
+                DipConfig {
+                    min_samples: 2,
+                    min_sales_in_window: 1,
+                    ..DipConfig::default()
+                },
+                &depth,
+            )
+            .unwrap()
+            .with_market_regime(regime);
+            let events = [
+                MarketEvent::PanicWindowOpened {
+                    branch: "test".into(),
+                    opened_at: queued_at,
+                },
+                MarketEvent::PanicWindowClosed {
+                    branch: "test".into(),
+                    closed_at: changed_at,
+                },
+            ];
+            let fees = fees();
+            let model = SimFillModel::new(
+                &depth,
+                fees.clone(),
+                RiskLimits::default(),
+                KillSwitch::new(),
+            )
+            .with_sim_config(SimConfig {
+                fill_latency: FillLatency {
+                    min: latency,
+                    max: latency,
+                },
+                ..SimConfig::default()
+            });
+            let report = Backtester::with_fill_model(BacktestConfig::new(fees), model)
+                .run(
+                    SimulationMode,
+                    &snapshots,
+                    &events,
+                    &mut [Box::new(adapter)],
+                )
+                .unwrap();
+            assert_eq!(report.totals.orders_submitted, 1);
+            assert_eq!(report.totals.orders_pending, 0);
+            assert_eq!(report.totals.orders_filled, u32::from(allowed));
+            assert_eq!(report.totals.orders_rejected, u32::from(!allowed));
         }
     }
 

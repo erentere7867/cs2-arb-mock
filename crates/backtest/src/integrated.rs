@@ -579,6 +579,19 @@ impl StrategyAdapter for DipAdapter {
         "dip"
     }
 
+    fn delayed_execution_rejection(
+        &self,
+        order: &Order,
+        view: &MarketView<'_>,
+    ) -> Option<&'static str> {
+        (order.side == OrderSide::Buy
+            && self
+                .market_regime
+                .as_ref()
+                .is_some_and(|regime| !regime.at(view.now).allows(&order.item)))
+        .then_some("market regime blocks this delayed dip buy")
+    }
+
     fn on_step(&mut self, view: &MarketView<'_>) -> Result<Vec<Order>> {
         for event in view.new_events {
             self.detector.apply_event(event);

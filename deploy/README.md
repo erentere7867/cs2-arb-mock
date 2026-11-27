@@ -24,9 +24,13 @@ See [`.env.example`](../.env.example) for the credential names. If `.env`
 already exists, edit it in place rather than replacing it. Add `CSFLOAT_API_KEY`
 to `/home/ubuntu/cs2-arb-mock/.env` when available (systemd `KEY=value` syntax,
 no `export`), then run `sudo systemctl restart cs2-arb-mock@cs2`.
-The CS2 and Rust jobs use their branch's default live venues.
-Skinport and Waxpeer reads are public; DMarket's existing offers adapter requires both
-credentials and opt-in, so these jobs do not use it by default.
+Skinport and Waxpeer reads are public and need no keys. CSFloat makes
+unauthenticated requests if its key is blank; those requests can be rate limited.
+DMarket has no public fallback and is disabled in the default jobs. To enable
+it for a job, add `"dmarket"` to the top-level `markets` list in that game's
+config (`config/default.toml` for CS2, where the list is commented out, or
+`config/rust.toml` for Rust) and set both `DMARKET_PUBLIC_KEY` and
+`DMARKET_SECRET_KEY` in `.env` before deploying the updated config.
 
 To block new simulated orders in both jobs, create
 `/home/ubuntu/cs2-arb-mock-data/KILL_SWITCH` (not a file in the checkout).

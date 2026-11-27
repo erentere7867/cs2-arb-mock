@@ -73,7 +73,7 @@ type PriceHistory = Vec<(DateTime<Utc>, i64)>;
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
 enum PriceSource {
     Snapshot(Platform, Option<FloatBucket>),
-    VerifiedSale(Platform),
+    VerifiedSale(Platform, Option<FloatBucket>),
 }
 
 pub struct RegimeAt<'a> {
@@ -131,7 +131,10 @@ impl MarketRegime {
                 prices
                     .entry(sale.item.clone())
                     .or_default()
-                    .entry(PriceSource::VerifiedSale(sale.platform))
+                    .entry(PriceSource::VerifiedSale(
+                        sale.platform,
+                        sale.float_value.and_then(FloatBucket::from_float),
+                    ))
                     .or_default()
                     .push((sale.sold_at, sale.price.0));
             }
@@ -397,6 +400,42 @@ mod tests {
         )
         .unwrap();
         assert_eq!(regime.at(now()).state.market.short_pct, Some(-10.0));
+    }
+
+    #[test]
+    fn a_shift_in_sale_float_mix_does_not_move_the_index() {
+        let mut sales = Vec::new();
+        for (days, low_count, high_count) in [(7, 3, 1), (1, 3, 1), (0, 1, 3)] {
+            for (float_value, price, count) in [(0.18, 200, low_count), (0.30, 100, high_count)] {
+                for i in 0..count {
+                    sales.push(Sale {
+                        id: format!("{days}-{float_value}-{i}"),
+                        platform: Platform::CsFloat,
+                        item: ItemId {
+                            wear_tier: WearTier::FieldTested,
+                            ..item("One")
+                        },
+                        price: Money(price),
+                        float_value: Some(float_value),
+                        sold_at: now() - Duration::days(days),
+                        verified: true,
+                    });
+                }
+            }
+        }
+        let regime = MarketRegime::new(
+            RegimeConfig {
+                min_index_items: 1,
+                ..RegimeConfig::default()
+            },
+            &[],
+            &sales,
+        )
+        .unwrap();
+        let state = regime.at(now()).state;
+        assert_eq!(state.market.short_pct, Some(0.0));
+        assert_eq!(state.market.long_pct, Some(0.0));
+        assert_eq!(state.status, RegimeStatus::RiskOn);
     }
 
     #[test]

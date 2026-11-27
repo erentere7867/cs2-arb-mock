@@ -265,12 +265,21 @@ fn write_reports(
 ) -> Result<()> {
     std::fs::create_dir_all(directory).map_err(|err| Error::Storage(err.to_string()))?;
     let json = directory.join("backtest.json");
+    let peg_json = directory.join("peg_dashboard.json");
     let markdown = directory.join("backtest.md");
     std::fs::write(&json, report.to_json()?).map_err(|err| Error::Storage(err.to_string()))?;
+    let peg_body = serde_json::to_string_pretty(peg_dashboard)
+        .map_err(|err| Error::Storage(err.to_string()))?;
+    std::fs::write(&peg_json, peg_body).map_err(|err| Error::Storage(err.to_string()))?;
     let mut full_md = report.to_markdown();
     full_md.push_str(&peg_dashboard.to_markdown());
     std::fs::write(&markdown, full_md).map_err(|err| Error::Storage(err.to_string()))?;
-    println!("Wrote {} and {}", json.display(), markdown.display());
+    println!(
+        "Wrote {}, {}, and {}",
+        json.display(),
+        peg_json.display(),
+        markdown.display()
+    );
     Ok(())
 }
 

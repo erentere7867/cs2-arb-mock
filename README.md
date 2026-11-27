@@ -44,7 +44,7 @@ cargo run --bin cs2-arb -- backtest --snapshots prices.json --sales sales.json \
 
 # Offline: replay the bundled Rust market scenario
 cargo run --bin cs2-arb -- --config config/rust.toml run-mock
-cargo run --bin cs2-arb -- --config config/rust.toml backtest --output-dir reports/rust
+cargo run --bin cs2-arb -- --config config/rust.toml backtest
 
 # Online: poll CS2 App ID 730 and persist events. Omit --once to poll until Ctrl-C.
 cargo run --bin cs2-arb -- watch --database data/events.db --once
@@ -64,7 +64,9 @@ The top-level `game` setting selects a single game per run. Omit it or use `game
 
 With `--live-market-data`, Rust defaults to Skinport (`app_id=252490`). To include DMarket (`gameId=rust`), pass `--platform skinport --platform dmarket` and set the DMarket credentials below. CSFloat is not available in the Rust profile. Skinport's aggregate history does not satisfy the verified-sale liquidity requirement, so live mock orders on Skinport are rejected even when both markets are enabled. Steam Community Market prices are not included: Steam Wallet credit is not interchangeable with cash-market USD proceeds.
 
-`watch` and its SQLite event queue remain CS2-only. Rust live reads do not consume CS2 events; a Rust historical replay can supply its own `--events` file if needed.
+`backtest` writes to `reports/` for CS2 and `reports/rust/` for Rust by default. Use `--output-dir` to override either.
+
+`watch` and its SQLite event queue remain CS2-only. Rust live reads do not consume CS2 events; a Rust historical replay can supply its own `--events` file if needed. Explicit panic-window records do not carry an app ID, so supply records for the selected game.
 
 `[rate_limits]` configures quotas and optional sharing between paths. Skinport also has a local 8-request/300-second cap and five-minute cache per endpoint (optional on-disk cache in `SkinportConfig`). A 429 suppresses further admissions for at least the full configured window or the server's longer retry hint. 5xx and network failures use exponential backoff with full jitter (1 s base, 300 s cap), and every attempt is gated. `[events]`, `[spread]`, `[dip]`, and `[risk]` configure polling and panic windows, the strategies, and risk limits.
 

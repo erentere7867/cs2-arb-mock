@@ -53,8 +53,9 @@ enum Command {
     Backtest {
         #[command(flatten)]
         history: HistoricalArgs,
-        #[arg(long, default_value = "reports")]
-        output_dir: PathBuf,
+        /// Report directory; defaults to reports for CS2 or reports/rust for Rust.
+        #[arg(long)]
+        output_dir: Option<PathBuf>,
     },
     /// Poll public CS2 branch metadata and persist events to SQLite.
     Watch {
@@ -173,7 +174,10 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Backtest {
             history,
             output_dir,
-        } => (historical(game, history)?, Some(output_dir)),
+        } => (
+            historical(game, history)?,
+            Some(backtest_output_dir(game, output_dir)),
+        ),
         Command::Watch { .. } => unreachable!("handled before loading market configuration"),
     };
     let kill_switch = KillSwitch::with_defaults();
@@ -319,6 +323,15 @@ fn read(path: &Path) -> Result<String> {
         .map_err(|err| Error::Storage(format!("{}: {err}", path.display())))
 }
 
+fn backtest_output_dir(game: Game, output_dir: Option<PathBuf>) -> PathBuf {
+    output_dir.unwrap_or_else(|| {
+        PathBuf::from(match game {
+            Game::Cs2 => "reports",
+            Game::Rust => "reports/rust",
+        })
+    })
+}
+
 fn write_reports(
     directory: &Path,
     report: &PerformanceReport,
@@ -354,6 +367,27 @@ mod tests {
             assert!(Cli::try_parse_from(["cs2-arb", command]).is_ok());
         }
         assert!(Cli::try_parse_from(["cs2-arb", "run-live"]).is_err());
+    }
+
+    #[test]
+    fn backtest_reports_default_to_separate_directories_and_allow_overrides() {
+        for (game, default) in [(Game::Cs2, "reports"), (Game::Rust, "reports/rust")] {
+            for override_dir in [None, Some("reports/custom")] {
+                let mut args = vec!["cs2-arb", "backtest"];
+                if let Some(path) = override_dir {
+                    args.extend(["--output-dir", path]);
+                }
+                let Command::Backtest { output_dir, .. } =
+                    Cli::try_parse_from(args).unwrap().command
+                else {
+                    panic!("expected backtest command");
+                };
+                assert_eq!(
+                    backtest_output_dir(game, output_dir),
+                    Path::new(override_dir.unwrap_or(default))
+                );
+            }
+        }
     }
 
     #[test]

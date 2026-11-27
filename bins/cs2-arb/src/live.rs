@@ -3,11 +3,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{TimeDelta, Utc};
-use cs2_arb_backtest::fixtures::parse_snapshots;
 use cs2_arb_backtest::{integrated::MarketDepth, Secrets};
 use cs2_arb_core::{
-    Error, FeeSchedules, ItemId, MarketClient, MarketEvent, Platform, PriceSnapshot, Result,
-    SystemClock, CS2_APP_ID,
+    Error, FeeSchedules, Game, ItemId, MarketClient, MarketEvent, Platform, PriceSnapshot, Result,
+    SystemClock,
 };
 use cs2_arb_events::EventQueue;
 use cs2_arb_markets::{
@@ -17,14 +16,34 @@ use cs2_arb_markets::{
 use cs2_arb_net::{NetConfig, TokioClock};
 use cs2_arb_sim::wear::quote_bucket;
 
-use crate::{watch, Inputs};
+use crate::{bundled_snapshots, watch, Inputs, Market};
 
 type MarketClients = Vec<(Platform, Box<dyn MarketClient>)>;
+
+pub fn select_platforms(game: Game, requested: Vec<Market>) -> Result<Vec<Platform>> {
+    let platforms = if requested.is_empty() {
+        match game {
+            Game::Cs2 => vec![Platform::Skinport, Platform::CsFloat],
+            Game::Rust => vec![Platform::Skinport],
+        }
+    } else {
+        requested.into_iter().map(Platform::from).collect()
+    };
+    for &platform in &platforms {
+        if !game.supports_market(platform) {
+            return Err(Error::InvalidConfig(format!(
+                "{platform:?} is not supported for {game:?}"
+            )));
+        }
+    }
+    Ok(platforms)
+}
 
 fn make_clients(
     source: &str,
     fees: &FeeSchedules,
     platforms: Vec<Platform>,
+    game: Game,
 ) -> Result<MarketClients> {
     let net = NetConfig::from_toml(source)?;
     let gate: Arc<dyn RequestGate> =
@@ -39,7 +58,10 @@ fn make_clients(
             Platform::Skinport => Box::new(ResilientMarket::new(
                 SkinportClient::with_config(
                     schedule,
-                    SkinportConfig::default(),
+                    SkinportConfig {
+                        game,
+                        ..SkinportConfig::default()
+                    },
                     gate.clone(),
                     clock.clone(),
                 )?,
@@ -69,7 +91,7 @@ fn make_clients(
                 Box::new(ResilientMarket::new(
                     DMarketClient::with_config(
                         schedule,
-                        DMarketConfig::default(),
+                        DMarketConfig::for_game(game),
                         credentials,
                         gate.clone(),
                         clock.clone(),
@@ -89,27 +111,32 @@ pub async fn collect(
     platforms: Vec<Platform>,
     samples: u16,
     interval_seconds: u64,
-    database: &str,
-    branch_update_window_hours: Option<i64>,
+    branch_updates: Option<(&str, Option<i64>)>,
+    game: Game,
 ) -> Result<Inputs> {
-    let assets = parse_snapshots(include_str!("../../../data/fixtures/price_snapshots.json"))?;
+    let assets = bundled_snapshots(game)?;
     let mut seen = HashSet::new();
     let items: Vec<ItemId> = assets
         .into_iter()
         .map(|quote| quote.item)
         .filter(|item| seen.insert(item.clone()))
         .collect();
-    let clients = make_clients(config, fees, platforms)?;
-    let queue = EventQueue::open(database).await?;
-    let mut events = watch::recover_branch_updates(&queue, branch_update_window_hours).await?;
-
-    // Restore already-consumed opens after a process restart. Later closes come through the queue.
-    for window in queue.open_windows_at(CS2_APP_ID, Utc::now()).await? {
-        events.push(MarketEvent::PanicWindowOpened {
-            branch: window.branch,
-            opened_at: window.opened_at,
-        });
-    }
+    let clients = make_clients(config, fees, platforms, game)?;
+    let mut events = Vec::new();
+    let queue = if let Some((database, hours)) = branch_updates {
+        let queue = EventQueue::open(database).await?;
+        events = watch::recover_branch_updates(&queue, hours).await?;
+        // Restore already-consumed opens after a process restart. Later closes come through the queue.
+        for window in queue.open_windows_at(game.app_id(), Utc::now()).await? {
+            events.push(MarketEvent::PanicWindowOpened {
+                branch: window.branch,
+                opened_at: window.opened_at,
+            });
+        }
+        Some(queue)
+    } else {
+        None
+    };
     let mut snapshots = Vec::new();
     let mut buy_orders = Vec::new();
     let mut depth = MarketDepth::default();
@@ -174,7 +201,9 @@ pub async fn collect(
             snapshots.extend(best.into_values());
             depth.replace_listings(at, platform, item, listings);
         }
-        watch::drain(&queue, &mut events).await?;
+        if let Some(queue) = &queue {
+            watch::drain(queue, &mut events).await?;
+        }
     }
     if snapshots.is_empty() {
         return Err(Error::InvalidData(

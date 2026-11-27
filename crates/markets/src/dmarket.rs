@@ -32,7 +32,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use cs2_arb_core::{
-    Error, FeeSchedule, ItemId, Listing, MarketClient, Platform, PriceSnapshot, Result, Sale,
+    Error, FeeSchedule, Game, ItemId, Listing, MarketClient, Platform, PriceSnapshot, Result, Sale,
+    WearTier,
 };
 use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue, ACCEPT};
@@ -41,7 +42,7 @@ use serde::Deserialize;
 use crate::clock::{Clock, SystemClock};
 use crate::convert::{
     cents_from_i64, cents_from_int_str, float_matches_tier, query_string, usd_decimal_str_to_cents,
-    usd_f64_to_cents, validate_item,
+    usd_f64_to_cents, validate_item_for_game,
 };
 use crate::gate::{Endpoint, NoopGate, RequestGate};
 use crate::http::{header_value, parse_json, HttpCore};
@@ -50,6 +51,7 @@ pub const DEFAULT_BASE_URL: &str = "https://api.dmarket.com";
 pub const PUBLIC_KEY_ENV: &str = "DMARKET_PUBLIC_KEY";
 pub const SECRET_KEY_ENV: &str = "DMARKET_SECRET_KEY";
 pub const CS2_GAME_ID: &str = "a8db";
+pub const RUST_GAME_ID: &str = "rust";
 pub const SIGNATURE_PREFIX: &str = "dmar ed25519 ";
 
 pub const OFFERS_ENDPOINT: Endpoint = Endpoint {
@@ -304,7 +306,11 @@ pub fn parse_offers(
         if offer.locked || offer.attributes.title != item.market_hash_name {
             continue;
         }
-        let float_value = parse_float(offer.attributes.cs2.as_ref().and_then(|c| c.float.as_ref()));
+        let float_value = if item.wear_tier == WearTier::NotApplicable {
+            None
+        } else {
+            parse_float(offer.attributes.cs2.as_ref().and_then(|c| c.float.as_ref()))
+        };
         if !float_matches_tier(item, float_value) {
             tracing::warn!(offer = %offer.offer_id, "dmarket offer float outside wear tier");
             continue;
@@ -375,11 +381,15 @@ fn convert_last_sales(
             serde_json::Value::Number(n) => usd_f64_to_cents(n.as_f64().unwrap_or(f64::NAN))?,
             _ => return Err(Error::InvalidData("dmarket sale price missing".into())),
         };
-        let float_value = parse_float(
-            sale.offer_attributes
-                .as_ref()
-                .and_then(|a| a.get("floatValue")),
-        );
+        let float_value = if item.wear_tier == WearTier::NotApplicable {
+            None
+        } else {
+            parse_float(
+                sale.offer_attributes
+                    .as_ref()
+                    .and_then(|a| a.get("floatValue")),
+            )
+        };
         if !float_matches_tier(item, float_value) {
             continue;
         }
@@ -420,13 +430,31 @@ pub struct DMarketConfig {
 
 impl Default for DMarketConfig {
     fn default() -> Self {
+        Self::for_game(Game::default())
+    }
+}
+
+impl DMarketConfig {
+    pub fn for_game(game: Game) -> Self {
         Self {
             base_url: DEFAULT_BASE_URL.into(),
-            game_id: CS2_GAME_ID.into(),
+            game_id: match game {
+                Game::Cs2 => CS2_GAME_ID,
+                Game::Rust => RUST_GAME_ID,
+            }
+            .into(),
             offers_limit: 100,
             sales_limit: 20,
             offer_type: None,
             request_timeout: Some(Duration::from_secs(30)),
+        }
+    }
+
+    fn game(&self) -> Game {
+        if self.game_id == RUST_GAME_ID {
+            Game::Rust
+        } else {
+            Game::Cs2
         }
     }
 }
@@ -518,7 +546,7 @@ impl DMarketClient {
 #[async_trait]
 impl MarketClient for DMarketClient {
     async fn list_listings(&self, item: &ItemId) -> Result<Vec<Listing>> {
-        validate_item(item)?;
+        validate_item_for_game(item, self.config.game())?;
         let limit = self.config.offers_limit.to_string();
         let mut pairs = vec![
             ("gameId", self.config.game_id.as_str()),
@@ -537,7 +565,7 @@ impl MarketClient for DMarketClient {
     }
 
     async fn recent_sales(&self, item: &ItemId, since: DateTime<Utc>) -> Result<Vec<Sale>> {
-        validate_item(item)?;
+        validate_item_for_game(item, self.config.game())?;
         let limit = self.config.sales_limit.to_string();
         let mut query = query_string(&[
             ("gameId", self.config.game_id.as_str()),

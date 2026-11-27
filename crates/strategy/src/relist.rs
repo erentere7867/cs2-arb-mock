@@ -542,9 +542,6 @@ impl RelistEngine {
                 continue;
             }
             let realized_net_pnl = net_proceeds.checked_sub(pos.cost_basis)?;
-            if realized_net_pnl.0 <= 0 {
-                continue;
-            }
             let (entry_schedule, entry_deposit, entry_fee) = self.items[&id].entry.map_or(
                 (Default::default(), Money(0), Money(0)),
                 |(deposit, fee)| (fees.get(pos.acquired_on), deposit, fee),
@@ -1164,7 +1161,26 @@ mod tests {
         let step = engine
             .step(&make_sales(20, 10_000, now), &snapshots, &fees(), now)
             .unwrap();
-        assert_eq!(step.unlocked, [position.id]);
+        assert_eq!(step.unlocked, [position.id.clone()]);
         assert_eq!(step.listed_orders[0].limit_price, Money(8000));
+
+        let sold_at = now + Duration::seconds(1);
+        let settled = engine
+            .step(
+                &make_sales(1, 8000, sold_at + Duration::hours(1)),
+                &[],
+                &fees(),
+                sold_at,
+            )
+            .unwrap();
+        let [sale] = settled.realized_sales.as_slice() else {
+            panic!("crossing print should settle the listed lot");
+        };
+        assert_eq!(sale.net_proceeds, Money(7840));
+        assert_eq!(sale.realized_net_pnl, Money(7840 - position.cost_basis.0));
+        assert!(matches!(
+            engine.get(&position.id).unwrap().status,
+            InventoryStatus::Sold { .. }
+        ));
     }
 }

@@ -5,8 +5,8 @@ use std::time::Duration;
 use chrono::{DateTime, TimeDelta, Utc};
 use cs2_arb_backtest::{integrated::MarketDepth, Secrets};
 use cs2_arb_core::{
-    BuyOrder, Error, FeeSchedules, Game, ItemId, Listing, MarketClient, MarketEvent, Platform,
-    PriceSnapshot, Result, SystemClock,
+    BuyOrder, EmptyListingPoll, Error, FeeSchedules, Game, ItemId, Listing, MarketClient,
+    MarketEvent, Platform, PriceSnapshot, Result, SystemClock,
 };
 use cs2_arb_events::queue::MarketHistory;
 use cs2_arb_events::EventQueue;
@@ -226,6 +226,7 @@ pub async fn collect(
     let mut snapshots = Vec::new();
     let mut regime_quotes = Vec::new();
     let mut bid_refreshes = Vec::new();
+    let mut empty_listing_polls = Vec::new();
     let mut depth = MarketDepth::default();
     let started_at = Utc::now();
     for sample in 0..samples {
@@ -298,6 +299,13 @@ pub async fn collect(
                         });
                 }
             }
+            if best.is_empty() {
+                empty_listing_polls.push(EmptyListingPoll {
+                    at,
+                    platform,
+                    item: item.clone(),
+                });
+            }
             for mut quote in best.into_values() {
                 regime_quotes.push(quote.clone());
                 quote.observed_at = at;
@@ -316,6 +324,7 @@ pub async fn collect(
             &regime_quotes,
             depth.sales(),
             &bid_refreshes,
+            &empty_listing_polls,
             retain_since,
         )
         .await?;

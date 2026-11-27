@@ -183,6 +183,14 @@ pub struct BuyOrderPoll {
     pub bids: Vec<BuyOrder>,
 }
 
+/// A successful read-only listing poll that left no quotable ask for an item.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EmptyListingPoll {
+    pub at: DateTime<Utc>,
+    pub platform: Platform,
+    pub item: ItemId,
+}
+
 /// Read-only API. There are intentionally no methods to place or execute real orders.
 #[async_trait]
 pub trait MarketClient: Send + Sync {

@@ -18,7 +18,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, TimeDelta, Utc};
-use cs2_arb_core::{BuyOrderPoll, Error, Game, MarketEvent, PriceSnapshot, Result, Sale};
+use cs2_arb_core::{
+    BuyOrderPoll, EmptyListingPoll, Error, Game, MarketEvent, PriceSnapshot, Result, Sale,
+};
 use serde::{Deserialize, Serialize};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteRow};
 use sqlx::{Row, SqliteConnection, SqlitePool};
@@ -272,6 +274,7 @@ pub struct MarketHistory {
     pub snapshots: Vec<PriceSnapshot>,
     pub sales: Vec<Sale>,
     pub bid_polls: Vec<BuyOrderPoll>,
+    pub empty_listing_polls: Vec<EmptyListingPoll>,
 }
 
 const QUEUE_COLUMNS: &str = "id, kind, payload, dedupe_key, status, attempts, enqueued_at, \
@@ -379,6 +382,7 @@ impl EventQueue {
         snapshots: &[PriceSnapshot],
         sales: &[Sale],
         bid_polls: &[BuyOrderPoll],
+        empty_listing_polls: &[EmptyListingPoll],
         retain_since: DateTime<Utc>,
     ) -> Result<()> {
         let app_id = i64::from(game.app_id());
@@ -419,6 +423,24 @@ impl EventQueue {
                 .await
                 .map_err(storage)?;
         }
+        for poll in empty_listing_polls
+            .iter()
+            .filter(|poll| poll.at >= retain_since)
+        {
+            sqlx::query("INSERT INTO market_empty_listing_polls (app_id, observed_at, payload) VALUES (?, ?, ?) ON CONFLICT DO NOTHING")
+                .bind(app_id)
+                .bind(to_millis(poll.at))
+                .bind(serde_json::to_string(poll).map_err(storage)?)
+                .execute(&mut *tx)
+                .await
+                .map_err(storage)?;
+        }
+        sqlx::query("DELETE FROM market_empty_listing_polls WHERE app_id = ? AND observed_at < ?")
+            .bind(app_id)
+            .bind(cutoff)
+            .execute(&mut *tx)
+            .await
+            .map_err(storage)?;
         sqlx::query("DELETE FROM market_bid_polls WHERE app_id = ? AND observed_at < ?")
             .bind(app_id)
             .bind(cutoff)
@@ -440,71 +462,109 @@ impl EventQueue {
         tx.commit().await.map_err(storage)
     }
 
+    /// Quotes and verified sales in `from..=through`, as the regime gate reads them.
     pub async fn load_market_history(
         &self,
         game: Game,
         from: DateTime<Utc>,
         through: DateTime<Utc>,
     ) -> Result<MarketHistory> {
+        self.read_market_history(game, from, through, false).await
+    }
+
+    /// Quotes, verified sales and the buy-book and empty-listing polls in
+    /// `from..=through`, read in one transaction so a concurrent batch commit
+    /// is either fully in or fully out.
+    pub async fn load_market_replay(
+        &self,
+        game: Game,
+        from: DateTime<Utc>,
+        through: DateTime<Utc>,
+    ) -> Result<MarketHistory> {
+        self.read_market_history(game, from, through, true).await
+    }
+
+    async fn read_market_history(
+        &self,
+        game: Game,
+        from: DateTime<Utc>,
+        through: DateTime<Utc>,
+        with_book_polls: bool,
+    ) -> Result<MarketHistory> {
         let app_id = i64::from(game.app_id());
-        let snapshots = sqlx::query_scalar::<_, String>(
+        let window = (to_millis(from), to_millis(through));
+        let mut tx = self.pool.begin().await.map_err(storage)?;
+        let mut snapshots: Vec<PriceSnapshot> = read_payloads(
+            &mut tx,
             "SELECT payload FROM market_snapshots WHERE app_id = ? AND observed_at BETWEEN ? AND ? ORDER BY observed_at, payload",
+            app_id,
+            window,
         )
-        .bind(app_id)
-        .bind(to_millis(from))
-        .bind(to_millis(through))
-        .fetch_all(&self.pool)
-        .await
-        .map_err(storage)?;
-        let sales = sqlx::query_scalar::<_, String>(
+        .await?;
+        let mut sales: Vec<Sale> = read_payloads(
+            &mut tx,
             "SELECT payload FROM market_sales WHERE app_id = ? AND sold_at BETWEEN ? AND ? ORDER BY sold_at, platform, sale_id",
+            app_id,
+            window,
         )
-        .bind(app_id)
-        .bind(to_millis(from))
-        .bind(to_millis(through))
-        .fetch_all(&self.pool)
-        .await
-        .map_err(storage)?;
-        let mut snapshots: Vec<PriceSnapshot> = snapshots
-            .iter()
-            .map(|payload| serde_json::from_str(payload).map_err(storage))
-            .collect::<Result<_>>()?;
-        let mut sales: Vec<Sale> = sales
-            .iter()
-            .map(|payload| serde_json::from_str(payload).map_err(storage))
-            .collect::<Result<_>>()?;
-        let has_bid_polls = sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'market_bid_polls'",
-        )
-        .fetch_one(&self.pool)
-        .await
-        .map_err(storage)?
-            > 0;
-        let bid_polls = if has_bid_polls {
-            sqlx::query_scalar::<_, String>(
-                "SELECT payload FROM market_bid_polls WHERE app_id = ? AND observed_at BETWEEN ? AND ? ORDER BY observed_at, payload",
+        .await?;
+        let has_book_polls = with_book_polls
+            && sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'market_bid_polls'",
             )
-            .bind(app_id)
-            .bind(to_millis(from))
-            .bind(to_millis(through))
-            .fetch_all(&self.pool)
+            .fetch_one(&mut *tx)
             .await
             .map_err(storage)?
-        } else {
-            Vec::new()
-        };
-        let mut bid_polls: Vec<BuyOrderPoll> = bid_polls
-            .iter()
-            .map(|payload| serde_json::from_str(payload).map_err(storage))
-            .collect::<Result<_>>()?;
+                > 0;
+        let (mut bid_polls, mut empty_listing_polls): (Vec<BuyOrderPoll>, Vec<EmptyListingPoll>) =
+            if has_book_polls {
+                (
+                    read_payloads(
+                        &mut tx,
+                        "SELECT payload FROM market_bid_polls WHERE app_id = ? AND observed_at BETWEEN ? AND ? ORDER BY observed_at, payload",
+                        app_id,
+                        window,
+                    )
+                    .await?,
+                    read_payloads(
+                        &mut tx,
+                        "SELECT payload FROM market_empty_listing_polls WHERE app_id = ? AND observed_at BETWEEN ? AND ? ORDER BY observed_at, payload",
+                        app_id,
+                        window,
+                    )
+                    .await?,
+                )
+            } else {
+                (Vec::new(), Vec::new())
+            };
+        tx.commit().await.map_err(storage)?;
         snapshots.retain(|quote| (from..=through).contains(&quote.observed_at));
         sales.retain(|sale| (from..=through).contains(&sale.sold_at));
         bid_polls.retain(|poll| (from..=through).contains(&poll.at));
+        empty_listing_polls.retain(|poll| (from..=through).contains(&poll.at));
         Ok(MarketHistory {
             snapshots,
             sales,
             bid_polls,
+            empty_listing_polls,
         })
+    }
+
+    /// Every acknowledged CS2 market event, oldest first.
+    pub async fn acknowledged_events(&self) -> Result<Vec<MarketEvent>> {
+        let rows = sqlx::query_scalar::<_, String>(
+            "SELECT payload FROM event_queue WHERE status = 'acked' ORDER BY id",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(storage)?;
+        Ok(rows
+            .iter()
+            .filter_map(|payload| serde_json::from_str(payload).ok())
+            .filter(|event| {
+                !matches!(event, MarketEvent::BranchUpdated { app_id, .. } if *app_id != cs2_arb_core::CS2_APP_ID)
+            })
+            .collect())
     }
 
     // ----------------------------------------------------------------- queue
@@ -1269,4 +1329,22 @@ fn transition_from_row(row: &SqliteRow) -> Result<StrategyTransition> {
         event_id: row.try_get("event_id").map_err(storage)?,
         occurred_at: from_millis(row.try_get("occurred_at").map_err(storage)?)?,
     })
+}
+
+async fn read_payloads<T: serde::de::DeserializeOwned>(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    sql: &str,
+    app_id: i64,
+    (from, through): (i64, i64),
+) -> Result<Vec<T>> {
+    sqlx::query_scalar::<_, String>(sql)
+        .bind(app_id)
+        .bind(from)
+        .bind(through)
+        .fetch_all(&mut **tx)
+        .await
+        .map_err(storage)?
+        .iter()
+        .map(|payload| serde_json::from_str(payload).map_err(storage))
+        .collect()
 }

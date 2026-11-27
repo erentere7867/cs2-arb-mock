@@ -511,9 +511,13 @@ async fn recorded(
         ));
     }
     let queue = EventQueue::open_read_only(path).await?;
-    let loaded = queue.load_market_history(game, from, through).await;
+    // Everything up to `through` feeds the regime gate and the dip baseline;
+    // only `from..=through` is replayed.
+    let loaded = queue
+        .load_market_replay(game, DateTime::UNIX_EPOCH, through)
+        .await;
     let recorded_events = match (&args.events, game) {
-        (None, Game::Cs2) => Some(queue.acknowledged_branch_updates_since(from).await),
+        (None, Game::Cs2) => Some(queue.acknowledged_events().await),
         _ => None,
     };
     queue.close().await;
@@ -523,8 +527,11 @@ async fn recorded(
         (None, Some(events)) => events?
             .into_iter()
             .filter(|event| match event {
-                MarketEvent::BranchUpdated { observed_at, .. } => *observed_at <= through,
-                _ => true,
+                MarketEvent::BranchUpdated { observed_at, .. } => {
+                    (from..=through).contains(observed_at)
+                }
+                MarketEvent::PanicWindowOpened { opened_at, .. } => *opened_at <= through,
+                MarketEvent::PanicWindowClosed { closed_at, .. } => *closed_at <= through,
             })
             .collect(),
         (None, None) => Vec::new(),
@@ -538,7 +545,10 @@ async fn recorded(
         .retain(|sale| sale.verified && markets.contains(&sale.platform));
     history
         .bid_polls
-        .retain(|poll| markets.contains(&poll.platform));
+        .retain(|poll| poll.at >= from && markets.contains(&poll.platform));
+    history
+        .empty_listing_polls
+        .retain(|poll| poll.at >= from && markets.contains(&poll.platform));
     for quote in &history.snapshots {
         validate_history_item(
             game,
@@ -553,15 +563,24 @@ async fn recorded(
     for poll in &history.bid_polls {
         validate_history_item(game, poll.platform, &poll.item, false)?;
     }
-    if history.snapshots.is_empty() {
+    let snapshots: Vec<PriceSnapshot> = history
+        .snapshots
+        .iter()
+        .filter(|quote| quote.observed_at >= from)
+        .cloned()
+        .collect();
+    if snapshots.is_empty() {
         return Err(Error::InvalidData(format!(
             "{path} has no recorded {game:?} quotes for the selected markets in the window"
         )));
     }
-    let mut depth = MarketDepth::from_snapshots(&history.snapshots);
+    let mut depth = MarketDepth::from_snapshots(&snapshots);
+    for poll in &history.empty_listing_polls {
+        depth.replace_listings(poll.at, poll.platform, poll.item.clone(), Vec::new());
+    }
     depth.add_sales(history.sales.iter().cloned());
     let inputs = Inputs {
-        snapshots: history.snapshots.clone(),
+        snapshots,
         events,
         depth,
         buy_orders: Vec::new(),
@@ -1018,6 +1037,7 @@ mod tests {
                         }],
                         &[],
                         &[],
+                        &[],
                         at - TimeDelta::days(10),
                     )
                     .await
@@ -1226,6 +1246,11 @@ amount = 100
                 &quotes,
                 &sales,
                 &polls,
+                &[cs2_arb_core::EmptyListingPoll {
+                    at: now - TimeDelta::minutes(30),
+                    platform: Platform::Waxpeer,
+                    item: item.clone(),
+                }],
                 now - TimeDelta::days(10),
             )
             .await
@@ -1256,7 +1281,7 @@ amount = 100
         assert!(markdown.contains("· 6 snapshots ·"), "{markdown}");
         let queue = EventQueue::open(db).await.unwrap();
         let stored = queue
-            .load_market_history(Game::Cs2, now - TimeDelta::days(1), now)
+            .load_market_replay(Game::Cs2, now - TimeDelta::days(1), now)
             .await
             .unwrap();
         queue.close().await;

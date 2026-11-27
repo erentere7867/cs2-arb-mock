@@ -117,8 +117,8 @@ min_sales_for_ask_fill = 15
 min_listing_age_secs = 3600
 require_verified_sales = true
 
-# Days of live quotes, verified sales and buy-book polls kept in events.db for
-# the regime gate and `backtest --history-db`; 30 covers a 7-day hold plus the
-# 21-day dip max hold.
+# Days of live quotes, verified sales and book polls kept in events.db for the
+# regime gate and `backtest --history-db`; 40 covers the dip's 30-day lookback
+# plus its 7-day liquidity window.
 [market_history]
-retention_days = 30
+retention_days = 40

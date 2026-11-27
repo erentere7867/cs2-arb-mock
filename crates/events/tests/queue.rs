@@ -7,8 +7,8 @@ use std::time::Duration;
 use chrono::TimeDelta;
 use common::{open, snapshot, t0};
 use cs2_arb_core::{
-    BuyOrder, BuyOrderPoll, Error, FloatBucket, Game, ItemId, MarketEvent, Money, Platform,
-    PriceSnapshot, Sale, WearTier,
+    BuyOrder, BuyOrderPoll, EmptyListingPoll, Error, FloatBucket, Game, ItemId, MarketEvent, Money,
+    Platform, PriceSnapshot, Sale, WearTier,
 };
 use cs2_arb_events::{
     Clock, EnqueueOptions, EventQueue, EventStatus, ManualClock, NackOutcome, NewTransition,
@@ -143,6 +143,11 @@ async fn market_history_survives_reopen_and_prunes_by_game() {
         bids: Vec::new(),
         ..poll.clone()
     };
+    let empty = EmptyListingPoll {
+        at: old_quote.observed_at,
+        platform: quote.platform,
+        item: quote.item.clone(),
+    };
     let start = now - TimeDelta::days(12);
     let queue = EventQueue::open(path.to_str().unwrap()).await.unwrap();
     for _ in 0..2 {
@@ -157,6 +162,7 @@ async fn market_history_survives_reopen_and_prunes_by_game() {
                     unverified.clone(),
                 ],
                 &[poll.clone(), old_poll.clone()],
+                std::slice::from_ref(&empty),
                 start,
             )
             .await
@@ -167,6 +173,7 @@ async fn market_history_survives_reopen_and_prunes_by_game() {
             Game::Rust,
             std::slice::from_ref(&rust_quote),
             std::slice::from_ref(&rust_sale),
+            &[],
             &[],
             start,
         )
@@ -179,6 +186,12 @@ async fn market_history_survives_reopen_and_prunes_by_game() {
         .load_market_history(Game::Cs2, start, now)
         .await
         .unwrap();
+    assert!(history.bid_polls.is_empty() && history.empty_listing_polls.is_empty());
+    let history = queue
+        .load_market_replay(Game::Cs2, start, now)
+        .await
+        .unwrap();
+    assert_eq!(history.empty_listing_polls, vec![empty]);
     assert_eq!(history.snapshots, vec![old_quote, quote.clone()]);
     assert_eq!(
         history.sales,
@@ -192,11 +205,11 @@ async fn market_history_survives_reopen_and_prunes_by_game() {
         .unwrap();
     assert!(history.snapshots.is_empty() && history.sales.is_empty());
     queue
-        .record_market_history(Game::Cs2, &[], &[], &[], now - TimeDelta::days(10))
+        .record_market_history(Game::Cs2, &[], &[], &[], &[], now - TimeDelta::days(10))
         .await
         .unwrap();
     let history = queue
-        .load_market_history(Game::Cs2, start, now)
+        .load_market_replay(Game::Cs2, start, now)
         .await
         .unwrap();
     assert_eq!(history.snapshots, vec![quote]);
@@ -208,7 +221,7 @@ async fn market_history_survives_reopen_and_prunes_by_game() {
         .await
         .unwrap();
     let history = reader
-        .load_market_history(Game::Cs2, start, now)
+        .load_market_replay(Game::Cs2, start, now)
         .await
         .unwrap();
     assert_eq!(history.bid_polls, vec![poll]);

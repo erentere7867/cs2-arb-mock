@@ -1,5 +1,6 @@
 game = "rust"
-markets = ["skinport", "waxpeer"]
+markets = ["skinport", "waxpeer", "dmarket"]
+dmarket_if_configured = true
 
 [relist]
 cross_venue = true

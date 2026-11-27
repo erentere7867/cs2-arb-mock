@@ -6,7 +6,7 @@ prerequisites and GitHub access. From that checkout, install or refresh the VPS 
 
 ```sh
 umask 077
-test -f .env || install -m 600 /dev/null .env
+test -f .env || install -m 600 .env.example .env
 chmod 600 .env
 sudo install -m 644 deploy/*.service /etc/systemd/system/
 sudo install -m 755 deploy/cs2-arb-run deploy/cs2-arb-update /usr/local/bin/
@@ -20,12 +20,21 @@ also accepts another branch on `origin`. It refuses a dirty checkout and builds
 the exact remote commit before switching the runtime release and restarting.
 The deployed branch and commit are in `/home/ubuntu/cs2-arb-mock-data/current/revision`.
 
-Add `CSFLOAT_API_KEY` to `/home/ubuntu/cs2-arb-mock/.env` when available (systemd
-`KEY=value` syntax, no `export`), then run
-`sudo systemctl restart cs2-arb-mock@cs2`. The CS2 and Rust jobs use their
-branch's default live venues.
-Skinport reads are public; DMarket's existing offers adapter requires both
-credentials and opt-in, so these jobs do not use it by default.
+See [`.env.example`](../.env.example) for the credential names. If `.env`
+already exists, edit `/home/ubuntu/cs2-arb-mock/.env` in place rather than
+replacing it. Use systemd `KEY=value` syntax, without `export`.
+
+Skinport and Waxpeer reads are public and need no keys. CSFloat makes
+unauthenticated requests without `CSFLOAT_API_KEY`; those requests can be rate limited.
+DMarket has no public fallback. Both jobs automatically add DMarket's signed,
+read-only requests when `DMARKET_PUBLIC_KEY` and `DMARKET_SECRET_KEY` form a
+valid key pair. If either key is blank, missing, or invalid, the jobs skip
+DMarket and continue with the other venues. Once the keys are in `.env`,
+restart the jobs; no config edit is needed:
+
+```sh
+sudo systemctl restart cs2-arb-mock@cs2 cs2-arb-mock@rust
+```
 
 To block new simulated orders in both jobs, create
 `/home/ubuntu/cs2-arb-mock-data/KILL_SWITCH` (not a file in the checkout).

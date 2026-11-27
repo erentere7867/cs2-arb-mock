@@ -4,7 +4,9 @@ use std::process::ExitCode;
 use chrono::TimeDelta;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use cs2_arb_backtest::integrated::{DipAdapter, MarketDepth, SimFillModel, SpreadAdapter};
-use cs2_arb_backtest::{fixtures, BacktestConfig, Backtester, PerformanceReport, StrategyAdapter};
+use cs2_arb_backtest::{
+    fixtures, BacktestConfig, Backtester, PerformanceReport, Secrets, StrategyAdapter,
+};
 use cs2_arb_core::{
     BuyOrder, Error, FeeSchedules, Game, ItemId, MarketEvent, Platform, PriceSnapshot, Result,
     SimulationMode,
@@ -113,6 +115,7 @@ struct Settings {
     venue_accounts: Option<VenueAccountsConfig>,
     platform_audit: bool,
     simulation: SimulationSettings,
+    dmarket_if_configured: bool,
     spread: SpreadConfig,
     dip: DipConfig,
     risk: RiskLimits,
@@ -196,6 +199,23 @@ impl Settings {
         }
         Ok(markets)
     }
+
+    fn live_platforms(&self, requested: Vec<Market>, secrets: &Secrets) -> Result<Vec<Platform>> {
+        let auto_dmarket = self.dmarket_if_configured && requested.is_empty();
+        let allowlist = self.market_allowlist()?;
+        let mut platforms =
+            live::select_platforms(self.game, requested, allowlist, self.markets.is_some())?;
+        if auto_dmarket {
+            platforms.retain(|&platform| platform != Platform::DMarket);
+            if allowlist.contains(&Platform::DMarket) && secrets.require_dmarket().is_ok() {
+                match live::dmarket_credentials(secrets) {
+                    Ok(_) => platforms.push(Platform::DMarket),
+                    Err(_) => tracing::warn!("invalid DMarket credential pair; skipping DMarket"),
+                }
+            }
+        }
+        Ok(platforms)
+    }
 }
 
 #[tokio::main]
@@ -268,8 +288,7 @@ async fn run(cli: Cli) -> Result<()> {
         } => {
             let inputs = if live_market_data {
                 live_data = true;
-                audited_markets =
-                    live::select_platforms(game, platform, markets, settings.markets.is_some())?;
+                audited_markets = settings.live_platforms(platform, &Secrets::from_env())?;
                 live::collect(
                     &config,
                     &fees,
@@ -520,6 +539,10 @@ fn write_reports(
 
 #[cfg(test)]
 mod tests {
+    use cs2_arb_backtest::ops::secrets::vars::{DMARKET_PUBLIC_KEY, DMARKET_SECRET_KEY};
+
+    use super::*;
+
     #[test]
     fn live_sales_lookback_covers_configured_simulation_window() {
         let settings: Settings =
@@ -531,7 +554,18 @@ mod tests {
         assert_eq!(settings.live_sales_lookback_days(), 30);
         assert_eq!(Settings::default().live_sales_lookback_days(), 7);
     }
-    use super::*;
+    const EXAMPLE_DMARKET_PUBLIC: &str =
+        "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a";
+    const EXAMPLE_DMARKET_SEED: &str =
+        "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60";
+
+    fn dmarket_secrets(public: Option<&str>, secret: Option<&str>) -> Secrets {
+        Secrets::from_lookup(|name| match name {
+            DMARKET_PUBLIC_KEY => public.map(str::to_owned),
+            DMARKET_SECRET_KEY => secret.map(str::to_owned),
+            _ => None,
+        })
+    }
 
     #[test]
     fn cli_exposes_only_mock_and_read_only_commands() {
@@ -699,6 +733,84 @@ mod tests {
             false
         )
         .is_err());
+    }
+
+    #[test]
+    fn shipped_profiles_add_dmarket_to_default_live_reads_only_with_both_keys() {
+        for (config, other_venue) in [
+            (
+                include_str!("../../../config/default.toml"),
+                Platform::CsFloat,
+            ),
+            (include_str!("../../../config/rust.toml"), Platform::Waxpeer),
+        ] {
+            let settings: Settings = toml::from_str(config).unwrap();
+            let public = Some(EXAMPLE_DMARKET_PUBLIC);
+            let secret = Some(EXAMPLE_DMARKET_SEED);
+            for (credentials, enable) in [
+                (dmarket_secrets(None, None), false),
+                (dmarket_secrets(public, None), false),
+                (dmarket_secrets(None, secret), false),
+                (dmarket_secrets(public, Some(" ")), false),
+                (dmarket_secrets(public, secret), true),
+            ] {
+                let mut expected = vec![Platform::Skinport, other_venue];
+                if enable {
+                    expected.push(Platform::DMarket);
+                }
+                assert_eq!(
+                    settings.live_platforms(vec![], &credentials).unwrap(),
+                    expected
+                );
+                assert_eq!(
+                    settings
+                        .live_platforms(vec![Market::Skinport], &credentials)
+                        .unwrap(),
+                    [Platform::Skinport]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_or_mismatched_dmarket_keys_do_not_break_default_live_reads() {
+        for (config, public_platforms) in [
+            (
+                include_str!("../../../config/default.toml"),
+                [Platform::Skinport, Platform::CsFloat],
+            ),
+            (
+                include_str!("../../../config/rust.toml"),
+                [Platform::Skinport, Platform::Waxpeer],
+            ),
+        ] {
+            let settings: Settings = toml::from_str(config).unwrap();
+            let mismatched_seed = "00".repeat(32);
+            for seed in ["not-hex", mismatched_seed.as_str()] {
+                let secrets = dmarket_secrets(Some(EXAMPLE_DMARKET_PUBLIC), Some(seed));
+                assert!(live::dmarket_credentials(&secrets).is_err());
+                assert_eq!(
+                    settings.live_platforms(vec![], &secrets).unwrap(),
+                    public_platforms
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn automatic_dmarket_selection_respects_an_explicit_allowlist() {
+        let settings: Settings =
+            toml::from_str("game = 'rust'\nmarkets = ['waxpeer']\ndmarket_if_configured = true")
+                .unwrap();
+        let secrets = dmarket_secrets(Some(EXAMPLE_DMARKET_PUBLIC), Some(EXAMPLE_DMARKET_SEED));
+        assert!(live::dmarket_credentials(&secrets).is_ok());
+        assert_eq!(
+            settings.live_platforms(vec![], &secrets).unwrap(),
+            [Platform::Waxpeer]
+        );
+        assert!(settings
+            .live_platforms(vec![Market::Dmarket], &secrets)
+            .is_err());
     }
 
     #[test]

@@ -608,7 +608,7 @@ mod tests {
     use cs2_arb_core::{Money, WearTier};
     use cs2_arb_events::EventQueue;
     use serde_json::json;
-    use wiremock::matchers::{method, path, query_param};
+    use wiremock::matchers::{method, path, path_regex, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::*;
@@ -734,6 +734,99 @@ mod tests {
         let markdown = String::from_utf8(report).unwrap();
         assert!(markdown.contains("· 2 snapshots ·"));
         assert!(markdown.contains("| Regime History Quotes | 1 |"));
+    }
+
+    #[tokio::test]
+    async fn verified_sale_history_seeds_both_regime_anchors_on_the_first_batch() {
+        let server = MockServer::start().await;
+        for endpoint in ["/api/v1/listings", "/api/v1/buy-orders"] {
+            Mock::given(method("GET"))
+                .and(path(endpoint))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+                .expect(4)
+                .mount(&server)
+                .await;
+        }
+        let now = Utc::now() - TimeDelta::hours(1);
+        let mut sales = Vec::new();
+        for (item, float_value) in [
+            ("AK-47 | Redline (Field-Tested)", 0.18),
+            ("M4A1-S | Decimator (Minimal Wear)", 0.10),
+            ("USP-S | Cortex (Factory New)", 0.03),
+        ] {
+            for days in [0, 1, 7] {
+                sales.push(json!({
+                    "id": format!("{item}-{days}"),
+                    "price": 2500,
+                    "item": {"market_hash_name": item, "float_value": float_value},
+                    "sold_at": now - TimeDelta::days(days),
+                }));
+            }
+        }
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/api/v1/history/[^/]+/sales$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(sales))
+            .expect(4)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/prices/snapshot"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "success": true,
+                "items": [{
+                    "name": "AK-47 | Redline (Field-Tested)",
+                    "item_id": "ask-1",
+                    "price": 25000,
+                }],
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/buy-orders/snapshot"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "success": true,
+                "offers": [],
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut config = tempfile::NamedTempFile::new().unwrap();
+        let config_body = include_str!("../../../config/default.toml")
+            .replace("max_requests = 1\n", "max_requests = 50\n");
+        config.write_all(config_body.as_bytes()).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("events.db");
+        let cli = Cli::try_parse_from([
+            "cs2-arb",
+            "--config",
+            config.path().to_str().unwrap(),
+            "run-mock",
+            "--live-market-data",
+            "--platform",
+            "csfloat",
+            "--platform",
+            "waxpeer",
+            "--database",
+            db.to_str().unwrap(),
+        ])
+        .unwrap();
+        let sources = live::MarketSources {
+            secrets: &Secrets::default(),
+            base_url_override: Some(&server.uri()),
+        };
+        let mut report = Vec::new();
+        run(cli, &sources, &mut report).await.unwrap();
+        let markdown = String::from_utf8(report).unwrap();
+        assert!(markdown.contains("| Regime History Quotes | 1 |"));
+        assert!(markdown.contains("| Regime History Verified Sales | 9 |"));
+        assert!(
+            markdown.contains("| Market Regime | Risk-on |"),
+            "{markdown}"
+        );
+        assert!(markdown.contains("| Broad Index 24h | +0.00% |"));
+        assert!(markdown.contains("| Broad Index 7d | +0.00% |"));
     }
 
     #[tokio::test]

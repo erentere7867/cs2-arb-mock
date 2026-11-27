@@ -1,9 +1,10 @@
 mod common;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use common::*;
-use cs2_arb_core::{Game, ItemId, MarketClient, Money, Platform, WearTier};
+use cs2_arb_core::{Error, Game, ItemId, MarketClient, Money, Platform, WearTier};
 use cs2_arb_markets::dmarket::{string_to_sign, DMarketClient, DMarketConfig, DMarketCredentials};
 use cs2_arb_markets::NoopGate;
 use ed25519_dalek::{Signature, SigningKey, Verifier};
@@ -159,6 +160,32 @@ fn offer(
         "discountPercent": 0,
         "offerType": "dmarket"
     })
+}
+
+#[tokio::test(start_paused = true)]
+async fn exhausted_quota_stops_reads_until_dmarket_reset() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/marketplace-api/v2/offers"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("RateLimit-Remaining", "0")
+                .insert_header("RateLimit-Reset", "1")
+                .set_body_json(json!({"items": []})),
+        )
+        .expect(2)
+        .mount(&server)
+        .await;
+    let dm = client(&server);
+    assert!(dm.list_listings(&redline()).await.unwrap().is_empty());
+    assert!(matches!(
+        dm.recent_sales(&redline(), t0()).await,
+        Err(Error::RateLimited { retry_after }) if retry_after == Duration::from_secs(1)
+    ));
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    tokio::time::advance(Duration::from_secs(1)).await;
+    assert!(dm.list_listings(&redline()).await.unwrap().is_empty());
+    assert_eq!(server.received_requests().await.unwrap().len(), 2);
 }
 
 #[tokio::test]

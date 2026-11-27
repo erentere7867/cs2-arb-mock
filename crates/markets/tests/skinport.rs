@@ -362,19 +362,19 @@ async fn server_429_penalizes_endpoint_and_reports_to_gate() {
     .unwrap();
     let err = sp.items().await.unwrap_err();
     assert!(
-        matches!(err, Error::RateLimited { retry_after } if retry_after == Duration::from_secs(120))
+        matches!(err, Error::RateLimited { retry_after } if retry_after == Duration::from_secs(300))
     );
     assert_eq!(
         gate.responses.lock().unwrap().as_slice(),
-        &[("skinport.items", 429, Some(Duration::from_secs(120)))]
+        &[("skinport.items", 429, Some(Duration::from_secs(300)))]
     );
     // Local limiter now blocks the endpoint for the server's window without a request.
     let err = sp.items().await.unwrap_err();
     assert!(
-        matches!(err, Error::RateLimited { retry_after } if retry_after == Duration::from_secs(120))
+        matches!(err, Error::RateLimited { retry_after } if retry_after == Duration::from_secs(300))
     );
     assert_eq!(hits(&server, "/v1/items").await, 1);
-    tokio::time::advance(Duration::from_secs(120)).await;
+    tokio::time::advance(Duration::from_secs(300)).await;
     sp.items().await.unwrap();
     assert_eq!(hits(&server, "/v1/items").await, 2);
     assert_eq!(gate.acquired.lock().unwrap().len(), 2);

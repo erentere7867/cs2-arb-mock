@@ -26,9 +26,8 @@ pub trait RequestGate: Send + Sync {
     /// Wait for (or refuse, with `Error::RateLimited`) permission to send one request.
     async fn acquire(&self, endpoint: &Endpoint) -> Result<()>;
 
-    /// Report the HTTP status of a completed request and any server-provided retry delay
-    /// (`Retry-After`, or `X-RateLimit-Reset` converted to a delay). Called for every
-    /// response that produced a status, including 429 and 5xx.
+    /// Report the HTTP status of a completed request and any retry delay. On 429 this
+    /// includes the HTTP client's fallback if the server sent no usable hint.
     fn on_response(&self, endpoint: &Endpoint, status: u16, retry_after: Option<Duration>);
 }
 

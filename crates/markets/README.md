@@ -3,8 +3,9 @@
 Read-only `MarketClient` implementations for Skinport, CSFloat, DMarket and Waxpeer. Every request
 is a `GET`; no order/trade code exists. Fees come from the `FeeSchedule` passed in.
 
-- `gate::RequestGate` and `NetGate` connect each read attempt to `cs2-arb-net`'s
-  limiter and 429 cooldown. `ResilientMarket` retries transient reads with backoff.
+- The shared HTTP client stops reads across routes during a host cooldown, even without
+  a `RequestGate`. `NetGate` applies configured quotas and endpoint penalties.
+  `ResilientMarket` retries transient network failures, not 429s.
 - Skinport: `/v1/items`, `/v1/sales/history`, `Accept-Encoding: br`, whole-catalogue
   fetches, per-endpoint 8 req / 5 min local limiter, TTL cache (memory + optional disk
   JSON), stale fallback when rate limited.

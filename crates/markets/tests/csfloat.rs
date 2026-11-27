@@ -157,7 +157,7 @@ fn anonymous_sale_identity_survives_a_newer_row() {
     assert_ne!(after[0].id, after[1].id);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn maps_429_with_ratelimit_reset_and_http_errors() {
     let server = MockServer::start().await;
     let reset = (t0().timestamp() + 45).to_string();
@@ -179,6 +179,7 @@ async fn maps_429_with_ratelimit_reset_and_http_errors() {
         market_hash_name: "x".into(),
         wear_tier: cs2_arb_core::WearTier::FactoryNew,
     };
+    tokio::time::advance(Duration::from_secs(45)).await;
     assert!(
         matches!(cf.recent_sales(&item, t0()).await, Err(Error::Network(m)) if m.contains("500"))
     );
@@ -189,6 +190,79 @@ async fn maps_429_with_ratelimit_reset_and_http_errors() {
             ("csfloat.sales_history", 500, None)
         ]
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn retry_after_silences_all_csfloat_routes_until_expiry() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/listings"))
+        .respond_with(
+            ResponseTemplate::new(429)
+                .insert_header("Retry-After", "60")
+                .set_body_string("retry after 90s"),
+        )
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/buy-orders"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": []})))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let cf = client(&server, None, Arc::new(NoopGate));
+    assert!(matches!(
+        cf.list_listings(&redline()).await,
+        Err(Error::RateLimited { retry_after }) if retry_after == Duration::from_secs(60)
+    ));
+    for (advance, elapsed) in [(0, 0), (1, 1), (58, 59)] {
+        tokio::time::advance(Duration::from_secs(advance)).await;
+        assert!(matches!(
+            cf.list_listings(&redline()).await,
+            Err(Error::RateLimited { retry_after }) if retry_after == Duration::from_secs(60 - elapsed)
+        ));
+        assert!(matches!(
+            cf.top_buy_orders(&redline()).await,
+            Err(Error::RateLimited { .. })
+        ));
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+    tokio::time::advance(Duration::from_secs(1)).await;
+    assert!(cf.top_buy_orders(&redline()).await.unwrap().is_empty());
+    assert_eq!(server.received_requests().await.unwrap().len(), 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn missing_retry_after_uses_body_then_default() {
+    for (body, secs) in [
+        (r#"{"message":"Too many requests, retry after 75s"}"#, 75),
+        ("no hint", 60),
+    ] {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/listings"))
+            .respond_with(ResponseTemplate::new(429).set_body_string(body))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let gate = Arc::new(RecordingGate::default());
+        let cf = client(&server, None, gate.clone());
+        let delay = Duration::from_secs(secs);
+        assert!(matches!(
+            cf.list_listings(&redline()).await,
+            Err(Error::RateLimited { retry_after }) if retry_after == delay
+        ));
+        assert_eq!(
+            gate.responses.lock().unwrap().as_slice(),
+            &[("csfloat.listings", 429, Some(delay))]
+        );
+        assert!(matches!(
+            cf.list_listings(&redline()).await,
+            Err(Error::RateLimited { .. })
+        ));
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
 }
 
 #[tokio::test]

@@ -135,7 +135,7 @@ fn build_limiter(net: &NetConfig, platforms: &[Platform]) -> Result<RateLimiter>
         limiter.register(
             Platform::Waxpeer,
             DEFAULT_ENDPOINT,
-            RateLimit::new(2, std::time::Duration::from_secs(10))?,
+            RateLimit::new(1, Duration::from_secs(6))?,
         )?;
     }
     Ok(limiter)
@@ -186,6 +186,7 @@ pub async fn collect(
             for item in &items {
                 let listings = match client.list_listings(item).await {
                     Ok(listings) => listings,
+                    Err(Error::RateLimited { .. }) => continue,
                     Err(error) => {
                         tracing::warn!(?platform, %error, "read-only listing request skipped");
                         continue;
@@ -193,6 +194,7 @@ pub async fn collect(
                 };
                 match client.recent_sales(item, since).await {
                     Ok(sales) => depth.add_sales(sales),
+                    Err(Error::RateLimited { .. }) => {}
                     Err(error) => {
                         tracing::warn!(?platform, %error, "read-only sales request skipped")
                     }
@@ -203,6 +205,7 @@ pub async fn collect(
                 ) {
                     match client.top_buy_orders(item).await {
                         Ok(orders) => buy_orders.extend(orders),
+                        Err(Error::RateLimited { .. }) => {}
                         Err(error) => {
                             tracing::warn!(?platform, %error, "read-only buy-orders request skipped")
                         }

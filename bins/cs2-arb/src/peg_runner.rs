@@ -270,7 +270,7 @@ pub fn run_peg_bid_engine(
                         let _ = risk.record_marked_fill(
                             &report.fill,
                             unrealized,
-                            report.cost_basis_released.unwrap_or(Money(0)),
+                            report.ledger_entry.cost_basis_released.unwrap_or(Money(0)),
                         )?;
                     }
                     Err(reason) => tracing::warn!(
@@ -337,7 +337,7 @@ pub fn run_peg_bid_engine(
                     let _ = risk.record_marked_fill(
                         &report.fill,
                         unrealized,
-                        report.cost_basis_released.unwrap_or(Money(0)),
+                        report.ledger_entry.cost_basis_released.unwrap_or(Money(0)),
                     )?;
                 }
                 Err(reason) => tracing::warn!(

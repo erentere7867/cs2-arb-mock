@@ -307,6 +307,13 @@ impl EventQueue {
                     .max_lifetime(None),
             )
         } else {
+            if let Some(parent) = options
+                .get_filename()
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+            {
+                tokio::fs::create_dir_all(parent).await.map_err(storage)?;
+            }
             (
                 options.journal_mode(SqliteJournalMode::Wal),
                 SqlitePoolOptions::new().max_connections(4),

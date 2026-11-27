@@ -31,6 +31,23 @@ fn config() -> QueueConfig {
 }
 
 #[tokio::test]
+async fn queue_creates_missing_database_directories() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("data/nested/events.db");
+    EventQueue::open(path.to_str().unwrap())
+        .await
+        .unwrap()
+        .close()
+        .await;
+    assert!(path.is_file());
+
+    let path = dir.path().join("another/nested/events.db");
+    let url = format!("sqlite://{}", path.display());
+    EventQueue::open(&url).await.unwrap().close().await;
+    assert!(path.is_file());
+}
+
+#[tokio::test]
 async fn queue_reopens_with_an_unknown_applied_migration() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("events.db");

@@ -481,9 +481,9 @@ fn profitable_exit(
         return Ok(None);
     }
     let mut order = exit_order(position, quote, price, view.now);
-    let (_, quantity) = view
-        .preview_fill(strategy, &order)
-        .unwrap_or((price, order.quantity));
+    let Some((price, quantity)) = view.preview_fill(strategy, &order) else {
+        return Ok(None);
+    };
     let released =
         i128::from(position.cost_basis.0) * i128::from(quantity) / i128::from(position.quantity);
     let proceeds = view

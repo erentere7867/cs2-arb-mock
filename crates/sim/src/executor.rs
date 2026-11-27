@@ -23,6 +23,7 @@ use crate::wear::{order_matches, order_matches_float};
 /// Everything produced by an accepted order.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ExecutionReport {
+    pub allocated_deposit: Option<Money>,
     /// `fill.fee` is the **total** marketplace fee for the fill (buyer fee on a
     /// buy, seller fee on a sell), not a per-unit fee.
     pub fill: Fill,
@@ -239,7 +240,10 @@ impl MockExecutor {
                 let level = self.buy_level(order, target, now)?;
                 Ok((level.price, level.quantity))
             }
-            OrderSide::Sell => Ok((order.limit_price, target)),
+            OrderSide::Sell => {
+                self.validate_sell_price(order, target, now)?;
+                Ok((order.limit_price, target))
+            }
         }
     }
 
@@ -468,6 +472,7 @@ impl MockExecutor {
             self.book.consume(order.platform, id, *take);
         }
         Ok(ExecutionReport {
+            allocated_deposit: None,
             fill: Fill {
                 order: order.clone(),
                 quantity,
@@ -577,23 +582,7 @@ impl MockExecutor {
             });
         }
 
-        // The liquidity gate guarantees verified sales exist, so a reference exists.
-        let reference = self
-            .sell_reference(order, now)
-            .ok_or(Rejection::Arithmetic)?;
-        if order.limit_price > reference {
-            return Err(Rejection::SellLimitAboveMarket {
-                limit: order.limit_price,
-                reference,
-            });
-        }
-        let fees = self.execution_fees(order, order.limit_price, target)?;
-        if fees.net.0 <= 0 {
-            return Err(Rejection::NonPositiveProceeds {
-                unit_price: fees.unit_price,
-                unit_fee: fees.unit_fee,
-            });
-        }
+        let fees = self.validate_sell_price(order, target, now)?;
 
         // FIFO over tradable lots: oldest acquisition first, then position id.
         let mut lots: Vec<(usize, &Position)> = matching
@@ -643,6 +632,7 @@ impl MockExecutor {
         };
         self.portfolio.record_sell(entry.clone(), &draws)?;
         Ok(ExecutionReport {
+            allocated_deposit: None,
             fill: Fill {
                 order: order.clone(),
                 quantity: target,
@@ -655,6 +645,31 @@ impl MockExecutor {
             ledger_entry: entry,
             position: None,
         })
+    }
+
+    fn validate_sell_price(
+        &self,
+        order: &Order,
+        target: u32,
+        now: DateTime<Utc>,
+    ) -> std::result::Result<FeeBreakdown, Rejection> {
+        let reference = self
+            .sell_reference(order, now)
+            .ok_or(Rejection::Arithmetic)?;
+        if order.limit_price > reference {
+            return Err(Rejection::SellLimitAboveMarket {
+                limit: order.limit_price,
+                reference,
+            });
+        }
+        let fees = self.execution_fees(order, order.limit_price, target)?;
+        if fees.net.0 <= 0 {
+            return Err(Rejection::NonPositiveProceeds {
+                unit_price: fees.unit_price,
+                unit_fee: fees.unit_fee,
+            });
+        }
+        Ok(fees)
     }
 }
 

@@ -1089,6 +1089,57 @@ mod tests {
     }
 
     #[test]
+    fn dip_selects_profitable_partial_exit_over_rejected_full_exit() {
+        use crate::integrated::{DipAdapter, SimFillModel};
+        use cs2_arb_strategy::{DipConfig, KillSwitch, RiskLimits};
+
+        let snapshots = [
+            snap(Platform::CsFloat, 0, 999),
+            snap(Platform::CsFloat, 1, 1001),
+            snap(Platform::CsFloat, 2, 900),
+            snap(Platform::CsFloat, 9, 2000),
+            snap(Platform::Skinport, 9, 1200),
+        ];
+        let rows = snapshots
+            .clone()
+            .into_iter()
+            .zip([70, 70, 140, 0, 70])
+            .map(|(quote, count)| (quote, 2, count))
+            .collect::<Vec<_>>();
+        let depth = depth_with_snapshots(&rows);
+        let mut strategies: Vec<Box<dyn StrategyAdapter>> = vec![Box::new(
+            DipAdapter::new(
+                DipConfig {
+                    min_samples: 2,
+                    min_sales_in_window: 1,
+                    quantity: 2,
+                    ..DipConfig::default()
+                },
+                &depth,
+            )
+            .unwrap(),
+        )];
+        let events = [MarketEvent::PanicWindowOpened {
+            branch: "test".into(),
+            opened_at: t(2),
+        }];
+        let fees = FeeSchedules::default();
+        let model = SimFillModel::new(
+            &depth,
+            fees.clone(),
+            RiskLimits::default(),
+            KillSwitch::new(),
+        );
+        let report = Backtester::with_fill_model(BacktestConfig::new(fees), model)
+            .run(SimulationMode, &snapshots, &events, &mut strategies)
+            .unwrap();
+        assert_eq!(report.trades.len(), 1);
+        assert_eq!(report.trades[0].quantity, 1);
+        assert_eq!(report.trades[0].net_pnl, Money(300));
+        assert_eq!(report.totals.open_positions, 1);
+    }
+
+    #[test]
     fn spread_partial_exit_rejects_a_loss_after_the_liquidity_cap() {
         use crate::integrated::{SimFillModel, SpreadAdapter};
         use cs2_arb_strategy::{KillSwitch, RiskLimits, SpreadConfig};

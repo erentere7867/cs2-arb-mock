@@ -67,7 +67,7 @@ pub fn pct_to_ppm(pct: f64) -> Result<i64> {
 pub struct FeeRate {
     /// Commission in parts-per-million of the unit price.
     pub rate_ppm: i64,
-    /// Fixed fee per unit, in cents.
+    /// Fixed fee per filled order, in cents.
     pub fixed: Money,
 }
 
@@ -161,33 +161,45 @@ impl ExactFeeSchedule {
 
     /// Cash paid by the buyer for `quantity` units, buyer marketplace fee included.
     pub fn buy(&self, unit_price: Money, quantity: u32) -> Result<FeeBreakdown> {
-        self.buy_fill(unit_price, quantity, true)
+        self.buy_with_rates(unit_price, quantity, self.buyer, self.crypto_deposit)
     }
 
     pub(crate) fn buy_fill(
         &self,
         unit_price: Money,
-        quantity: u32,
-        first_fill: bool,
-    ) -> Result<FeeBreakdown> {
-        let rate = |rate: FeeRate| {
-            if first_fill {
-                rate
-            } else {
-                FeeRate {
-                    fixed: Money(0),
-                    ..rate
-                }
-            }
+        index: u32,
+        order_quantity: u32,
+    ) -> Result<(FeeBreakdown, Money, Money)> {
+        let n = i64::from(order_quantity);
+        let platform_remainder = self.buyer.fixed.0 % n;
+        let share = |rate: FeeRate, offset: i64| FeeRate {
+            fixed: Money(
+                rate.fixed.0 / n + i64::from((i64::from(index) + offset) % n < rate.fixed.0 % n),
+            ),
+            ..rate
         };
+        let buyer = share(self.buyer, 0);
+        let deposit = share(self.crypto_deposit, n - platform_remainder);
+        let fees = self.buy_with_rates(unit_price, 1, buyer, deposit)?;
+        let allocated_deposit = deposit.order_fee(unit_price, 1, self.rounding)?;
+        let fixed = self.buyer.fixed.checked_add(self.crypto_deposit.fixed)?;
+        let allocated_fixed = buyer.fixed.checked_add(deposit.fixed)?;
+        let unallocated_change =
+            if index == 0 { fixed } else { Money(0) }.checked_sub(allocated_fixed)?;
+        Ok((fees, allocated_deposit, unallocated_change))
+    }
+
+    fn buy_with_rates(
+        &self,
+        unit_price: Money,
+        quantity: u32,
+        buyer: FeeRate,
+        deposit: FeeRate,
+    ) -> Result<FeeBreakdown> {
         let gross = unit_price.checked_mul(quantity)?;
-        let fee = rate(self.buyer)
+        let fee = buyer
             .order_fee(unit_price, quantity, self.rounding)?
-            .checked_add(rate(self.crypto_deposit).order_fee(
-                unit_price,
-                quantity,
-                self.rounding,
-            )?)?;
+            .checked_add(deposit.order_fee(unit_price, quantity, self.rounding)?)?;
         Ok(FeeBreakdown {
             quantity,
             unit_price,

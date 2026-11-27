@@ -97,17 +97,13 @@ impl TradeFees {
         exit: FeeSchedule,
         entry_fee: Money,
         exit_fee: Money,
-        entry_unit: Money,
+        crypto_deposit: Money,
         exit_unit: Money,
         quantity: u32,
     ) -> Result<Option<Self>> {
         if !entry.funding.enabled() && !exit.funding.enabled() {
             return Ok(None);
         }
-        let crypto_deposit = entry
-            .funding
-            .crypto_deposit
-            .order_fee(entry_unit, quantity)?;
         let crypto_withdrawal = exit
             .funding
             .crypto_withdrawal

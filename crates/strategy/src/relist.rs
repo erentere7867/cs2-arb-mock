@@ -187,8 +187,17 @@ impl RelistEngine {
         self.track(position, None, now);
     }
 
-    pub fn track_filled_position(&mut self, position: Position, fill: &cs2_arb_core::Fill) {
-        self.track(position, Some((fill.unit_price, fill.fee)), fill.filled_at);
+    pub fn track_filled_position(
+        &mut self,
+        position: Position,
+        fill: &cs2_arb_core::Fill,
+        allocated_deposit: Money,
+    ) {
+        self.track(
+            position,
+            Some((allocated_deposit, fill.fee)),
+            fill.filled_at,
+        );
     }
 
     fn track(&mut self, position: Position, entry: Option<(Money, Money)>, now: DateTime<Utc>) {
@@ -375,17 +384,16 @@ impl RelistEngine {
                     if realized_net_pnl.0 <= 0 {
                         continue;
                     }
-                    let (entry_schedule, entry_unit, entry_fee) = self.items[&id]
-                        .entry
-                        .map_or((Default::default(), Money(0), Money(0)), |(unit, fee)| {
-                            (fees.get(pos.acquired_on), unit, fee)
-                        });
+                    let (entry_schedule, entry_deposit, entry_fee) = self.items[&id].entry.map_or(
+                        (Default::default(), Money(0), Money(0)),
+                        |(deposit, fee)| (fees.get(pos.acquired_on), deposit, fee),
+                    );
                     let fee_breakdown = TradeFees::from_trade(
                         entry_schedule,
                         schedule,
                         entry_fee,
                         seller_fee,
-                        entry_unit,
+                        entry_deposit,
                         ask_price,
                         pos.quantity,
                     )?;
@@ -650,6 +658,51 @@ mod tests {
         let sales = make_sales(20, 8_600, now);
         let step = engine.step(&sales, &[], &fees(), now).unwrap();
         assert!(step.listed_orders.is_empty());
+    }
+
+    #[test]
+    fn relist_recovers_allocated_lot_cost_and_reports_actual_deposit() {
+        let acquired = t(1, 12);
+        let now = t(8, 12);
+        let mut fees = fees();
+        fees.csfloat.seller_fee_pct = 0.0;
+        fees.csfloat.funding.crypto_deposit.fixed = Money(200);
+        let mut engine = RelistEngine::new(RelistConfig::default()).unwrap();
+        for i in 0..2 {
+            let mut position = make_position(acquired);
+            position.id = format!("lot-{i}");
+            position.cost_basis = Money(8650);
+            let fill = cs2_arb_core::Fill {
+                order: Order {
+                    id: "bid".into(),
+                    side: OrderSide::Buy,
+                    platform: Platform::CsFloat,
+                    item: position.item.clone(),
+                    float_bucket: None,
+                    quantity: 2,
+                    limit_price: Money(8500),
+                    submitted_at: acquired,
+                },
+                quantity: 1,
+                unit_price: Money(8500),
+                fee: Money(150),
+                filled_at: acquired,
+            };
+            engine.track_filled_position(position, &fill, Money(100));
+        }
+        let sales = make_sales(20, 8700, now);
+        let listed = engine.step(&sales, &[], &fees, now).unwrap();
+        assert_eq!(listed.listed_orders.len(), 2);
+        let settled = engine
+            .step(&sales, &[], &fees, now + Duration::hours(1))
+            .unwrap();
+        assert_eq!(settled.realized_sales.len(), 2);
+        for trade in settled.realized_sales {
+            assert_eq!(trade.realized_net_pnl, Money(50));
+            let breakdown = trade.fee_breakdown.unwrap();
+            assert_eq!(breakdown.crypto_deposit, Money(100));
+            assert_eq!(breakdown.platform_buy, Money(50));
+        }
     }
 
     #[test]

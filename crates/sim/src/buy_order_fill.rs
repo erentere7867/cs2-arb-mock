@@ -135,6 +135,7 @@ pub struct BuyOrderFillSimulator {
     seen_sale_ids: HashSet<String>,
     filled_order_ids: HashSet<String>,
     rejections: Vec<RejectionRecord>,
+    unallocated_buy_fees: Money,
 }
 
 impl BuyOrderFillSimulator {
@@ -157,6 +158,7 @@ impl BuyOrderFillSimulator {
             seen_sale_ids: HashSet::new(),
             filled_order_ids: HashSet::new(),
             rejections: Vec::new(),
+            unallocated_buy_fees: Money(0),
         })
     }
 
@@ -187,6 +189,10 @@ impl BuyOrderFillSimulator {
     /// Whether a passive buy order has been completely filled (no remaining units).
     pub fn is_order_filled(&self, order_id: &str) -> bool {
         self.filled_order_ids.contains(order_id)
+    }
+
+    pub fn unallocated_buy_fees(&self) -> Money {
+        self.unallocated_buy_fees
     }
 
     /// All recorded historical/live sales known to the simulator.
@@ -374,21 +380,32 @@ impl BuyOrderFillSimulator {
 
             // A single historical/live sale print represents one traded skin unit.
             let fill_qty = 1u32;
-            let Ok(fees) = self.fees.get(order.platform).buy_fill(
-                order.limit_price,
-                fill_qty,
-                remaining_quantity == order.quantity,
-            ) else {
+            let Ok((fees, allocated_deposit, unallocated_change)) =
+                self.fees.get(order.platform).buy_fill(
+                    order.limit_price,
+                    order.quantity - remaining_quantity,
+                    order.quantity,
+                )
+            else {
+                continue;
+            };
+            let Ok(paid_fee) = fees.fee.checked_add(unallocated_change) else {
+                continue;
+            };
+            let Ok(paid) = fees.gross.checked_add(paid_fee) else {
+                continue;
+            };
+            let Ok(unallocated) = self.unallocated_buy_fees.checked_add(unallocated_change) else {
                 continue;
             };
 
             if let Some(cash) = self.portfolio.cash() {
-                if fees.net > cash {
+                if paid > cash {
                     self.rejections.push(RejectionRecord {
                         order_id: order.id.clone(),
                         rejected_at: sale.sold_at,
                         rejection: Rejection::InsufficientFunds {
-                            required: fees.net,
+                            required: paid,
                             available: cash,
                         },
                     });
@@ -396,7 +413,7 @@ impl BuyOrderFillSimulator {
                 }
             }
 
-            let Ok(cash_delta) = Money(0).checked_sub(fees.net) else {
+            let Ok(cash_delta) = Money(0).checked_sub(paid) else {
                 continue;
             };
 
@@ -426,9 +443,9 @@ impl BuyOrderFillSimulator {
                 float_bucket: order.float_bucket,
                 quantity: fill_qty,
                 unit_price: order.limit_price,
-                unit_fee: fees.unit_fee,
+                unit_fee: paid_fee,
                 gross: fees.gross,
-                fee: fees.fee,
+                fee: paid_fee,
                 cash_delta,
                 cost_basis_released: None,
                 realized_pnl: None,
@@ -442,6 +459,7 @@ impl BuyOrderFillSimulator {
                 .record_buy(position.clone(), entry.clone())
                 .is_ok()
             {
+                self.unallocated_buy_fees = unallocated;
                 let new_remaining = remaining_quantity - fill_qty;
                 self.resting_bids[idx].remaining_quantity = new_remaining;
                 if new_remaining == 0 {
@@ -449,6 +467,7 @@ impl BuyOrderFillSimulator {
                     self.filled_order_ids.insert(order.id.clone());
                 }
                 reports.push(ExecutionReport {
+                    allocated_deposit: Some(allocated_deposit),
                     fill: Fill {
                         order,
                         quantity: fill_qty,
@@ -564,6 +583,7 @@ impl BuyOrderFillSimulator {
         self.filled_order_ids.insert(order_id);
 
         Ok(ExecutionReport {
+            allocated_deposit: None,
             fill: Fill {
                 order,
                 quantity: position.quantity,
@@ -776,6 +796,37 @@ mod tests {
         let fills = sim.process_transaction(&tie3, t(10, 12, 35));
         assert_eq!(fills.len(), 1);
         assert_eq!(fills[0].fill.unit_price, Money(8_500));
+    }
+
+    #[test]
+    fn partial_bid_pays_all_fixed_charges_but_allocates_cents_across_lots() {
+        let now = t(10, 12, 0);
+        let mut fees = fees();
+        fees.csfloat.buyer_fixed_fee = Money(101);
+        fees.csfloat.funding.crypto_deposit.fixed = Money(101);
+        let mut sim =
+            BuyOrderFillSimulator::new(SimulationMode, BuyOrderFillConfig::default(), &fees, 7)
+                .unwrap();
+        seed_liquidity(&mut sim, 20, now);
+        let mut bid = bid_order("allocated", 8500, now);
+        bid.quantity = 2;
+        sim.place_bid(bid, now).unwrap();
+        let first = sim
+            .process_transaction(&make_sale("first", 8400, now, true), now)
+            .pop()
+            .unwrap();
+        assert_eq!(first.position.unwrap().cost_basis, Money(8601));
+        assert_eq!(first.ledger_entry.fee, Money(202));
+        assert_eq!(first.allocated_deposit, Some(Money(50)));
+        assert_eq!(sim.unallocated_buy_fees(), Money(101));
+        let second = sim
+            .process_transaction(&make_sale("second", 8400, now, true), now)
+            .pop()
+            .unwrap();
+        assert_eq!(second.position.unwrap().cost_basis, Money(8601));
+        assert_eq!(second.allocated_deposit, Some(Money(51)));
+        assert_eq!(sim.unallocated_buy_fees(), Money(0));
+        assert_eq!(sim.portfolio().buyer_fees_paid(), Money(202));
     }
 
     #[test]

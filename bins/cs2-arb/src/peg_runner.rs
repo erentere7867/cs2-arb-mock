@@ -329,7 +329,13 @@ pub fn run_peg_bid_engine(
                     strategy.mark_filled(&report.fill.order.id);
                 }
                 if let Some(pos) = report.position {
-                    relist.track_filled_position(pos, &report.fill);
+                    relist.track_filled_position(
+                        pos,
+                        &report.fill,
+                        report
+                            .allocated_deposit
+                            .expect("passive buy allocates deposit"),
+                    );
                 }
             }
             sale_idx += 1;
@@ -430,7 +436,9 @@ pub fn run_peg_bid_engine(
         bids_placed,
         bids_filled,
         realized_sales: relist.realized_sales().to_vec(),
-        realized_buy_order_pnl: relist.total_realized_pnl(),
+        realized_buy_order_pnl: relist
+            .total_realized_pnl()
+            .checked_sub(simulator.unallocated_buy_fees())?,
         total_seller_fees: relist.total_seller_fees(),
         cash_balance: simulator.cash(),
     })

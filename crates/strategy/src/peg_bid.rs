@@ -561,6 +561,13 @@ pub fn meets_net_margin(
         return Ok(false);
     }
     let econ = evaluate_bid_economics(unit_bid, rolling_median, unit_bid, fees, config)?;
+    if fees.buyer_fixed_fee.0 > 0 || fees.funding.crypto_deposit.fixed.0 > 0 {
+        let qty = i64::from(config.quantity);
+        let largest_basis = Money(econ.buy_cost.0 / qty + i64::from(econ.buy_cost.0 % qty != 0));
+        if fees.seller_order_proceeds(rolling_median, 1)? <= largest_basis {
+            return Ok(false);
+        }
+    }
     let required_net_profit = cents_ceil(econ.buy_cost.0 as f64 * config.target_margin_fraction())?;
     Ok(econ.expected_net_profit >= required_net_profit
         && (!fees.funding.enabled() || econ.expected_net_profit.0 > 0))

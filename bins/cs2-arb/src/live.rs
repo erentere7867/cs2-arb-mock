@@ -21,6 +21,11 @@ use crate::{bundled_snapshots, watch, Inputs, Market};
 
 type MarketClients = Vec<(Platform, Box<dyn MarketClient>)>;
 
+pub fn dmarket_credentials(secrets: &Secrets) -> Result<DMarketCredentials> {
+    let (public, secret) = secrets.require_dmarket()?;
+    DMarketCredentials::from_hex(public.expose_secret(), secret.expose_secret())
+}
+
 pub fn select_platforms(
     game: Game,
     requested: Vec<Market>,
@@ -103,9 +108,7 @@ fn make_clients(
                 ))
             }
             Platform::DMarket => {
-                let (public, secret) = secrets.require_dmarket()?;
-                let credentials =
-                    DMarketCredentials::from_hex(public.expose_secret(), secret.expose_secret())?;
+                let credentials = dmarket_credentials(&secrets)?;
                 Box::new(ResilientMarket::new(
                     DMarketClient::with_config(
                         schedule,

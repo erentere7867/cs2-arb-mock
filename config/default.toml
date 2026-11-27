@@ -1,4 +1,4 @@
-markets = ["skinport", "csfloat", "dmarket"]
+markets = ["skinport", "csfloat", "dmarket", "waxpeer"]
 dmarket_if_configured = true
 
 # Illustrative mock fees, NOT verified marketplace schedules unless linked.
@@ -21,7 +21,6 @@ seller_fee_pct = 7.0
 buyer_fixed_fee = 0
 seller_fixed_fee = 0
 
-# Include "waxpeer" in markets to opt in to CS2 Waxpeer.
 [fees.waxpeer]
 buyer_fee_pct = 0.0 # Assumption for purchases using existing marketplace balance.
 seller_fee_pct = 6.0 # Standard fee: https://faq.waxpeer.com/faq/fees-sell

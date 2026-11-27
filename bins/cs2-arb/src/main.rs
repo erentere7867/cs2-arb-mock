@@ -837,13 +837,17 @@ amount = 100
 
     #[test]
     fn shipped_profiles_add_dmarket_to_default_live_reads_only_with_both_keys() {
-        for (config, other_venue) in [
+        let profiles: [(&str, &[Platform]); 2] = [
             (
                 include_str!("../../../config/default.toml"),
-                Platform::CsFloat,
+                &[Platform::Skinport, Platform::CsFloat, Platform::Waxpeer],
             ),
-            (include_str!("../../../config/rust.toml"), Platform::Waxpeer),
-        ] {
+            (
+                include_str!("../../../config/rust.toml"),
+                &[Platform::Skinport, Platform::Waxpeer],
+            ),
+        ];
+        for (config, public_platforms) in profiles {
             let settings: Settings = toml::from_str(config).unwrap();
             let public = Some(EXAMPLE_DMARKET_PUBLIC);
             let secret = Some(EXAMPLE_DMARKET_SEED);
@@ -854,7 +858,7 @@ amount = 100
                 (dmarket_secrets(public, Some(" ")), false),
                 (dmarket_secrets(public, secret), true),
             ] {
-                let mut expected = vec![Platform::Skinport, other_venue];
+                let mut expected = public_platforms.to_vec();
                 if enable {
                     expected.push(Platform::DMarket);
                 }
@@ -874,16 +878,17 @@ amount = 100
 
     #[test]
     fn malformed_or_mismatched_dmarket_keys_do_not_break_default_live_reads() {
-        for (config, public_platforms) in [
+        let profiles: [(&str, &[Platform]); 2] = [
             (
                 include_str!("../../../config/default.toml"),
-                [Platform::Skinport, Platform::CsFloat],
+                &[Platform::Skinport, Platform::CsFloat, Platform::Waxpeer],
             ),
             (
                 include_str!("../../../config/rust.toml"),
-                [Platform::Skinport, Platform::Waxpeer],
+                &[Platform::Skinport, Platform::Waxpeer],
             ),
-        ] {
+        ];
+        for (config, public_platforms) in profiles {
             let settings: Settings = toml::from_str(config).unwrap();
             let mismatched_seed = "00".repeat(32);
             for seed in ["not-hex", mismatched_seed.as_str()] {

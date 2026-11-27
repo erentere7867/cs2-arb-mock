@@ -1161,7 +1161,7 @@ mod tests {
         let step = engine
             .step(&make_sales(20, 10_000, now), &snapshots, &fees(), now)
             .unwrap();
-        assert_eq!(step.unlocked, [position.id.clone()]);
+        assert_eq!(step.unlocked, std::slice::from_ref(&position.id));
         assert_eq!(step.listed_orders[0].limit_price, Money(8000));
 
         let sold_at = now + Duration::seconds(1);

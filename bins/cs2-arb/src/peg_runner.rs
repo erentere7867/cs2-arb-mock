@@ -11,7 +11,7 @@ use cs2_arb_core::{
 use cs2_arb_sim::{BuyOrderFillConfig, BuyOrderFillSimulator};
 use cs2_arb_strategy::{
     ActivePegBid, KillSwitch, PegBidConfig, PegBidStrategy, RealizedRelistSale, RelistConfig,
-    RelistEngine,
+    RelistEngine, RiskLimits, RiskManager,
 };
 use serde::Serialize;
 
@@ -204,10 +204,12 @@ pub fn run_peg_bid_engine(
     fees: &FeeSchedules,
     peg_config: PegBidConfig,
     relist_config: RelistConfig,
+    risk_limits: RiskLimits,
     kill_switch: &KillSwitch,
     starting_cash: Option<Money>,
 ) -> Result<PegBidDashboard> {
     let mut strategy = PegBidStrategy::new(peg_config)?;
+    let mut risk = RiskManager::new(risk_limits, kill_switch.clone())?;
     let sim_config = BuyOrderFillConfig {
         starting_cash,
         ..BuyOrderFillConfig::default()
@@ -249,6 +251,7 @@ pub fn run_peg_bid_engine(
             strategy.observe_sale(sale);
             for report in simulator.process_transaction(sale, now) {
                 bids_filled += 1;
+                let _ = risk.record_fill(&report.fill)?;
                 strategy.mark_filled(&report.fill.order.id);
                 if let Some(pos) = report.position {
                     relist.track_position(pos, report.fill.filled_at);
@@ -266,6 +269,10 @@ pub fn run_peg_bid_engine(
             let batch = &sorted_bids[bid_start..bid_idx];
             let orders = strategy.evaluate(batch, fees, now)?;
             for order in orders {
+                if let Err(reason) = risk.check(&order, now) {
+                    tracing::debug!(order_id = %order.id, %reason, "peg bid blocked by risk limits");
+                    continue;
+                }
                 if simulator.place_bid(order, now).is_ok() {
                     bids_placed += 1;
                 }
@@ -291,12 +298,21 @@ pub fn run_peg_bid_engine(
             now,
         )?;
         for settled in &relist_step.realized_sales {
-            let _ = simulator.settle_relist_sale(
+            match simulator.settle_relist_sale(
                 &settled.position_id,
                 settled.platform,
                 settled.ask_price,
                 settled.sold_at,
-            );
+            ) {
+                Ok(report) => {
+                    let _ = risk.record_fill(&report.fill)?;
+                }
+                Err(reason) => tracing::warn!(
+                    position_id = %settled.position_id,
+                    ?reason,
+                    "relist settlement rejected by simulator"
+                ),
+            }
         }
     }
 
@@ -427,6 +443,7 @@ mod tests {
             &fees(),
             PegBidConfig::default(),
             RelistConfig::default(),
+            RiskLimits::default(),
             &KillSwitch::new(),
             Some(Money(50_000)),
         )
@@ -476,6 +493,7 @@ mod tests {
             &fees(),
             PegBidConfig::default(),
             RelistConfig::default(),
+            RiskLimits::default(),
             &KillSwitch::new(),
             Some(Money(50_000)),
         )

@@ -164,6 +164,7 @@ async fn run(cli: Cli) -> Result<()> {
     let kill_switch = KillSwitch::with_defaults();
     let peg_config = settings.peg_bid.clone();
     let relist_config = settings.relist.clone();
+    let risk_limits = settings.risk.clone();
     let report = simulate(&inputs, fees.clone(), settings, kill_switch.clone())?;
     let peg_dashboard = peg_runner::run_peg_bid_engine(
         &inputs.snapshots,
@@ -172,6 +173,7 @@ async fn run(cli: Cli) -> Result<()> {
         &fees,
         peg_config,
         relist_config,
+        risk_limits,
         &kill_switch,
         None,
     )?;

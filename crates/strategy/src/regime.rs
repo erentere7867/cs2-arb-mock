@@ -500,6 +500,45 @@ mod tests {
     }
 
     #[test]
+    fn a_bucket_with_asks_and_sales_votes_once_per_venue() {
+        let snapshots = [
+            (FloatBucket::FieldTestedLow, 92),
+            (FloatBucket::FieldTestedHigh, 106),
+        ]
+        .into_iter()
+        .flat_map(|(bucket, current)| {
+            series("One", 100, 100, current).map(|mut quote| {
+                quote.item.wear_tier = WearTier::FieldTested;
+                quote.float_bucket = Some(bucket);
+                quote
+            })
+        })
+        .collect::<Vec<_>>();
+        let sales = [(7, 100), (1, 100), (0, 96)].map(|(days, price)| Sale {
+            id: format!("sale-{days}"),
+            platform: Platform::CsFloat,
+            item: snapshots[0].item.clone(),
+            price: Money(price),
+            float_value: Some(0.18),
+            sold_at: now() - Duration::days(days),
+            verified: true,
+        });
+        let regime = MarketRegime::new(
+            RegimeConfig {
+                min_index_items: 1,
+                ..RegimeConfig::default()
+            },
+            &snapshots,
+            &sales,
+        )
+        .unwrap();
+        let state = regime.at(now()).state;
+        assert_eq!(state.market.short_pct, Some(0.0));
+        assert_eq!(state.market.long_pct, Some(0.0));
+        assert_eq!(state.status, RegimeStatus::RiskOn);
+    }
+
+    #[test]
     fn stale_future_and_unverified_observations_do_not_complete_the_index() {
         let mut prices = [series("One", 100, 100, 100), series("Two", 100, 100, 100)].concat();
         let [mut stale, yesterday, mut future] = series("Three", 100, 100, 100);

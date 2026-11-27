@@ -675,7 +675,7 @@ impl<F: FillModel> Backtester<F> {
         let mut total_unrealized = Money(0);
         let mut total_open_basis = Money(0);
         let mut total_open = 0u32;
-        let (mut submitted, mut filled, mut rejected) = (0u32, 0u32, 0u32);
+        let (mut submitted, mut filled, mut rejected, mut pending) = (0u32, 0u32, 0u32, 0u32);
 
         for (strategy, book) in strategies.iter().zip(books) {
             let unrealized = match window.end {
@@ -687,11 +687,12 @@ impl<F: FillModel> Backtester<F> {
                 .iter()
                 .try_fold(Money(0), |acc, l| acc.checked_add(l.position.cost_basis))?;
             let open = book.lots.len() as u32;
+            let book_pending = book.pending.values().map(Vec::len).sum::<usize>() as u32;
             per_strategy.push(stats(
                 strategy.name(),
                 &book.trades,
                 &book.equity,
-                (book.submitted, book.filled, book.rejected),
+                (book.submitted, book.filled, book.rejected, book_pending),
                 (open, open_basis, unrealized),
             )?);
             for (sum, point) in combined_equity.iter_mut().zip(&book.equity) {
@@ -703,6 +704,7 @@ impl<F: FillModel> Backtester<F> {
             submitted += book.submitted;
             filled += book.filled;
             rejected += book.rejected;
+            pending += book_pending;
             all_trades.extend(book.trades.iter().cloned());
         }
         // Stable sort keeps strategy order for trades closed at the same instant.
@@ -711,7 +713,7 @@ impl<F: FillModel> Backtester<F> {
             "all",
             &all_trades,
             &combined_equity,
-            (submitted, filled, rejected),
+            (submitted, filled, rejected, pending),
             (total_open, total_open_basis, total_unrealized),
         )?;
         let venue_trade_holds = self.fill_model.venue_trade_holds();
@@ -805,7 +807,7 @@ fn stats(
     name: &str,
     trades: &[TradeRecord],
     equity: &[Money],
-    (submitted, filled, rejected): (u32, u32, u32),
+    (submitted, filled, rejected, pending): (u32, u32, u32, u32),
     (open_positions, open_cost_basis, unrealized_pnl): (u32, Money, Money),
 ) -> Result<StrategyStats> {
     let sum = |f: fn(&TradeRecord) -> Money| {
@@ -830,6 +832,7 @@ fn stats(
         orders_submitted: submitted,
         orders_filled: filled,
         orders_rejected: rejected,
+        orders_pending: pending,
         trade_count: count,
         winning_trades,
         losing_trades,
@@ -1142,6 +1145,9 @@ mod tests {
         assert_eq!(report.window.steps, 3);
         assert_eq!(report.totals.orders_submitted, 2);
         assert_eq!(report.totals.orders_filled, 1);
+        assert_eq!(report.totals.orders_pending, 1);
+        assert_eq!(report.strategies[0].orders_pending, 1);
+        assert!(report.to_markdown().contains("| Orders pending | 1 | 1 |"));
         assert_eq!(report.totals.open_positions, 1);
     }
 

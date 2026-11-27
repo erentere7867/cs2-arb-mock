@@ -47,6 +47,8 @@ pub struct StrategyStats {
     pub orders_submitted: u32,
     pub orders_filled: u32,
     pub orders_rejected: u32,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub orders_pending: u32,
     /// Closed round trips.
     pub trade_count: u32,
     pub winning_trades: u32,
@@ -83,6 +85,10 @@ pub struct StrategyStats {
     pub max_drawdown: Money,
     /// Mark-to-market equity after the final replay step.
     pub final_equity: Money,
+}
+
+fn is_zero(value: &u32) -> bool {
+    *value == 0
 }
 
 /// Replay coverage.
@@ -232,6 +238,13 @@ impl PerformanceReport {
             let _ = write!(out, "| {label} |");
             for c in &columns {
                 let _ = write!(out, " {} |", value(c));
+            }
+            out.push('\n');
+        }
+        if self.totals.orders_pending != 0 {
+            out.push_str("| Orders pending |");
+            for c in &columns {
+                let _ = write!(out, " {} |", c.orders_pending);
             }
             out.push('\n');
         }

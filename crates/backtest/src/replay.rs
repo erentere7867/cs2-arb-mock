@@ -1157,6 +1157,47 @@ mod tests {
     }
 
     #[test]
+    fn single_sample_reports_every_delayed_order_as_pending() {
+        use crate::integrated::{SimFillModel, SpreadAdapter};
+        use cs2_arb_sim::{FillLatency, SimConfig};
+        use cs2_arb_strategy::{KillSwitch, RiskLimits, SpreadConfig};
+
+        let rows = [
+            (snap(Platform::CsFloat, 0, 1000), 1, 70),
+            (snap(Platform::DMarket, 0, 1400), 1, 70),
+        ];
+        let depth = depth_with_snapshots(&rows);
+        let latency = Duration::seconds(3);
+        let model = SimFillModel::new(&depth, fees(), RiskLimits::default(), KillSwitch::new())
+            .with_sim_config(SimConfig {
+                fill_latency: FillLatency {
+                    min: latency,
+                    max: latency,
+                },
+                ..SimConfig::default()
+            });
+        let report = Backtester::with_fill_model(BacktestConfig::new(fees()), model)
+            .run(
+                SimulationMode,
+                &rows.map(|(quote, _, _)| quote),
+                &[],
+                &mut [Box::new(SpreadAdapter::new(SpreadConfig::default()))],
+            )
+            .unwrap();
+        assert_eq!(report.window.steps, 1);
+        assert_eq!(report.window.end, Some(t(0)));
+        assert_eq!(report.totals.orders_submitted, 1);
+        assert_eq!(report.totals.orders_filled, 0);
+        assert_eq!(report.totals.orders_rejected, 0);
+        assert_eq!(report.totals.orders_pending, 1);
+        assert_eq!(report.totals.final_equity, Money(0));
+        assert!(report.to_markdown().contains("| Orders pending | 1 | 1 |"));
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["totals"]["orders_pending"], 1);
+        assert_eq!(json["strategies"][0]["orders_pending"], 1);
+    }
+
+    #[test]
     fn dip_only_buys_when_recovery_to_the_mean_covers_fees() {
         use crate::integrated::{DipAdapter, SimFillModel};
         use cs2_arb_strategy::{DipConfig, KillSwitch, RiskLimits};

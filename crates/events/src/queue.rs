@@ -323,12 +323,21 @@ impl EventQueue {
                 SqlitePoolOptions::new().max_connections(4),
             )
         };
+        // SQLite migrations take no lock, so processes sharing one database
+        // (the CS2 and Rust engines) serialize them through a sibling lock file.
+        let migration_lock = if in_memory {
+            None
+        } else {
+            Some(lock_migrations(options.get_filename()).await?)
+        };
         let pool = pool_options.connect_with(options).await.map_err(storage)?;
-        sqlx::migrate!("./migrations")
+        let migrated = sqlx::migrate!("./migrations")
             .set_ignore_missing(true)
             .run(&pool)
             .await
-            .map_err(storage)?;
+            .map_err(storage);
+        drop(migration_lock);
+        migrated?;
         Ok(Self {
             pool,
             config: QueueConfig {
@@ -1347,4 +1356,25 @@ async fn read_payloads<T: serde::de::DeserializeOwned>(
         .iter()
         .map(|payload| serde_json::from_str(payload).map_err(storage))
         .collect()
+}
+
+async fn lock_migrations(database: &std::path::Path) -> Result<std::fs::File> {
+    let database = database.to_owned();
+    tokio::task::spawn_blocking(move || {
+        // Lock next to the file SQLite opens, so a symlinked path shares the target's lock.
+        let mut path = std::fs::canonicalize(&database)
+            .unwrap_or(database)
+            .into_os_string();
+        path.push(".migrate.lock");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(path)?;
+        file.lock()?;
+        Ok::<_, std::io::Error>(file)
+    })
+    .await
+    .map_err(storage)?
+    .map_err(storage)
 }

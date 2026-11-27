@@ -117,6 +117,8 @@ pub struct RestingBuyOrder {
     pub tie_ready_at: DateTime<Utc>,
     /// Number of verified prints observed at the exact tied price since placement.
     pub tie_prints_seen: u32,
+    /// Remaining unfilled units on this passive buy order.
+    pub remaining_quantity: u32,
     pub status: BuyOrderStatus,
 }
 
@@ -241,6 +243,7 @@ impl BuyOrderFillSimulator {
 
         let tie_ready_at = now + self.draw_tie_latency();
         let resting = RestingBuyOrder {
+            remaining_quantity: order.quantity,
             order,
             placed_at: now,
             tie_ready_at,
@@ -269,9 +272,9 @@ impl BuyOrderFillSimulator {
         let bid_count = self.resting_bids.len();
 
         for idx in 0..bid_count {
-            let (order, placed_at, tie_ready_at) = {
+            let (order, placed_at, tie_ready_at, remaining_quantity) = {
                 let bid = &self.resting_bids[idx];
-                if bid.status != BuyOrderStatus::Resting {
+                if bid.status != BuyOrderStatus::Resting || bid.remaining_quantity == 0 {
                     continue;
                 }
                 if bid.order.platform != sale.platform || bid.order.item != sale.item {
@@ -292,7 +295,12 @@ impl BuyOrderFillSimulator {
                 if sale.price > bid.order.limit_price {
                     continue;
                 }
-                (bid.order.clone(), bid.placed_at, bid.tie_ready_at)
+                (
+                    bid.order.clone(),
+                    bid.placed_at,
+                    bid.tie_ready_at,
+                    bid.remaining_quantity,
+                )
             };
 
             let _ = placed_at;
@@ -321,11 +329,9 @@ impl BuyOrderFillSimulator {
                 continue;
             }
 
-            let Ok(fees) = self
-                .fees
-                .get(order.platform)
-                .buy(order.limit_price, order.quantity)
-            else {
+            // A single historical/live sale print represents one traded skin unit.
+            let fill_qty = 1u32;
+            let Ok(fees) = self.fees.get(order.platform).buy(order.limit_price, fill_qty) else {
                 continue;
             };
 
@@ -348,12 +354,18 @@ impl BuyOrderFillSimulator {
             };
 
             let filled_at = sale.sold_at;
+            let fill_index = order.quantity - remaining_quantity + 1;
+            let position_id = if order.quantity == 1 {
+                format!("{}#pos", order.id)
+            } else {
+                format!("{}#pos-{fill_index}", order.id)
+            };
             let position = Position {
-                id: format!("{}#pos", order.id),
+                id: position_id,
                 item: order.item.clone(),
                 float_bucket: order.float_bucket,
                 acquired_on: order.platform,
-                quantity: order.quantity,
+                quantity: fill_qty,
                 cost_basis: fees.net,
                 acquired_at: filled_at,
                 locked_until: filled_at + valve_trade_hold(),
@@ -365,7 +377,7 @@ impl BuyOrderFillSimulator {
                 platform: order.platform,
                 item: order.item.clone(),
                 float_bucket: order.float_bucket,
-                quantity: order.quantity,
+                quantity: fill_qty,
                 unit_price: order.limit_price,
                 unit_fee: fees.unit_fee,
                 gross: fees.gross,
@@ -374,8 +386,8 @@ impl BuyOrderFillSimulator {
                 cost_basis_released: None,
                 realized_pnl: None,
                 filled_at,
-                listings: vec![(sale.id.clone(), order.quantity)],
-                positions: vec![(position.id.clone(), order.quantity)],
+                listings: vec![(sale.id.clone(), fill_qty)],
+                positions: vec![(position.id.clone(), fill_qty)],
             };
 
             if self
@@ -383,12 +395,16 @@ impl BuyOrderFillSimulator {
                 .record_buy(position.clone(), entry.clone())
                 .is_ok()
             {
-                self.resting_bids[idx].status = BuyOrderStatus::Filled;
-                self.filled_order_ids.insert(order.id.clone());
+                let new_remaining = remaining_quantity - fill_qty;
+                self.resting_bids[idx].remaining_quantity = new_remaining;
+                if new_remaining == 0 {
+                    self.resting_bids[idx].status = BuyOrderStatus::Filled;
+                    self.filled_order_ids.insert(order.id.clone());
+                }
                 reports.push(ExecutionReport {
                     fill: Fill {
                         order,
-                        quantity: position.quantity,
+                        quantity: fill_qty,
                         unit_price: entry.unit_price,
                         fee: fees.fee,
                         filled_at,
@@ -398,6 +414,7 @@ impl BuyOrderFillSimulator {
                     ledger_entry: entry,
                     position: Some(position),
                 });
+                break;
             }
         }
 

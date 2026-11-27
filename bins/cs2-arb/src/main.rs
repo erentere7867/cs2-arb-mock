@@ -279,6 +279,7 @@ async fn run(cli: Cli) -> Result<()> {
                     game,
                     settings.relist.instant_sale,
                     settings.live_sales_lookback_days(),
+                    settings.simulation.build()?.max_listing_age,
                 )
                 .await?
             } else {

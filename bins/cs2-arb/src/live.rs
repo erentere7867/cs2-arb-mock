@@ -2,11 +2,11 @@ use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::{TimeDelta, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
 use cs2_arb_backtest::{integrated::MarketDepth, Secrets};
 use cs2_arb_core::{
-    Error, FeeSchedules, Game, ItemId, MarketClient, MarketEvent, Platform, PriceSnapshot, Result,
-    SystemClock,
+    Error, FeeSchedules, Game, ItemId, Listing, MarketClient, MarketEvent, Platform, PriceSnapshot,
+    Result, SystemClock,
 };
 use cs2_arb_events::EventQueue;
 use cs2_arb_markets::{
@@ -157,6 +157,7 @@ pub async fn collect(
     game: Game,
     instant_sale: bool,
     sales_lookback_days: i64,
+    max_listing_age: TimeDelta,
 ) -> Result<Inputs> {
     let sales_lookback = TimeDelta::try_days(sales_lookback_days)
         .ok_or_else(|| Error::InvalidConfig("live sales lookback is out of range".into()))?;
@@ -229,15 +230,10 @@ pub async fn collect(
             }
         }
         let at = Utc::now();
-        let max_age = cs2_arb_sim::SimConfig::default().max_listing_age;
         for (platform, item, listings) in books {
             let mut best = BTreeMap::new();
             for listing in &listings {
-                if listing.price.0 <= 0
-                    || listing.quantity == 0
-                    || listing.trade_locked_until.is_some_and(|until| until > at)
-                    || at - listing.observed_at > max_age
-                {
+                if !quotable(listing, at, max_listing_age) {
                     continue;
                 }
                 if let Ok(bucket) = quote_bucket(item.wear_tier, listing.float_value) {
@@ -276,9 +272,36 @@ pub async fn collect(
     })
 }
 
+fn quotable(listing: &Listing, at: DateTime<Utc>, max_age: TimeDelta) -> bool {
+    listing.price.0 > 0
+        && listing.quantity > 0
+        && listing.trade_locked_until.is_none_or(|until| until <= at)
+        && at - listing.observed_at <= max_age
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_quote_selection_respects_listing_age_overrides() {
+        let now = Utc::now();
+        let listing = Listing {
+            id: "listing".into(),
+            platform: Platform::Waxpeer,
+            item: ItemId {
+                market_hash_name: "Alien Red".into(),
+                wear_tier: cs2_arb_core::WearTier::NotApplicable,
+            },
+            price: cs2_arb_core::Money(100),
+            quantity: 1,
+            float_value: None,
+            observed_at: now - TimeDelta::minutes(15),
+            trade_locked_until: None,
+        };
+        assert!(quotable(&listing, now, TimeDelta::minutes(20)));
+        assert!(!quotable(&listing, now, TimeDelta::minutes(10)));
+    }
 
     #[test]
     fn waxpeer_live_reads_get_a_limit_even_without_rate_limit_config() {

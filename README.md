@@ -70,9 +70,20 @@ cargo run --bin cs2-arb -- run-mock --live-market-data \
 
 The CS2 live reader consumes watcher events from the same SQLite database and records panic/monitoring transitions. With the shipped config and no `--platform`, it reads Skinport, CSFloat, and Waxpeer and adds signed DMarket reads when both DMarket keys are set. Missing or insufficient sales cause orders to be rejected rather than filled on assumed live liquidity. Historical input formats are arrays of `PriceSnapshot`, `Sale`, and `MarketEvent` as defined in `crates/core`; custom history is not given synthetic sales.
 
-Live mock batches for both games store quotes and verified individual sales in the SQLite database named by `--database`, keeping ten days of regime history per game. The next batch reads that history for its tracked items and enabled venues. Only the regime gate uses persisted history; the prior batches are not replayed as executable books or fills, and the dip baseline and liquidity checks still use the batch's existing inputs. Historical replays do not read or populate the live store.
+Live mock batches for both games store quotes and verified individual sales in the SQLite database named by `--database`, keeping `[market_history] retention_days` (40 in the shipped profiles) of history per game. The next batch reads that history for its tracked items and enabled venues. Live batches use persisted history only for the regime gate; `backtest --history-db` replays it as executable books and fills (see below), and the dip baseline and liquidity checks still use the batch's existing inputs. Historical replays do not read or populate the live store.
 
 Timestamped verified sales already fetched from CSFloat and DMarket can seed the long and short anchors without extra requests, but only when enough comparable sale history exists for the tracked items. Skinport aggregates and synthetic fixture sales do not seed the live store. A fresh database without comparable sales needs recurring quote samples reaching back to the seven-day anchor and its lookback tolerance (up to eight days); missing anchors still block entries. Look for quote and verified-sale counts and the oldest loaded observation in the dashboard's peg summary and batch logs. The oldest observation alone does not establish comparable anchor coverage.
+
+## Backtest on recorded market data
+
+Live batches store every quote, verified individual sale, buy-book poll and empty listing poll they read in the `--database` SQLite file (`[market_history] retention_days`, 40 in the shipped profiles). `backtest --history-db` replays that recording through the same spread, dip, peg-bid, relist, regime and risk logic, fees and seven-day hold as a live batch, using only what was observed: no synthetic sales or bids are added. The database is opened read-only, so it is safe to point at the live store.
+
+```sh
+cs2-arb --config config/default.toml backtest --history-db /home/ubuntu/cs2-arb-mock-data/events.db \
+  --from 2026-11-27T00:00:00Z --through 2026-12-05T00:00:00Z --output-dir reports/recorded
+```
+
+`--from` and `--through` default to the oldest record and now; only that window is traded, while everything recorded before it warms up the regime gate and the dip baseline. CS2 replays also use the branch updates and panic windows the watcher acknowledged unless `--events` is given. Results are only as deep as the recording: exits need quotes at least seven days after entry, and buy-book polls are only stored by builds that include this feature.
 
 ## Configuration and credentials
 

@@ -19,12 +19,7 @@ use cs2_arb_strategy::{
 };
 use serde::Serialize;
 
-pub struct BidRefresh {
-    pub at: DateTime<Utc>,
-    pub platform: Platform,
-    pub item: ItemId,
-    pub bids: Vec<BuyOrder>,
-}
+pub type BidRefresh = cs2_arb_core::BuyOrderPoll;
 
 /// One trade-locked inventory entry displayed on the dashboard.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

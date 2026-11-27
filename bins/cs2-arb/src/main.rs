@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use chrono::TimeDelta;
+use chrono::{DateTime, TimeDelta, Utc};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use cs2_arb_backtest::integrated::{DipAdapter, MarketDepth, SimFillModel, SpreadAdapter};
 use cs2_arb_backtest::{
@@ -13,6 +13,8 @@ use cs2_arb_core::{
     BuyOrder, Error, FeeSchedules, Game, ItemId, MarketEvent, Platform, PriceSnapshot, Result,
     SimulationMode,
 };
+use cs2_arb_events::queue::MarketHistory;
+use cs2_arb_events::EventQueue;
 use cs2_arb_sim::venues::{VenueAccounts, VenueAccountsConfig};
 use cs2_arb_sim::{FillLatency, LiquidityConfig, SimConfig};
 use cs2_arb_strategy::regime::{MarketRegime, RegimeConfig};
@@ -47,7 +49,7 @@ enum Command {
     RunMock {
         #[command(flatten)]
         history: HistoricalArgs,
-        #[arg(long, conflicts_with_all = ["snapshots", "events", "sales", "buy_orders"])]
+        #[arg(long, conflicts_with_all = ["snapshots", "events", "sales", "buy_orders", "history_db"])]
         live_market_data: bool,
         #[arg(long, value_enum, requires = "live_market_data")]
         platform: Vec<Market>,
@@ -89,6 +91,16 @@ struct HistoricalArgs {
     /// Optional top-of-book buy orders JSON for custom peg-bidding replays.
     #[arg(long)]
     buy_orders: Option<PathBuf>,
+    /// Replay the quotes, verified sales and buy-book polls that live batches
+    /// recorded in this SQLite database (opened read-only).
+    #[arg(long, conflicts_with_all = ["snapshots", "sales", "buy_orders"])]
+    history_db: Option<PathBuf>,
+    /// Start of the recorded window (RFC 3339); defaults to the oldest record.
+    #[arg(long, requires = "history_db")]
+    from: Option<DateTime<Utc>>,
+    /// End of the recorded window (RFC 3339); defaults to now.
+    #[arg(long, requires = "history_db")]
+    through: Option<DateTime<Utc>>,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -125,6 +137,33 @@ struct Settings {
     peg_bid: PegBidConfig,
     market_regime: RegimeConfig,
     relist: RelistConfig,
+    market_history: MarketHistorySettings,
+}
+
+#[derive(Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct MarketHistorySettings {
+    /// Days of quotes, verified sales and buy-book polls kept in the live store.
+    retention_days: u32,
+}
+
+impl Default for MarketHistorySettings {
+    fn default() -> Self {
+        Self { retention_days: 10 }
+    }
+}
+
+impl MarketHistorySettings {
+    fn retention(&self) -> Result<TimeDelta> {
+        if self.retention_days == 0 {
+            return Err(Error::InvalidConfig(
+                "market_history.retention_days must be at least 1".into(),
+            ));
+        }
+        TimeDelta::try_days(i64::from(self.retention_days)).ok_or_else(|| {
+            Error::InvalidConfig("market_history.retention_days is out of range".into())
+        })
+    }
 }
 
 #[derive(Default, Deserialize)]
@@ -323,22 +362,23 @@ async fn run(
                     settings.relist.instant_sale,
                     settings.live_sales_lookback_days(),
                     settings.simulation.build()?.max_listing_age,
+                    settings.market_history.retention()?,
                     market_sources,
                 )
                 .await?;
                 (inputs, None, Some(history))
             } else {
-                (historical(game, markets, history)?, None, None)
+                let (inputs, tape) = offline(game, markets, history).await?;
+                (inputs, None, tape)
             }
         }
         Command::Backtest {
             history,
             output_dir,
-        } => (
-            historical(game, markets, history)?,
-            Some(backtest_output_dir(game, output_dir)),
-            None,
-        ),
+        } => {
+            let (inputs, tape) = offline(game, markets, history).await?;
+            (inputs, Some(backtest_output_dir(game, output_dir)), tape)
+        }
         Command::Watch { .. } => unreachable!("handled before loading market configuration"),
     };
     let kill_switch = KillSwitch::with_defaults();
@@ -361,7 +401,7 @@ async fn run(
         settings,
         kill_switch.clone(),
         (accounts.clone(), &audited_markets),
-        live_platforms.is_some(),
+        history.is_some(),
         Arc::clone(&regime),
     )?;
     if audit_enabled || live_platforms.is_some() {
@@ -436,6 +476,118 @@ fn filter_history_events(game: Game, events: &mut Vec<MarketEvent>) {
         MarketEvent::BranchUpdated { app_id, .. } => *app_id == game.app_id(),
         MarketEvent::PanicWindowOpened { .. } | MarketEvent::PanicWindowClosed { .. } => true,
     });
+}
+
+async fn offline(
+    game: Game,
+    markets: &[Platform],
+    args: HistoricalArgs,
+) -> Result<(Inputs, Option<MarketHistory>)> {
+    if args.history_db.is_some() {
+        let (inputs, history) = recorded(game, markets, args).await?;
+        Ok((inputs, Some(history)))
+    } else {
+        Ok((historical(game, markets, args)?, None))
+    }
+}
+
+/// Inputs from the live store: real quotes, verified sales and buy books only;
+/// nothing is synthesized, so gaps in the recording stay gaps in the replay.
+async fn recorded(
+    game: Game,
+    markets: &[Platform],
+    args: HistoricalArgs,
+) -> Result<(Inputs, MarketHistory)> {
+    let path = args
+        .history_db
+        .as_deref()
+        .and_then(Path::to_str)
+        .ok_or_else(|| Error::InvalidData("history database path must be UTF-8".into()))?;
+    let from = args.from.unwrap_or(DateTime::UNIX_EPOCH);
+    let through = args.through.unwrap_or_else(Utc::now);
+    if from > through {
+        return Err(Error::InvalidData(
+            "--from must not be after --through".into(),
+        ));
+    }
+    let queue = EventQueue::open_read_only(path).await?;
+    // Everything up to `through` feeds the regime gate and the dip baseline;
+    // only `from..=through` is replayed.
+    let loaded = queue
+        .load_market_replay(game, DateTime::UNIX_EPOCH, through)
+        .await;
+    let recorded_events = match (&args.events, game) {
+        (None, Game::Cs2) => Some(queue.acknowledged_events().await),
+        _ => None,
+    };
+    queue.close().await;
+    let mut history = loaded?;
+    let mut events = match (args.events, recorded_events) {
+        (Some(path), _) => fixtures::load_events(path)?,
+        (None, Some(events)) => events?
+            .into_iter()
+            .filter(|event| match event {
+                MarketEvent::BranchUpdated { observed_at, .. } => {
+                    (from..=through).contains(observed_at)
+                }
+                MarketEvent::PanicWindowOpened { opened_at, .. } => *opened_at <= through,
+                MarketEvent::PanicWindowClosed { closed_at, .. } => *closed_at <= through,
+            })
+            .collect(),
+        (None, None) => Vec::new(),
+    };
+    filter_history_events(game, &mut events);
+    history
+        .snapshots
+        .retain(|quote| markets.contains(&quote.platform));
+    history
+        .sales
+        .retain(|sale| sale.verified && markets.contains(&sale.platform));
+    history
+        .bid_polls
+        .retain(|poll| poll.at >= from && markets.contains(&poll.platform));
+    history
+        .empty_listing_polls
+        .retain(|poll| poll.at >= from && markets.contains(&poll.platform));
+    for quote in &history.snapshots {
+        validate_history_item(
+            game,
+            quote.platform,
+            &quote.item,
+            quote.float_bucket.is_some(),
+        )?;
+    }
+    for sale in &history.sales {
+        validate_history_item(game, sale.platform, &sale.item, sale.float_value.is_some())?;
+    }
+    for poll in &history.bid_polls {
+        validate_history_item(game, poll.platform, &poll.item, false)?;
+    }
+    let snapshots: Vec<PriceSnapshot> = history
+        .snapshots
+        .iter()
+        .filter(|quote| quote.observed_at >= from)
+        .cloned()
+        .collect();
+    if snapshots.is_empty() {
+        return Err(Error::InvalidData(format!(
+            "{path} has no recorded {game:?} quotes for the selected markets in the window"
+        )));
+    }
+    let mut depth = MarketDepth::from_snapshots(&snapshots);
+    for poll in &history.empty_listing_polls {
+        depth.replace_listings(poll.at, poll.platform, poll.item.clone(), Vec::new());
+    }
+    depth.add_sales(history.sales.iter().cloned());
+    let inputs = Inputs {
+        snapshots,
+        events,
+        depth,
+        buy_orders: Vec::new(),
+        bid_refreshes: history.bid_polls.clone(),
+        has_observed_bids: !history.bid_polls.is_empty(),
+    };
+    Ok((inputs, history))
 }
 
 fn historical(game: Game, markets: &[Platform], args: HistoricalArgs) -> Result<Inputs> {
@@ -536,11 +688,11 @@ fn simulate_with_accounts(
     settings: Settings,
     kill_switch: KillSwitch,
     (accounts, active_platforms): (Option<VenueAccounts>, &[Platform]),
-    live_batch: bool,
+    seed_dip_from_sales: bool,
     regime: Arc<MarketRegime>,
 ) -> Result<PerformanceReport> {
     let mut dip = DipAdapter::new(settings.dip, &inputs.depth)?.with_market_regime(regime);
-    if live_batch {
+    if seed_dip_from_sales {
         if let Some(first_quote) = inputs.snapshots.iter().map(|q| q.observed_at).min() {
             dip.seed_daily_sale_prices(inputs.depth.sales(), first_quote);
         }
@@ -884,6 +1036,8 @@ mod tests {
                             observed_at: at,
                         }],
                         &[],
+                        &[],
+                        &[],
                         at - TimeDelta::days(10),
                     )
                     .await
@@ -1036,6 +1190,138 @@ amount = 100
             assert!(Cli::try_parse_from(["cs2-arb", command]).is_ok());
         }
         assert!(Cli::try_parse_from(["cs2-arb", "run-live"]).is_err());
+    }
+
+    #[tokio::test]
+    async fn backtest_replays_recorded_history_read_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("events.db");
+        let db = db.to_str().unwrap();
+        let item = ItemId {
+            market_hash_name: "AK-47 | Redline (Field-Tested)".into(),
+            wear_tier: WearTier::FieldTested,
+        };
+        let now = Utc::now();
+        let mut quotes = Vec::new();
+        let mut sales = Vec::new();
+        let mut polls = Vec::new();
+        for hour in 0..6 {
+            let at = now - TimeDelta::hours(6 - hour);
+            for (platform, cents) in [(Platform::Waxpeer, 2500), (Platform::CsFloat, 2600)] {
+                quotes.push(PriceSnapshot {
+                    platform,
+                    item: item.clone(),
+                    float_bucket: None,
+                    price: Money(cents),
+                    observed_at: at,
+                });
+                polls.push(cs2_arb_core::BuyOrderPoll {
+                    at,
+                    platform,
+                    item: item.clone(),
+                    bids: vec![BuyOrder {
+                        platform,
+                        item: item.clone(),
+                        float_bucket: None,
+                        price: Money(cents - 300),
+                        quantity: 1,
+                        observed_at: at,
+                    }],
+                });
+            }
+            sales.push(cs2_arb_core::Sale {
+                id: format!("sale-{hour}"),
+                platform: Platform::CsFloat,
+                item: item.clone(),
+                price: Money(2550),
+                float_value: Some(0.25),
+                sold_at: at,
+                verified: true,
+            });
+        }
+        let queue = EventQueue::open(db).await.unwrap();
+        queue
+            .record_market_history(
+                Game::Cs2,
+                &quotes,
+                &sales,
+                &polls,
+                &[cs2_arb_core::EmptyListingPoll {
+                    at: now - TimeDelta::minutes(30),
+                    platform: Platform::Waxpeer,
+                    item: item.clone(),
+                }],
+                now - TimeDelta::days(10),
+            )
+            .await
+            .unwrap();
+        queue.close().await;
+
+        let out = dir.path().join("reports");
+        let from = (now - TimeDelta::hours(3)).to_rfc3339();
+        let cli = Cli::try_parse_from([
+            "cs2-arb",
+            "--config",
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../../config/default.toml"),
+            "backtest",
+            "--history-db",
+            db,
+            "--from",
+            &from,
+            "--output-dir",
+            out.to_str().unwrap(),
+        ])
+        .unwrap();
+        let sources = live::MarketSources {
+            secrets: &Secrets::default(),
+            base_url_override: None,
+        };
+        run(cli, &sources, io::sink()).await.unwrap();
+        let markdown = std::fs::read_to_string(out.join("backtest.md")).unwrap();
+        assert!(markdown.contains("· 4 steps · 6 snapshots ·"), "{markdown}");
+        let queue = EventQueue::open(db).await.unwrap();
+        let stored = queue
+            .load_market_replay(Game::Cs2, now - TimeDelta::days(1), now)
+            .await
+            .unwrap();
+        queue.close().await;
+        assert_eq!(
+            (
+                stored.snapshots.len(),
+                stored.sales.len(),
+                stored.bid_polls.len()
+            ),
+            (quotes.len(), sales.len(), polls.len())
+        );
+
+        let empty = dir.path().join("empty.db");
+        EventQueue::open(empty.to_str().unwrap())
+            .await
+            .unwrap()
+            .close()
+            .await;
+        let cli = Cli::try_parse_from([
+            "cs2-arb",
+            "backtest",
+            "--history-db",
+            empty.to_str().unwrap(),
+            "--output-dir",
+            out.to_str().unwrap(),
+        ])
+        .unwrap();
+        assert!(run(cli, &sources, io::sink()).await.is_err());
+        for conflicting in ["--snapshots", "--sales", "--buy-orders"] {
+            assert!(Cli::try_parse_from([
+                "cs2-arb",
+                "backtest",
+                "--history-db",
+                db,
+                conflicting,
+                "x.json",
+            ])
+            .is_err());
+        }
+        assert!(Cli::try_parse_from(["cs2-arb", "backtest", "--from", &from]).is_err());
     }
 
     #[test]

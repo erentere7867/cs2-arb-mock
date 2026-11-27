@@ -37,11 +37,9 @@ pub trait FillModel {
         quantity: u32,
         fees: FeeSchedule,
     ) -> Result<Money> {
-        if fees.funding.enabled() {
-            fees.seller_proceeds(unit_price)?.checked_mul(quantity)
-        } else {
-            fees.seller_proceeds(unit_price.checked_mul(quantity)?)
-        }
+        unit_price
+            .checked_mul(quantity)?
+            .checked_sub(fees.seller_order_fee(unit_price, quantity)?)
     }
 
     fn prepare_run(&self) {}
@@ -115,19 +113,10 @@ impl FillModel for SnapshotFillModel {
                 order.limit_price.0, quote.price.0
             )));
         }
-        let subtotal = quote.price.checked_mul(order.quantity)?;
-        let price = if fees.funding.enabled() {
-            quote.price
-        } else {
-            subtotal
+        let fee = match order.side {
+            OrderSide::Buy => fees.buyer_order_fee(quote.price, order.quantity)?,
+            OrderSide::Sell => fees.seller_order_fee(quote.price, order.quantity)?,
         };
-        let mut fee = match order.side {
-            OrderSide::Buy => fees.buyer_fee(price)?,
-            OrderSide::Sell => fees.seller_fee(price)?,
-        };
-        if fees.funding.enabled() {
-            fee = fee.checked_mul(order.quantity)?;
-        }
         Ok(FillOutcome::Filled(Fill {
             order: order.clone(),
             quantity: order.quantity,
@@ -205,6 +194,34 @@ mod tests {
             panic!("expected fill");
         };
         assert_eq!(sell.fee, Money(40)); // 2% of 2000
+    }
+
+    #[test]
+    fn funding_does_not_multiply_per_order_platform_fees() {
+        let model = SnapshotFillModel::default();
+        let mut fees = FEES;
+        fees.seller_fixed_fee = Money(7);
+        fees.funding.crypto_withdrawal.fixed = Money(3);
+        let quote = quote(1000);
+        let now = quote.observed_at;
+        let FillOutcome::Filled(buy) = model
+            .fill(&order(OrderSide::Buy, 1000, 2), &quote, fees, now)
+            .unwrap()
+        else {
+            panic!("expected buy");
+        };
+        let FillOutcome::Filled(sell) = model
+            .fill(&order(OrderSide::Sell, 1000, 2), &quote, fees, now)
+            .unwrap()
+        else {
+            panic!("expected sell");
+        };
+        assert_eq!(buy.fee, Money(25));
+        assert_eq!(sell.fee, Money(53));
+        assert_eq!(
+            model.seller_proceeds(Money(1000), 2, fees).unwrap(),
+            Money(1947)
+        );
     }
 
     #[test]

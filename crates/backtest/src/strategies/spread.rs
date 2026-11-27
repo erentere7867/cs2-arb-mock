@@ -67,11 +67,8 @@ impl StrategyAdapter for SpreadStrategy {
             for quote in &quotes {
                 let subtotal = quote.price.checked_mul(self.quantity)?;
                 let fees = view.fees.get(quote.platform);
-                let cost = if fees.funding.enabled() {
-                    fees.buyer_total(quote.price)?.checked_mul(self.quantity)?
-                } else {
-                    fees.buyer_total(subtotal)?
-                };
+                let cost =
+                    subtotal.checked_add(fees.buyer_order_fee(quote.price, self.quantity)?)?;
                 if best_buy.as_ref().is_none_or(|(_, c)| cost < *c) {
                     best_buy = Some((*quote, cost));
                 }

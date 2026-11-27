@@ -172,6 +172,42 @@ impl FeeSchedule {
             .checked_add(self.funding.bank_cashout.unit_fee(subtotal)?)
     }
 
+    pub fn buyer_order_fee(self, unit_price: Money, quantity: u32) -> Result<Money> {
+        self.validate()?;
+        fee(
+            unit_price.checked_mul(quantity)?,
+            self.buyer_fee_pct,
+            self.buyer_fixed_fee,
+        )?
+        .checked_add(
+            self.funding
+                .crypto_deposit
+                .unit_fee(unit_price)?
+                .checked_mul(quantity)?,
+        )
+    }
+
+    pub fn seller_order_fee(self, unit_price: Money, quantity: u32) -> Result<Money> {
+        self.validate()?;
+        fee(
+            unit_price.checked_mul(quantity)?,
+            self.seller_fee_pct,
+            self.seller_fixed_fee,
+        )?
+        .checked_add(
+            self.funding
+                .crypto_withdrawal
+                .unit_fee(unit_price)?
+                .checked_mul(quantity)?,
+        )?
+        .checked_add(
+            self.funding
+                .bank_cashout
+                .unit_fee(unit_price)?
+                .checked_mul(quantity)?,
+        )
+    }
+
     pub fn buyer_total(self, subtotal: Money) -> Result<Money> {
         subtotal.checked_add(self.buyer_fee(subtotal)?)
     }

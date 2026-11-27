@@ -237,6 +237,13 @@ fn validate_history_item(
     Ok(())
 }
 
+fn filter_history_events(game: Game, events: &mut Vec<MarketEvent>) {
+    events.retain(|event| match event {
+        MarketEvent::BranchUpdated { app_id, .. } => *app_id == game.app_id(),
+        MarketEvent::PanicWindowOpened { .. } | MarketEvent::PanicWindowClosed { .. } => true,
+    });
+}
+
 fn historical(game: Game, args: HistoricalArgs) -> Result<Inputs> {
     let bundled = args.snapshots.is_none();
     let snapshots = match args.snapshots {
@@ -254,16 +261,14 @@ fn historical(game: Game, args: HistoricalArgs) -> Result<Inputs> {
             snapshot.float_bucket.is_some(),
         )?;
     }
-    let events = match args.events {
+    let mut events = match args.events {
         Some(path) => fixtures::load_events(path)?,
         None if bundled && game == Game::Cs2 => {
             fixtures::load_events("data/fixtures/market_events.json")?
         }
         None => Vec::new(),
     };
-    if game == Game::Rust && events.iter().any(|event| matches!(event, MarketEvent::BranchUpdated { app_id, .. } if *app_id != game.app_id())) {
-        return Err(Error::InvalidData("branch update history is not for Rust".into()));
-    }
+    filter_history_events(game, &mut events);
     let mut depth = MarketDepth::from_snapshots(&snapshots);
     if let Some(path) = args.sales {
         let sales: Vec<cs2_arb_core::Sale> = serde_json::from_str(&read(&path)?)
@@ -470,6 +475,26 @@ mod tests {
         )
         .unwrap();
         assert!(report.strategy("spread").unwrap().trade_count > 0);
+    }
+
+    #[test]
+    fn historical_branch_events_are_filtered_for_both_games() {
+        let observed_at = chrono::DateTime::from_timestamp(1_740_000_000, 0).unwrap();
+        let branch = |game: Game| MarketEvent::BranchUpdated {
+            app_id: game.app_id(),
+            branch: "staging".into(),
+            change_number: 1,
+            observed_at,
+        };
+        let explicit = MarketEvent::PanicWindowOpened {
+            branch: "staging".into(),
+            opened_at: observed_at,
+        };
+        for game in [Game::Cs2, Game::Rust] {
+            let mut events = vec![branch(Game::Cs2), branch(Game::Rust), explicit.clone()];
+            filter_history_events(game, &mut events);
+            assert_eq!(events, [branch(game), explicit.clone()]);
+        }
     }
 
     #[test]

@@ -10,6 +10,7 @@ use cs2_arb_core::{
 use cs2_arb_sim::venues::VenueTradeHold;
 use cs2_arb_sim::{wear::quote_bucket, MockExecutor, SimConfig};
 use cs2_arb_strategy::executor::execute_with_risk;
+use cs2_arb_strategy::regime::MarketRegime;
 use cs2_arb_strategy::{
     evaluate_spread, evaluate_spread_with_holds, median_cents, spread_breakdown_with_hold,
     DipConfig, DipDetector, KillSwitch, RiskLimits, RiskManager, SpreadBreakdown, SpreadConfig,
@@ -520,6 +521,7 @@ impl StrategyAdapter for SpreadAdapter {
 pub struct DipAdapter {
     detector: DipDetector,
     liquidations: DipLiquidations,
+    market_regime: Option<Arc<MarketRegime>>,
 }
 
 impl DipAdapter {
@@ -529,7 +531,13 @@ impl DipAdapter {
         Ok(Self {
             detector,
             liquidations: DipLiquidations::default(),
+            market_regime: None,
         })
+    }
+
+    pub fn with_market_regime(mut self, regime: Arc<MarketRegime>) -> Self {
+        self.market_regime = Some(regime);
+        self
     }
 
     pub fn seed_daily_sale_prices(&mut self, sales: &[Sale], first_quote: DateTime<Utc>) {
@@ -569,6 +577,19 @@ impl DipAdapter {
 impl StrategyAdapter for DipAdapter {
     fn name(&self) -> &str {
         "dip"
+    }
+
+    fn delayed_execution_rejection(
+        &self,
+        order: &Order,
+        view: &MarketView<'_>,
+    ) -> Option<&'static str> {
+        (order.side == OrderSide::Buy
+            && self
+                .market_regime
+                .as_ref()
+                .is_some_and(|regime| !regime.at(view.now).allows(&order.item)))
+        .then_some("market regime blocks this delayed dip buy")
     }
 
     fn on_step(&mut self, view: &MarketView<'_>) -> Result<Vec<Order>> {
@@ -620,8 +641,15 @@ impl StrategyAdapter for DipAdapter {
                 orders.push(order);
             }
         }
+        let regime = self.market_regime.as_ref().map(|model| model.at(view.now));
         for quote in view.batch {
             if let Some(signal) = self.detector.observe(quote)? {
+                if regime
+                    .as_ref()
+                    .is_some_and(|state| !state.allows(&quote.item))
+                {
+                    continue;
+                }
                 let schedule = view.fees.get(quote.platform);
                 let (price, quantity) = view
                     .preview_fill(self.name(), &signal.order)

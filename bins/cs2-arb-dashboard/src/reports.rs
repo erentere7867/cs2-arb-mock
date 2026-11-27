@@ -293,6 +293,8 @@ _None_
 | Metric | Value |
 | --- | ---: |
 | Mock Bids Placed | 10 |
+| Market Regime | Risk-off: market downtrend |
+| Broad Index 24h | -3.00% |
 | Realized Buy-Order P&L | $12.99 |
 ";
         let s = parse_summary(report);
@@ -304,6 +306,8 @@ _None_
         assert_eq!(s[0].pnl.unrealized, Some(250));
         let metrics: BTreeMap<_, _> = parse_metrics(report, PEG).collect();
         assert_eq!(metrics["Mock Bids Placed"], ["10"]);
+        assert_eq!(metrics["Market Regime"], ["Risk-off: market downtrend"]);
+        assert_eq!(metrics["Broad Index 24h"], ["-3.00%"]);
         assert_eq!(metrics["Realized Buy-Order P&L"], ["$12.99"]);
     }
 }

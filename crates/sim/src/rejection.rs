@@ -29,6 +29,8 @@ pub enum Rejection {
         verified_sales: u32,
         window_days: u32,
     },
+    #[error("market regime blocks this passive buy")]
+    AdverseSelection,
 
     // --- Buy-side listing selection ---
     #[error("no visible listings for this item on this platform")]

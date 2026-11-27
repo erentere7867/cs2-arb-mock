@@ -11,6 +11,7 @@ use cs2_arb_core::{
 };
 use cs2_arb_sim::venues::{VenueAccounts, VenueBalance};
 use cs2_arb_sim::{BuyOrderFillConfig, BuyOrderFillSimulator};
+use cs2_arb_strategy::regime::{MarketRegime, RegimeState, RegimeStatus};
 use cs2_arb_strategy::{
     ActivePegBid, KillSwitch, PegBidConfig, PegBidPlacement, PegBidStrategy, RealizedRelistSale,
     RelistConfig, RelistEngine, RiskLimits, RiskManager,
@@ -40,6 +41,8 @@ pub struct LockedInventoryRow {
 #[derive(Debug, Clone, Serialize)]
 pub struct PegBidDashboard {
     pub as_of: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub market_regime: Option<RegimeState>,
     pub active_mock_bids: Vec<ActivePegBid>,
     pub locked_inventory: Vec<LockedInventoryRow>,
     pub ready_to_sell_count: usize,
@@ -105,6 +108,18 @@ impl PegBidDashboard {
         let _ = writeln!(out, "### Realized Buy-Order P&L\n");
         let _ = writeln!(out, "| Metric | Value |");
         let _ = writeln!(out, "| --- | ---: |");
+        if let Some(regime) = self.market_regime {
+            let _ = writeln!(out, "| Market Regime | {} |", regime.status.label());
+            for (label, change) in [
+                ("Broad Index 24h", regime.market.short_pct),
+                ("Broad Index 7d", regime.market.long_pct),
+                ("Case Index 24h", regime.cases.short_pct),
+                ("Case Index 7d", regime.cases.long_pct),
+            ] {
+                let value = change.map_or_else(|| "n/a".into(), |pct| format!("{pct:+.2}%"));
+                let _ = writeln!(out, "| {label} | {value} |");
+            }
+        }
         let _ = writeln!(out, "| Mock Bids Placed | {} |", self.bids_placed);
         let _ = writeln!(out, "| Passive Buy-Order Fills | {} |", self.bids_filled);
         let _ = writeln!(
@@ -245,6 +260,7 @@ pub fn run_peg_bid_engine(
     kill_switch: &KillSwitch,
     starting_cash: Option<Money>,
     accounts: Option<VenueAccounts>,
+    market_regime: Option<&MarketRegime>,
 ) -> Result<PegBidDashboard> {
     let resting_ttl = peg_config
         .resting_bid_ttl_secs
@@ -298,6 +314,8 @@ pub fn run_peg_bid_engine(
     let mut last_now = None;
     let mut latest_prices: HashMap<(Platform, ItemId, Option<FloatBucket>), Money> = HashMap::new();
     let mut accounted_fee_losses = Money(0);
+    let mut last_regime = market_regime.map(|_| RegimeState::default());
+    let mut last_status = None;
 
     while let Some(now) = times.pop_first() {
         let snapshot_tick = sorted_snapshots
@@ -334,6 +352,18 @@ pub fn run_peg_bid_engine(
 
         simulator.advance_venue_accounts(now)?;
         last_now = Some(now);
+        let regime = market_regime.map(|model| model.at(now));
+        let risk_on = regime
+            .as_ref()
+            .is_none_or(|regime| regime.state.status == RegimeStatus::RiskOn);
+        if let Some(regime) = &regime {
+            let status = regime.state.status;
+            if last_status != Some(status) && status == RegimeStatus::InsufficientHistory {
+                tracing::warn!("market regime is risk-off: insufficient comparable index history");
+            }
+            last_status = Some(status);
+            last_regime = Some(regime.state);
+        }
 
         if let Some(ttl) = resting_ttl {
             for id in simulator.expire_bids(now, ttl)? {
@@ -398,7 +428,11 @@ pub fn run_peg_bid_engine(
                 }
             }
             strategy.observe_sale(sale);
-            for report in simulator.process_transaction(sale, now) {
+            for report in simulator.process_transaction_with(sale, now, |order| {
+                regime
+                    .as_ref()
+                    .is_none_or(|state| state.allows(&order.item))
+            }) {
                 bids_filled += 1;
                 let unrealized = compute_unrealized_pnl(&simulator, &latest_prices);
                 let _ = risk.record_marked_fill(&report.fill, unrealized, Money(0))?;
@@ -450,10 +484,14 @@ pub fn run_peg_bid_engine(
         let unrealized = compute_unrealized_pnl(&simulator, &latest_prices);
         risk.set_unrealized_pnl(unrealized, now);
 
-        if !kill_switch.is_engaged()
+        if risk_on
+            && !kill_switch.is_engaged()
             && (snapshot_tick || !historical_bids.is_empty() || refresh_idx > refresh_start)
         {
             strategy.evaluate_with(&[], fees, now, |order, resting| {
+                if regime.as_ref().is_some_and(|state| !state.allows(&order.item)) {
+                    return Ok(PegBidPlacement::CancelResting);
+                }
                 let cost = fees
                     .get(order.platform)
                     .buyer_order_total(order.limit_price, order.quantity)?;
@@ -504,6 +542,9 @@ pub fn run_peg_bid_engine(
                 Ok(PegBidPlacement::Accepted)
             })?;
         }
+        if let Some(regime) = &regime {
+            strategy.retain_bids(|item| regime.allows(item));
+        }
         strategy.cancel_unprofitable_bids(fees, now)?;
         cancel_discarded_bids(&strategy, &mut simulator, now)?;
         account_bid_fee_losses(
@@ -538,6 +579,7 @@ pub fn run_peg_bid_engine(
 
     Ok(PegBidDashboard {
         as_of: last_now,
+        market_regime: last_regime,
         active_mock_bids,
         locked_inventory,
         ready_to_sell_count: relist.ready_to_sell().len(),
@@ -787,6 +829,7 @@ mod tests {
             &KillSwitch::new(),
             None,
             None,
+            None,
         )
         .unwrap();
 
@@ -857,6 +900,7 @@ mod tests {
             &KillSwitch::new(),
             Some(Money(50_000)),
             None,
+            None,
         )
         .unwrap();
         assert_eq!(mid_dashboard.bids_placed, 1);
@@ -909,6 +953,7 @@ mod tests {
             &KillSwitch::new(),
             Some(Money(50_000)),
             None,
+            None,
         )
         .unwrap();
 
@@ -929,6 +974,116 @@ mod tests {
         assert!(md.contains("Locked Inventory"));
         assert!(md.contains("Realized Buy-Order P&L"));
         assert!(md.contains("$12.99"));
+    }
+
+    #[test]
+    fn market_selloff_blocks_a_crossing_print_and_cancels_the_resting_bid() {
+        assert_crossing_print_blocked_and_bid_cancelled(9_000, RegimeStatus::MarketDowntrend);
+    }
+
+    #[test]
+    fn an_item_lagging_a_rising_market_cannot_fill_and_loses_its_resting_bid() {
+        assert_crossing_print_blocked_and_bid_cancelled(11_000, RegimeStatus::RiskOn);
+    }
+
+    fn assert_crossing_print_blocked_and_bid_cancelled(
+        market_price_at_fill: i64,
+        status: RegimeStatus,
+    ) {
+        use cs2_arb_strategy::regime::RegimeConfig;
+
+        let mut snapshots = Vec::new();
+        for (day, market_price) in [
+            (1, 10_000),
+            (2, 10_000),
+            (7, 10_000),
+            (8, 10_000),
+            (9, market_price_at_fill),
+        ] {
+            for (item, price) in [
+                (item(), 10_000),
+                (
+                    ItemId {
+                        market_hash_name: "Other One".into(),
+                        ..item()
+                    },
+                    market_price,
+                ),
+                (
+                    ItemId {
+                        market_hash_name: "Other Two".into(),
+                        ..item()
+                    },
+                    market_price,
+                ),
+            ] {
+                snapshots.push(PriceSnapshot {
+                    platform: Platform::CsFloat,
+                    item,
+                    float_bucket: None,
+                    price: Money(price),
+                    observed_at: t(day, 12),
+                });
+            }
+        }
+        let bids = [7, 8, 9].map(|day| BuyOrder {
+            platform: Platform::CsFloat,
+            item: item(),
+            float_bucket: None,
+            price: Money(8_500),
+            quantity: 1,
+            observed_at: t(day, 12),
+        });
+        let mut sales: Vec<_> = (0..20)
+            .map(|i| Sale {
+                id: format!("liquidity-{i}"),
+                platform: Platform::CsFloat,
+                item: item(),
+                price: Money(10_000),
+                float_value: Some(0.20),
+                sold_at: t(6, 12) + Duration::hours(i),
+                verified: true,
+            })
+            .collect();
+        sales.push(Sale {
+            id: "crossing".into(),
+            sold_at: t(9, 12),
+            price: Money(8_400),
+            ..sales[0].clone()
+        });
+        let run = |regime| {
+            run_peg_bid_engine(
+                &snapshots,
+                &sales,
+                &bids,
+                &[],
+                &fees(),
+                PegBidConfig {
+                    max_order_age_secs: None,
+                    min_median_samples: 1,
+                    ..PegBidConfig::default()
+                },
+                RelistConfig::default(),
+                RiskLimits::default(),
+                &KillSwitch::new(),
+                Some(Money(50_000)),
+                None,
+                regime,
+            )
+            .unwrap()
+        };
+        let regime = MarketRegime::new(RegimeConfig::default(), &snapshots, &sales).unwrap();
+        let unguarded = run(None);
+        assert_eq!(unguarded.bids_filled, 1);
+        let guarded = run(Some(&regime));
+        assert_eq!(guarded.bids_placed, 1);
+        assert_eq!(guarded.bids_filled, 0);
+        assert!(guarded.active_mock_bids.is_empty());
+        assert_eq!(guarded.cash_balance, Some(Money(50_000)));
+        let index_return = (market_price_at_fill - 10_000) as f64 / 100.0;
+        let markdown = guarded.to_markdown();
+        assert!(markdown.contains(&format!("| Market Regime | {} |", status.label())));
+        assert!(markdown.contains(&format!("| Broad Index 24h | {index_return:+.2}% |")));
     }
 
     #[test]
@@ -980,6 +1135,7 @@ mod tests {
             RiskLimits::default(),
             &KillSwitch::new(),
             Some(Money(50_000)),
+            None,
             None,
         )
         .unwrap();
@@ -1044,6 +1200,7 @@ mod tests {
             },
             &KillSwitch::new(),
             Some(Money(50_000)),
+            None,
             None,
         )
         .unwrap();
@@ -1137,6 +1294,7 @@ mod tests {
             &KillSwitch::new(),
             Some(Money(50_000)),
             None,
+            None,
         )
         .unwrap();
         assert_eq!(dashboard.bids_placed, 2);
@@ -1207,6 +1365,7 @@ mod tests {
             RiskLimits::default(),
             &KillSwitch::new(),
             Some(Money(50_000)),
+            None,
             None,
         )
         .unwrap();

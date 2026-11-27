@@ -337,6 +337,16 @@ impl BuyOrderFillSimulator {
     /// Also records `sale` into the liquidity tape. Returns any fills triggered
     /// by this transaction.
     pub fn process_transaction(&mut self, sale: &Sale, now: DateTime<Utc>) -> Vec<ExecutionReport> {
+        self.process_transaction_with(sale, now, |_| true)
+    }
+
+    /// Record the print, but refuse a matching fill unless the entry guard allows it.
+    pub fn process_transaction_with(
+        &mut self,
+        sale: &Sale,
+        now: DateTime<Utc>,
+        mut allow_entry: impl FnMut(&Order) -> bool,
+    ) -> Vec<ExecutionReport> {
         self.record_sales([sale.clone()]);
 
         if sale.sold_at > now {
@@ -396,6 +406,14 @@ impl BuyOrderFillSimulator {
                 )
             };
 
+            if !allow_entry(&order) {
+                self.rejections.push(RejectionRecord {
+                    order_id: order.id.clone(),
+                    rejected_at: sale.sold_at,
+                    rejection: Rejection::AdverseSelection,
+                });
+                continue;
+            }
             let _ = placed_at;
             let is_price_tie = sale.price == order.limit_price;
             if is_price_tie {
@@ -762,6 +780,32 @@ mod tests {
             )
         });
         sim.record_sales(sales);
+    }
+
+    #[test]
+    fn entry_guard_rejects_a_crossing_print_without_filling_or_spending() {
+        let now = t(10, 12, 0);
+        let config = BuyOrderFillConfig {
+            starting_cash: Some(Money(20_000)),
+            ..BuyOrderFillConfig::default()
+        };
+        let mut sim = BuyOrderFillSimulator::new(SimulationMode, config, &fees(), 42).unwrap();
+        seed_liquidity(&mut sim, 15, now);
+        sim.place_bid(bid_order("guarded", 8_500, now), now)
+            .unwrap();
+        let crossing = t(10, 12, 5);
+        let sale = make_sale("blocked", 8_400, crossing, true);
+        assert!(sim
+            .process_transaction_with(&sale, crossing, |_| false)
+            .is_empty());
+        assert_eq!(sim.rejections()[0].rejection, Rejection::AdverseSelection);
+        assert_eq!(sim.cash(), Some(Money(20_000)));
+        let later = t(10, 12, 10);
+        let sale = make_sale("allowed", 8_400, later, true);
+        assert_eq!(
+            sim.process_transaction_with(&sale, later, |_| true).len(),
+            1
+        );
     }
 
     #[test]

@@ -15,6 +15,7 @@ pub mod dip;
 pub mod executor;
 pub mod kill_switch;
 pub mod peg_bid;
+pub mod regime;
 pub mod relist;
 pub mod risk;
 

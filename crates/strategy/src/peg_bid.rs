@@ -558,6 +558,10 @@ impl PegBidStrategy {
         Ok(orders)
     }
 
+    pub fn retain_bids(&mut self, mut keep: impl FnMut(&ItemId) -> bool) {
+        self.active_bids.retain(|_, bid| keep(&bid.order.item));
+    }
+
     /// Remove an active bid after it has been filled in the simulator.
     pub fn mark_filled(&mut self, order_id: &str) -> Option<ActivePegBid> {
         let key = self

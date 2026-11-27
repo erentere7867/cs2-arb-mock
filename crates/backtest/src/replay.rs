@@ -868,6 +868,7 @@ fn stats(
 
 /// The built-in strategy set used by [`replay`]: spread then dip, default parameters.
 pub fn default_strategies() -> Vec<Box<dyn StrategyAdapter>> {
+    tracing::warn!("default replay has no sales tape; dip cannot open trades");
     vec![
         Box::new(SpreadStrategy::default()),
         Box::new(DipStrategy::default()),
@@ -1992,6 +1993,37 @@ mod tests {
         assert_eq!(report.totals.win_rate, None);
         assert_eq!(report.strategies.len(), 2);
         assert!(report.to_markdown().contains("No closed trades."));
+    }
+
+    #[test]
+    fn default_replay_warns_when_there_is_no_dip_sales_tape() {
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone, Default)]
+        struct Output(Arc<Mutex<Vec<u8>>>);
+
+        impl std::io::Write for Output {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let output = Output::default();
+        let writer = output.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            replay(SimulationMode, &daily(1, |_, _| 1000), &[], fees()).unwrap();
+        });
+        assert!(String::from_utf8_lossy(&output.0.lock().unwrap())
+            .contains("default replay has no sales tape; dip cannot open trades"));
     }
 
     #[test]

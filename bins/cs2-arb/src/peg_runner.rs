@@ -285,7 +285,9 @@ pub fn run_peg_bid_engine(
             for report in simulator.process_transaction(sale, now) {
                 bids_filled += 1;
                 let _ = risk.record_fill(&report.fill)?;
-                strategy.mark_filled(&report.fill.order.id);
+                if simulator.is_order_filled(&report.fill.order.id) {
+                    strategy.mark_filled(&report.fill.order.id);
+                }
                 if let Some(pos) = report.position {
                     relist.track_position(pos, report.fill.filled_at);
                 }

@@ -184,6 +184,11 @@ impl BuyOrderFillSimulator {
             .collect()
     }
 
+    /// Whether a passive buy order has been completely filled (no remaining units).
+    pub fn is_order_filled(&self, order_id: &str) -> bool {
+        self.filled_order_ids.contains(order_id)
+    }
+
     /// All recorded historical/live sales known to the simulator.
     pub fn sales_tape(&self) -> &[Sale] {
         &self.sales_tape

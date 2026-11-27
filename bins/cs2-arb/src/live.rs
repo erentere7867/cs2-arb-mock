@@ -60,6 +60,7 @@ fn make_clients(
     platforms: Vec<Platform>,
     game: Game,
     instant_sale: bool,
+    waxpeer_api_key: Option<String>,
 ) -> Result<MarketClients> {
     let net = NetConfig::from_toml(source)?;
     let gate: Arc<dyn RequestGate> = Arc::new(NetGate(Arc::new(build_limiter(&net, &platforms)?)));
@@ -86,7 +87,7 @@ fn make_clients(
             Platform::Waxpeer => {
                 let mut client = WaxpeerClient::new(schedule, game, gate.clone(), clock.clone())?;
                 if instant_sale {
-                    client = client.with_detailed_buy_orders(std::env::var("WAXPEER_API_KEY").ok());
+                    client = client.with_detailed_buy_orders(waxpeer_api_key.clone());
                 }
                 Box::new(ResilientMarket::new(client, net.retry))
             }
@@ -168,7 +169,11 @@ pub async fn collect(
         .map(|quote| quote.item)
         .filter(|item| seen.insert(item.clone()))
         .collect();
-    let clients = make_clients(config, fees, platforms, game, instant_sale)?;
+    let waxpeer_api_key = instant_sale
+        .then(|| std::env::var("WAXPEER_API_KEY").ok())
+        .flatten();
+    let waxpeer_has_key = waxpeer_api_key.is_some();
+    let clients = make_clients(config, fees, platforms, game, instant_sale, waxpeer_api_key)?;
     let mut events = Vec::new();
     let queue = if let Some((database, hours)) = branch_updates {
         let queue = EventQueue::open(database).await?;
@@ -211,11 +216,7 @@ pub async fn collect(
                         tracing::warn!(?platform, %error, "read-only sales request skipped")
                     }
                 }
-                if matches!(
-                    platform,
-                    Platform::CsFloat | Platform::Skinport | Platform::Waxpeer
-                ) || (instant_sale && *platform == Platform::DMarket)
-                {
+                if polls_bids(*platform, instant_sale, waxpeer_has_key) {
                     match client.top_buy_orders(item).await {
                         Ok(orders) if instant_sale && orders.is_empty() => {
                             empty_bid_refreshes.push((Utc::now(), *platform, item.clone()));
@@ -272,6 +273,15 @@ pub async fn collect(
     })
 }
 
+fn polls_bids(platform: Platform, instant_sale: bool, waxpeer_has_key: bool) -> bool {
+    match platform {
+        Platform::CsFloat => true,
+        Platform::DMarket => instant_sale,
+        Platform::Waxpeer => !instant_sale || waxpeer_has_key,
+        Platform::Skinport => false,
+    }
+}
+
 fn quotable(listing: &Listing, at: DateTime<Utc>, max_age: TimeDelta) -> bool {
     listing.price.0 > 0
         && listing.quantity > 0
@@ -281,6 +291,14 @@ fn quotable(listing: &Listing, at: DateTime<Utc>, max_age: TimeDelta) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn unsupported_bid_polls_do_not_create_refreshes() {
+        assert!(!polls_bids(Platform::Skinport, true, true));
+        assert!(!polls_bids(Platform::Waxpeer, true, false));
+        assert!(polls_bids(Platform::Waxpeer, true, true));
+        assert!(polls_bids(Platform::Waxpeer, false, false));
+        assert!(polls_bids(Platform::DMarket, true, false));
+    }
     use super::*;
 
     #[test]

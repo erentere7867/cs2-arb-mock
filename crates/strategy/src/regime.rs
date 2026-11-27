@@ -69,6 +69,7 @@ pub struct MarketRegime {
 }
 
 type PriceHistory = Vec<(DateTime<Utc>, i64)>;
+type BucketReturns = HashMap<Option<FloatBucket>, [Vec<f64>; 2]>;
 
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
 enum PriceSource {
@@ -157,15 +158,36 @@ impl MarketRegime {
         let mut short_returns = HashMap::new();
         let anchors = [1, 7].map(|days| now.checked_sub_signed(Duration::days(days)));
         for (item, sources) in &self.prices {
-            let mut changes = [Vec::new(), Vec::new()];
-            for series in sources.values() {
+            let mut venues: HashMap<Platform, BucketReturns> = HashMap::new();
+            for (source, series) in sources {
+                let (platform, bucket) = match *source {
+                    PriceSource::Snapshot(platform, bucket)
+                    | PriceSource::VerifiedSale(platform, bucket) => (platform, bucket),
+                };
                 let Some(current) = price_at(series, now, age) else {
                     continue;
                 };
                 for (i, anchor) in anchors.iter().enumerate() {
                     if let Some(prior) = anchor.and_then(|anchor| price_at(series, anchor, age)) {
-                        changes[i].push((current - prior) * 100.0 / prior);
+                        venues
+                            .entry(platform)
+                            .or_default()
+                            .entry(bucket)
+                            .or_default()[i]
+                            .push((current - prior) * 100.0 / prior);
                     }
+                }
+            }
+            let mut changes = [Vec::new(), Vec::new()];
+            for buckets in venues.into_values() {
+                let mut bucket_changes = [Vec::new(), Vec::new()];
+                for sources in buckets.into_values() {
+                    for (i, returns) in sources.into_iter().enumerate() {
+                        bucket_changes[i].extend(index_median(returns, 1));
+                    }
+                }
+                for (i, returns) in bucket_changes.into_iter().enumerate() {
+                    changes[i].extend(index_median(returns, 1));
                 }
             }
             for (i, changes) in changes.into_iter().enumerate() {
@@ -421,6 +443,45 @@ mod tests {
                         verified: true,
                     });
                 }
+            }
+        }
+        let regime = MarketRegime::new(
+            RegimeConfig {
+                min_index_items: 1,
+                ..RegimeConfig::default()
+            },
+            &[],
+            &sales,
+        )
+        .unwrap();
+        let state = regime.at(now()).state;
+        assert_eq!(state.market.short_pct, Some(0.0));
+        assert_eq!(state.market.long_pct, Some(0.0));
+        assert_eq!(state.status, RegimeStatus::RiskOn);
+    }
+
+    #[test]
+    fn extra_float_buckets_do_not_give_a_venue_more_weight() {
+        let mut sales = Vec::new();
+        for (platform, float_value, current) in [
+            (Platform::CsFloat, 0.18, 92),
+            (Platform::CsFloat, 0.30, 92),
+            (Platform::DMarket, 0.18, 100),
+            (Platform::Waxpeer, 0.18, 100),
+        ] {
+            for (days, price) in [(7, 100), (1, 100), (0, current)] {
+                sales.push(Sale {
+                    id: format!("{days}-{float_value}"),
+                    platform,
+                    item: ItemId {
+                        wear_tier: WearTier::FieldTested,
+                        ..item("One")
+                    },
+                    price: Money(price),
+                    float_value: Some(float_value),
+                    sold_at: now() - Duration::days(days),
+                    verified: true,
+                });
             }
         }
         let regime = MarketRegime::new(

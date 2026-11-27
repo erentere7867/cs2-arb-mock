@@ -13,3 +13,8 @@ Regenerate both files from the workspace root:
 ```sh
 python3 data/fixtures/generate.py
 ```
+
+`rust_price_snapshots.json` is a separate 16-day synthetic Skinport/DMarket
+scenario for Alien Red, with no exterior or float bucket. It has no bundled
+update events. The CLI models the same synthetic sales tape for each bundled
+scenario; it does not synthesize sales for custom snapshot files.

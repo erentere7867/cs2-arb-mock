@@ -1,7 +1,7 @@
 //! Normalization helpers: source prices to [`Money`] (USD cents), floats and market hash
 //! names to [`WearTier`], and RFC 3986 percent-encoding.
 
-use cs2_arb_core::{Error, ItemId, Money, Result, WearTier};
+use cs2_arb_core::{Error, Game, ItemId, Money, Result, WearTier};
 
 /// Largest accepted price, in cents (USD 10 billion). Anything larger is treated as bad data.
 const MAX_CENTS: i64 = 1_000_000_000_000;
@@ -102,6 +102,21 @@ pub fn validate_item(item: &ItemId) -> Result<()> {
         ))),
         _ => Ok(()),
     }
+}
+
+pub(crate) fn validate_item_for_game(item: &ItemId, game: Game) -> Result<()> {
+    if !game.supports_wear(item.wear_tier) {
+        return Err(Error::InvalidData(format!(
+            "incompatible wear tier for {game:?}"
+        )));
+    }
+    if game == Game::Cs2 {
+        return validate_item(item);
+    }
+    if item.market_hash_name.trim().is_empty() {
+        return Err(Error::InvalidData("empty market hash name".into()));
+    }
+    Ok(())
 }
 
 /// Whether an observed float (if any) falls in the item's wear tier.

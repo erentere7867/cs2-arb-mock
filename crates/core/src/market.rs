@@ -14,7 +14,7 @@ pub enum Platform {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ItemId {
-    /// Canonical Steam market hash name, including variant and exterior.
+    /// Canonical Steam market hash name, including variant and exterior where applicable.
     pub market_hash_name: String,
     pub wear_tier: WearTier,
 }
@@ -27,18 +27,20 @@ pub enum WearTier {
     FieldTested,
     WellWorn,
     BattleScarred,
+    NotApplicable,
 }
 
 impl WearTier {
     /// Canonical wear intervals are lower-inclusive and upper-exclusive, except 1.0 is valid.
-    pub const fn float_bounds(self) -> (f64, f64) {
-        match self {
+    pub const fn float_bounds(self) -> Option<(f64, f64)> {
+        Some(match self {
             Self::FactoryNew => (0.0, 0.07),
             Self::MinimalWear => (0.07, 0.15),
             Self::FieldTested => (0.15, 0.38),
             Self::WellWorn => (0.38, 0.45),
             Self::BattleScarred => (0.45, 1.0),
-        }
+            Self::NotApplicable => return None,
+        })
     }
 
     pub fn from_float(value: f64) -> Option<Self> {
@@ -78,7 +80,8 @@ impl FloatBucket {
             Self::FieldTestedHigh => (0.25, 0.38),
             Self::BattleScarredLow => (0.45, 0.65),
             Self::BattleScarredHigh => (0.65, 1.0),
-            _ => self.wear_tier().float_bounds(),
+            Self::MinimalWear => (0.07, 0.15),
+            Self::WellWorn => (0.38, 0.45),
         }
     }
 

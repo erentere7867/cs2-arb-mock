@@ -17,7 +17,7 @@ use cs2_arb_strategy::{
 };
 use serde::Serialize;
 
-pub type EmptyBidRefresh = (DateTime<Utc>, Platform, ItemId);
+pub type BidRefresh = (DateTime<Utc>, Platform, ItemId, Vec<BuyOrder>);
 
 /// One trade-locked inventory entry displayed on the dashboard.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -237,7 +237,7 @@ pub fn run_peg_bid_engine(
     snapshots: &[PriceSnapshot],
     sales: &[Sale],
     buy_orders: &[BuyOrder],
-    empty_bid_refreshes: &[EmptyBidRefresh],
+    bid_refreshes: &[BidRefresh],
     fees: &FeeSchedules,
     peg_config: PegBidConfig,
     relist_config: RelistConfig,
@@ -279,20 +279,20 @@ pub fn run_peg_bid_engine(
 
     let mut sorted_bids = buy_orders.to_vec();
     sorted_bids.sort_by_key(|b| b.observed_at);
-    let mut empty_bid_refreshes = empty_bid_refreshes.to_vec();
-    empty_bid_refreshes.sort_by_key(|&(at, _, _)| at);
+    let mut bid_refreshes: Vec<_> = bid_refreshes.iter().collect();
+    bid_refreshes.sort_by_key(|(at, ..)| *at);
 
     let mut times: BTreeSet<DateTime<Utc>> = BTreeSet::new();
     times.extend(sorted_snapshots.iter().map(|s| s.observed_at));
     times.extend(sorted_sales.iter().map(|s| s.sold_at));
     times.extend(sorted_bids.iter().map(|b| b.observed_at));
-    times.extend(empty_bid_refreshes.iter().map(|&(at, _, _)| at));
+    times.extend(bid_refreshes.iter().map(|(at, ..)| *at));
     let replay_end = times.last().copied();
 
     let mut snap_idx = 0usize;
     let mut sale_idx = 0usize;
     let mut bid_idx = 0usize;
-    let mut empty_bid_idx = 0usize;
+    let mut refresh_idx = 0usize;
     let mut bids_placed = 0usize;
     let mut bids_filled = 0usize;
     let mut last_now = None;
@@ -307,9 +307,9 @@ pub fn run_peg_bid_engine(
             || sorted_bids
                 .get(bid_idx)
                 .is_some_and(|b| b.observed_at == now)
-            || empty_bid_refreshes
-                .get(empty_bid_idx)
-                .is_some_and(|&(at, _, _)| at == now);
+            || bid_refreshes
+                .get(refresh_idx)
+                .is_some_and(|(at, ..)| *at == now);
         if !market_tick
             && !resting_ttl.is_some_and(|ttl| {
                 simulator
@@ -397,12 +397,13 @@ pub fn run_peg_bid_engine(
             bid_idx += 1;
         }
         relist.observe_bids(&sorted_bids[bid_start..bid_idx]);
-        while let Some((_, platform, item)) = empty_bid_refreshes
-            .get(empty_bid_idx)
-            .filter(|(at, _, _)| *at == now)
+        let refresh_start = refresh_idx;
+        while let Some((_, platform, item, bids)) =
+            bid_refreshes.get(refresh_idx).filter(|(at, ..)| *at == now)
         {
-            relist.clear_bid_book(*platform, item);
-            empty_bid_idx += 1;
+            relist.replace_bid_book(*platform, item, bids);
+            strategy.replace_buy_orders(*platform, item, bids, now);
+            refresh_idx += 1;
         }
         let relist_step = relist.step(
             &sorted_sales[..sale_idx],
@@ -436,9 +437,14 @@ pub fn run_peg_bid_engine(
         let unrealized = compute_unrealized_pnl(&simulator, &latest_prices);
         risk.set_unrealized_pnl(unrealized, now);
 
-        if !kill_switch.is_engaged() && bid_start < bid_idx {
-            let batch = &sorted_bids[bid_start..bid_idx];
-            let orders = strategy.evaluate(batch, fees, now)?;
+        let historical_bids = &sorted_bids[bid_start..bid_idx];
+        let refreshed_bids = bid_refreshes[refresh_start..refresh_idx]
+            .iter()
+            .flat_map(|(_, _, _, bids)| bids);
+        if !kill_switch.is_engaged()
+            && (!historical_bids.is_empty() || refreshed_bids.clone().next().is_some())
+        {
+            let orders = strategy.evaluate(historical_bids, fees, now)?;
             for order in orders {
                 let cost = fees
                     .get(order.platform)
@@ -480,7 +486,7 @@ pub fn run_peg_bid_engine(
                 .into_iter()
                 .map(|b| (b.order.platform, b.order.item.clone(), b.order.float_bucket))
                 .collect();
-            for obs in batch {
+            for obs in historical_bids.iter().chain(refreshed_bids) {
                 let key = (obs.platform, obs.item.clone(), obs.float_bucket);
                 if !active_keys.contains(&key) {
                     simulator.cancel_bids_for_item(

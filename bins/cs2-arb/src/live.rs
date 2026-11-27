@@ -191,7 +191,7 @@ pub async fn collect(
     };
     let mut snapshots = Vec::new();
     let mut buy_orders = Vec::new();
-    let mut empty_bid_refreshes = Vec::new();
+    let mut bid_refreshes = Vec::new();
     let mut depth = MarketDepth::default();
     for sample in 0..samples {
         if sample > 0 {
@@ -218,8 +218,8 @@ pub async fn collect(
                 }
                 if polls_bids(*platform, instant_sale, waxpeer_has_key) {
                     match client.top_buy_orders(item).await {
-                        Ok(orders) if instant_sale && orders.is_empty() => {
-                            empty_bid_refreshes.push((Utc::now(), *platform, item.clone()));
+                        Ok(orders) if instant_sale => {
+                            bid_refreshes.push((Utc::now(), *platform, item.clone(), orders));
                         }
                         Ok(orders) => buy_orders.extend(orders),
                         Err(error) => {
@@ -268,7 +268,7 @@ pub async fn collect(
         events,
         depth,
         buy_orders,
-        empty_bid_refreshes,
+        bid_refreshes,
         has_observed_bids: true,
     })
 }

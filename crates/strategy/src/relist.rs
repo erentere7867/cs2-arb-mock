@@ -223,9 +223,20 @@ impl RelistEngine {
         }
     }
 
-    pub fn clear_bid_book(&mut self, platform: Platform, item: &ItemId) {
+    pub fn replace_bid_book(&mut self, platform: Platform, item: &ItemId, bids: &[BuyOrder]) {
+        if !self.config.instant_sale || platform == Platform::Skinport {
+            return;
+        }
         self.bids
             .retain(|(venue, bid_item, _), _| *venue != platform || bid_item != item);
+        for bid in bids.iter().filter(|bid| {
+            bid.platform == platform && &bid.item == item && bid.price.0 > 0 && bid.quantity > 0
+        }) {
+            self.bids
+                .entry((platform, item.clone(), bid.float_bucket))
+                .or_default()
+                .push(bid.clone());
+        }
     }
 
     fn time_adjusted(&self, platform: Platform, net: Money, wait: i64) -> i128 {
@@ -873,12 +884,53 @@ mod tests {
             quantity: 1,
             observed_at: now - Duration::seconds(1),
         }]);
-        engine.clear_bid_book(Platform::CsFloat, &item());
+        engine.replace_bid_book(Platform::CsFloat, &item(), &[]);
         let step = engine
             .step(&make_sales(20, 10_000, now), &[], &fees(), now)
             .unwrap();
         assert!(step.realized_sales.is_empty());
         assert_eq!(step.listed_orders.len(), 1);
+    }
+
+    #[test]
+    fn bid_refresh_preserves_distinct_page_ages() {
+        let acquired = t(1, 12);
+        let now = t(8, 12);
+        for (first_page_age, expected) in [(1, Money(13_000)), (3, Money(12_000))] {
+            let mut engine = RelistEngine::new(RelistConfig {
+                instant_sale: true,
+                maximum_bid_age_seconds: 2,
+                ..RelistConfig::default()
+            })
+            .unwrap();
+            engine.track_position(make_position(acquired), acquired);
+            engine.replace_bid_book(
+                Platform::CsFloat,
+                &item(),
+                &[
+                    BuyOrder {
+                        platform: Platform::CsFloat,
+                        item: item(),
+                        float_bucket: None,
+                        price: Money(13_000),
+                        quantity: 1,
+                        observed_at: now - Duration::seconds(first_page_age),
+                    },
+                    BuyOrder {
+                        platform: Platform::CsFloat,
+                        item: item(),
+                        float_bucket: None,
+                        price: Money(12_000),
+                        quantity: 1,
+                        observed_at: now,
+                    },
+                ],
+            );
+            let step = engine
+                .step(&make_sales(20, 10_000, now), &[], &fees(), now)
+                .unwrap();
+            assert_eq!(step.realized_sales[0].ask_price, expected);
+        }
     }
 
     #[test]

@@ -14,7 +14,9 @@ async fn detailed_bids_page_past_filtered_depth_on_get() {
     let server = MockServer::start().await;
     let clock = clock();
     let filtered = json!({"name":"Alien Red","game":"rust","price":14000,"amount":1,"filled":0,"filters":{"float_min":0.1},"by":"filtered"});
-    let first_page: Vec<_> = std::iter::repeat_n(filtered, 100).collect();
+    let first_page: Vec<_> = std::iter::once(
+        json!({"name":"Alien Red","game":"rust","price":13000,"amount":1,"filled":0,"by":"earlier"}),
+    ).chain(std::iter::repeat_n(filtered, 99)).collect();
     for (skip, rows) in [
         ("0", first_page),
         (
@@ -48,10 +50,12 @@ async fn detailed_bids_page_past_filtered_depth_on_get() {
         wear_tier: WearTier::NotApplicable,
     };
     let bids = client.top_buy_orders(&item).await.unwrap();
-    assert_eq!(bids.len(), 1);
-    assert_eq!(bids[0].price, Money(1250));
-    assert_eq!(bids[0].quantity, 1);
-    assert_eq!(bids[0].observed_at, t0() + chrono::TimeDelta::seconds(6));
+    assert_eq!(bids.len(), 2);
+    assert_eq!(bids[0].price, Money(1300));
+    assert_eq!(bids[0].observed_at, t0() + chrono::TimeDelta::seconds(3));
+    assert_eq!(bids[1].price, Money(1250));
+    assert_eq!(bids[1].quantity, 1);
+    assert_eq!(bids[1].observed_at, t0() + chrono::TimeDelta::seconds(6));
 }
 
 #[tokio::test]

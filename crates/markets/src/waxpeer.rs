@@ -36,12 +36,14 @@ const DETAILED_BUY_ORDERS: Endpoint = Endpoint {
 const BID_PAGE_SIZE: usize = 100;
 const MAX_BID_OWNERS: u32 = 100;
 const MAX_BID_PAGES: usize = 3;
+type BidOwners = HashMap<String, (Money, DateTime<Utc>)>;
 
 fn add_detailed_bid_page(
     body: &[u8],
     item: &ItemId,
     game: &str,
-    owners: &mut HashMap<String, Money>,
+    owners: &mut BidOwners,
+    observed_at: DateTime<Utc>,
 ) -> Result<usize> {
     #[derive(Deserialize)]
     struct Response {
@@ -79,27 +81,27 @@ fn add_detailed_bid_page(
         if price.0 > 0 {
             owners
                 .entry(bid.by)
-                .and_modify(|old| *old = (*old).max(price))
-                .or_insert(price);
+                .and_modify(|old| {
+                    if price > old.0 {
+                        *old = (price, observed_at);
+                    }
+                })
+                .or_insert((price, observed_at));
         }
     }
     Ok(count)
 }
 
-fn detailed_depth(
-    owners: HashMap<String, Money>,
-    item: &ItemId,
-    at: DateTime<Utc>,
-) -> Vec<BuyOrder> {
-    let mut depth = BTreeMap::<Money, u32>::new();
-    for price in owners.into_values() {
-        *depth.entry(price).or_default() += 1;
+fn detailed_depth(owners: BidOwners, item: &ItemId) -> Vec<BuyOrder> {
+    let mut depth = BTreeMap::<(Money, std::cmp::Reverse<DateTime<Utc>>), u32>::new();
+    for (price, at) in owners.into_values() {
+        *depth.entry((price, std::cmp::Reverse(at))).or_default() += 1;
     }
     let mut remaining = MAX_BID_OWNERS;
     depth
         .into_iter()
         .rev()
-        .map_while(|(price, quantity)| {
+        .map_while(|((price, std::cmp::Reverse(at)), quantity)| {
             let quantity = remaining.min(quantity);
             remaining -= quantity;
             (quantity > 0).then(|| BuyOrder {
@@ -335,7 +337,6 @@ impl MarketClient for WaxpeerClient {
             };
             let game = self.game_code();
             let mut owners = HashMap::new();
-            let mut observed_at = None;
             for page in 0..MAX_BID_PAGES {
                 let skip = (page * BID_PAGE_SIZE).to_string();
                 let query = query_string(&[
@@ -349,13 +350,13 @@ impl MarketClient for WaxpeerClient {
                     .http
                     .get(&DETAILED_BUY_ORDERS, &path, HeaderMap::new())
                     .await?;
-                observed_at = Some(self.http.clock().now());
-                let rows = add_detailed_bid_page(&body, item, game, &mut owners)?;
+                let rows =
+                    add_detailed_bid_page(&body, item, game, &mut owners, self.http.clock().now())?;
                 if rows < BID_PAGE_SIZE || owners.len() >= MAX_BID_OWNERS as usize {
                     break;
                 }
             }
-            return Ok(observed_at.map_or_else(Vec::new, |at| detailed_depth(owners, item, at)));
+            return Ok(detailed_depth(owners, item));
         }
         let bids = self.fetch(&BUY_ORDERS, &self.bids, parse_bids).await?;
         Ok(bids
@@ -392,11 +393,14 @@ mod tests {
             .map(|index| {
                 (
                     index.to_string(),
-                    Money(if index < 60 { 1200 } else { 1100 }),
+                    (
+                        Money(if index < 60 { 1200 } else { 1100 }),
+                        DateTime::<Utc>::UNIX_EPOCH,
+                    ),
                 )
             })
             .collect();
-        let bids = detailed_depth(owners, &item, DateTime::<Utc>::UNIX_EPOCH);
+        let bids = detailed_depth(owners, &item);
         assert_eq!(
             bids.iter()
                 .map(|bid| (bid.price, bid.quantity))
@@ -419,10 +423,17 @@ mod tests {
         ]}"#;
         let mut owners = HashMap::new();
         assert_eq!(
-            add_detailed_bid_page(body, &item, "rust", &mut owners).unwrap(),
+            add_detailed_bid_page(
+                body,
+                &item,
+                "rust",
+                &mut owners,
+                DateTime::<Utc>::UNIX_EPOCH
+            )
+            .unwrap(),
             4
         );
-        let bids = detailed_depth(owners, &item, DateTime::<Utc>::UNIX_EPOCH);
+        let bids = detailed_depth(owners, &item);
         assert_eq!(bids.len(), 1);
         assert_eq!(bids[0].quantity, 2);
         assert_eq!(bids[0].price, Money(1234));

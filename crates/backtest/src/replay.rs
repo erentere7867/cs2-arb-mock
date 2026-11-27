@@ -135,6 +135,10 @@ pub struct MarketView<'a> {
 }
 
 impl<'a> MarketView<'a> {
+    pub fn uses_venue_holds(&self) -> bool {
+        self.fill_model.uses_venue_holds()
+    }
+
     pub fn available_cash(&self, strategy: &str, platform: Platform) -> Option<Money> {
         self.fill_model.available_cash(strategy, platform)
     }
@@ -1199,6 +1203,58 @@ mod tests {
         assert_eq!(report.trades[0].closed_at, t(8));
         assert_eq!(report.trades[0].quantity, 1);
         assert_eq!(report.trades[0].net_pnl, Money(95));
+    }
+
+    #[test]
+    fn spread_exits_at_venue_unlock_even_before_strategy_hold() {
+        use crate::integrated::{SimFillModel, SpreadAdapter};
+        use cs2_arb_sim::venues::{VenueAccounts, VenueAccountsConfig, VenueConfig};
+        use cs2_arb_strategy::{KillSwitch, RiskLimits, SpreadConfig};
+
+        let rows = [
+            (snap(Platform::CsFloat, 0, 1000), 1, 70),
+            (snap(Platform::DMarket, 0, 1400), 1, 70),
+            (snap(Platform::DMarket, 1, 1400), 1, 70),
+        ];
+        let depth = depth_with_snapshots(&rows);
+        let snapshots = rows.map(|(quote, _, _)| quote);
+        let accounts = VenueAccounts::new(
+            VenueAccountsConfig {
+                venues: [Platform::CsFloat, Platform::DMarket]
+                    .into_iter()
+                    .map(|platform| {
+                        (
+                            platform,
+                            VenueConfig {
+                                starting_cash: Money(5000),
+                                trade_hold_seconds: 86_400,
+                                sale_balance_hold_seconds: 0,
+                                transfer_in_seconds: 0,
+                                transfer_out_seconds: 0,
+                            },
+                        )
+                    })
+                    .collect(),
+                transfers: vec![],
+            },
+            fees(),
+        );
+        for use_accounts in [false, true] {
+            let mut model =
+                SimFillModel::new(&depth, fees(), RiskLimits::default(), KillSwitch::new());
+            if use_accounts {
+                model = model.with_venue_accounts(accounts.clone());
+            }
+            let report = Backtester::with_fill_model(BacktestConfig::new(fees()), model)
+                .run(
+                    SimulationMode,
+                    &snapshots,
+                    &[],
+                    &mut [Box::new(SpreadAdapter::new(SpreadConfig::default()))],
+                )
+                .unwrap();
+            assert_eq!(report.trades.len(), usize::from(use_accounts));
+        }
     }
 
     #[test]

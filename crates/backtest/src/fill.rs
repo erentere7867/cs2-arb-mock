@@ -23,6 +23,10 @@ pub enum FillOutcome {
 /// Pluggable simulated execution. The real `cs2-arb-sim` can be adapted to this
 /// trait at integration time (for example by synthesizing a `Listing` from the quote).
 pub trait FillModel {
+    fn uses_venue_holds(&self) -> bool {
+        false
+    }
+
     fn preview_fill(&self, _strategy: &str, order: &Order) -> Option<(Money, u32)> {
         Some((order.limit_price, order.quantity))
     }

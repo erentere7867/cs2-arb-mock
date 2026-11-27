@@ -167,6 +167,10 @@ impl<'a> SimFillModel<'a> {
 }
 
 impl FillModel for SimFillModel<'_> {
+    fn uses_venue_holds(&self) -> bool {
+        self.venue_accounts.is_some()
+    }
+
     fn preview_fill(&self, strategy: &str, order: &Order) -> Option<(Money, u32)> {
         self.sessions
             .borrow()
@@ -359,7 +363,9 @@ impl StrategyAdapter for SpreadAdapter {
         for position in view.positions {
             let key = (position.item.clone(), position.float_bucket);
             if let Some(&(platform, not_before)) = self.targets.get(&key) {
-                if view.now >= not_before && !position.is_trade_locked_at(view.now) {
+                if (view.uses_venue_holds() || view.now >= not_before)
+                    && !position.is_trade_locked_at(view.now)
+                {
                     if let Some(quote) =
                         view.latest_quote(platform, &position.item, position.float_bucket)
                     {

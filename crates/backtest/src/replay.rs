@@ -1422,7 +1422,11 @@ mod tests {
         use cs2_arb_strategy::regime::{MarketRegime, RegimeConfig, RegimeStatus};
         use cs2_arb_strategy::{DipConfig, KillSwitch, RiskLimits};
 
-        for entry_risk_off in [true, false] {
+        for (entry_risk_off, item_margin, entry_allowed) in [
+            (true, 15.0, false),
+            (false, 5.0, false),
+            (false, 15.0, true),
+        ] {
             let quotes = [(0, 999), (1, 1001), (2, 900), (8, 1000), (9, 650)]
                 .map(|(day, price)| snap(Platform::CsFloat, day, price));
             let mut snapshots = quotes.to_vec();
@@ -1445,7 +1449,7 @@ mod tests {
             let regime = Arc::new(
                 MarketRegime::new(
                     RegimeConfig {
-                        item_underperformance_pct: 15.0,
+                        item_underperformance_pct: item_margin,
                         ..RegimeConfig::default()
                     },
                     &snapshots,
@@ -1453,7 +1457,16 @@ mod tests {
                 )
                 .unwrap(),
             );
-            assert_eq!(regime.at(t(2)).allows(&item()), !entry_risk_off);
+            let entry = regime.at(t(2));
+            assert_eq!(
+                entry.state.status,
+                if entry_risk_off {
+                    RegimeStatus::MarketDowntrend
+                } else {
+                    RegimeStatus::RiskOn
+                }
+            );
+            assert_eq!(entry.allows(&item()), entry_allowed);
             assert_eq!(regime.at(t(9)).state.status, RegimeStatus::MarketDowntrend);
             let adapter = DipAdapter::new(
                 DipConfig {
@@ -1484,7 +1497,7 @@ mod tests {
                     &mut [Box::new(adapter)],
                 )
                 .unwrap();
-            if entry_risk_off {
+            if !entry_allowed {
                 assert_eq!(report.totals.orders_filled, 0);
             } else {
                 let [stop_loss] = report.trades.as_slice() else {

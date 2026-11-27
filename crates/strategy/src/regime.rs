@@ -85,14 +85,11 @@ pub struct RegimeAt<'a> {
 impl RegimeAt<'_> {
     pub fn allows(&self, item: &ItemId) -> bool {
         self.state.status == RegimeStatus::RiskOn
-            && self.short_returns.get(item).is_some_and(|&change| {
-                change >= 0.0
-                    || self
-                        .state
-                        .market
-                        .short_pct
-                        .is_some_and(|index| change >= index - self.item_underperformance_pct)
-            })
+            && self
+                .short_returns
+                .get(item)
+                .zip(self.state.market.short_pct)
+                .is_some_and(|(&change, index)| index - change <= self.item_underperformance_pct)
     }
 }
 
@@ -322,6 +319,36 @@ mod tests {
         assert!(regime.allows(&item("Flat")));
         assert!(regime.allows(&item("Positive")));
         assert!(!regime.allows(&item("Missing")));
+    }
+
+    #[test]
+    fn item_gate_compares_positive_returns_and_allows_exactly_the_configured_gap() {
+        let mut prices = Vec::new();
+        for name in ["One", "Two", "Three", "Four"] {
+            prices.extend(series(name, 100, 100, 110));
+        }
+        prices.extend(series("Below margin", 100, 100, 104));
+        prices.extend(series("At margin", 100, 100, 105));
+        prices.push(series("No prior price", 100, 100, 110)[2].clone());
+
+        let default = MarketRegime::new(RegimeConfig::default(), &prices, &[]).unwrap();
+        let regime = default.at(now());
+        assert_eq!(regime.state.status, RegimeStatus::RiskOn);
+        assert_eq!(regime.state.market.short_pct, Some(10.0));
+        assert!(!regime.allows(&item("Below margin"))); // +4% is six points behind +10%.
+        assert!(regime.allows(&item("At margin")));
+        assert!(!regime.allows(&item("No prior price")));
+
+        let wider = MarketRegime::new(
+            RegimeConfig {
+                item_underperformance_pct: 6.0,
+                ..RegimeConfig::default()
+            },
+            &prices,
+            &[],
+        )
+        .unwrap();
+        assert!(wider.at(now()).allows(&item("Below margin")));
     }
 
     #[test]

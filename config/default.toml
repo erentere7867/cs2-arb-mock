@@ -96,7 +96,7 @@ min_case_items = 2
 max_price_age_hours = 24
 short_loss_pct = 3.0
 long_loss_pct = 8.0
-item_underperformance_pct = 5.0
+item_underperformance_pct = 5.0 # Maximum 24h shortfall vs. the broad index, in percentage points.
 
 [peg_bid]
 target_margin_pct = 7.0

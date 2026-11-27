@@ -978,6 +978,18 @@ mod tests {
 
     #[test]
     fn market_selloff_blocks_a_crossing_print_and_cancels_the_resting_bid() {
+        assert_crossing_print_blocked_and_bid_cancelled(9_000, RegimeStatus::MarketDowntrend);
+    }
+
+    #[test]
+    fn an_item_lagging_a_rising_market_cannot_fill_and_loses_its_resting_bid() {
+        assert_crossing_print_blocked_and_bid_cancelled(11_000, RegimeStatus::RiskOn);
+    }
+
+    fn assert_crossing_print_blocked_and_bid_cancelled(
+        market_price_at_fill: i64,
+        status: RegimeStatus,
+    ) {
         use cs2_arb_strategy::regime::RegimeConfig;
 
         let mut snapshots = Vec::new();
@@ -986,7 +998,7 @@ mod tests {
             (2, 10_000),
             (7, 10_000),
             (8, 10_000),
-            (9, 9_000),
+            (9, market_price_at_fill),
         ] {
             for (item, price) in [
                 (item(), 10_000),
@@ -1029,7 +1041,7 @@ mod tests {
                 item: item(),
                 price: Money(10_000),
                 float_value: Some(0.20),
-                sold_at: t(7, 12) + Duration::hours(i),
+                sold_at: t(6, 12) + Duration::hours(i),
                 verified: true,
             })
             .collect();
@@ -1068,12 +1080,10 @@ mod tests {
         assert_eq!(guarded.bids_filled, 0);
         assert!(guarded.active_mock_bids.is_empty());
         assert_eq!(guarded.cash_balance, Some(Money(50_000)));
-        assert!(guarded
-            .to_markdown()
-            .contains("| Market Regime | Risk-off: market downtrend |"));
-        assert!(guarded
-            .to_markdown()
-            .contains("| Broad Index 24h | -10.00% |"));
+        let index_return = (market_price_at_fill - 10_000) as f64 / 100.0;
+        let markdown = guarded.to_markdown();
+        assert!(markdown.contains(&format!("| Market Regime | {} |", status.label())));
+        assert!(markdown.contains(&format!("| Broad Index 24h | {index_return:+.2}% |")));
     }
 
     #[test]

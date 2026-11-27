@@ -300,9 +300,10 @@ pub fn run_peg_bid_engine(
     let mut accounted_fee_losses = Money(0);
 
     while let Some(now) = times.pop_first() {
-        let market_tick = sorted_snapshots
+        let snapshot_tick = sorted_snapshots
             .get(snap_idx)
-            .is_some_and(|s| s.observed_at == now)
+            .is_some_and(|s| s.observed_at == now);
+        let market_tick = snapshot_tick
             || sorted_sales.get(sale_idx).is_some_and(|s| s.sold_at == now)
             || sorted_bids
                 .get(bid_idx)
@@ -449,7 +450,8 @@ pub fn run_peg_bid_engine(
         let unrealized = compute_unrealized_pnl(&simulator, &latest_prices);
         risk.set_unrealized_pnl(unrealized, now);
 
-        if !kill_switch.is_engaged() && (!historical_bids.is_empty() || refresh_idx > refresh_start)
+        if !kill_switch.is_engaged()
+            && (snapshot_tick || !historical_bids.is_empty() || refresh_idx > refresh_start)
         {
             let orders = strategy.evaluate(&[], fees, now)?;
             for order in orders {
@@ -913,6 +915,67 @@ mod tests {
         assert!(md.contains("Locked Inventory"));
         assert!(md.contains("Realized Buy-Order P&L"));
         assert!(md.contains("$12.99"));
+    }
+
+    #[test]
+    fn snapshot_only_tick_replaces_an_unsafe_bid_using_the_fresh_book() {
+        let placed_at = t(3, 12);
+        let repriced_at = placed_at + Duration::seconds(1);
+        let platform = Platform::CsFloat;
+        let quote = PriceSnapshot {
+            platform,
+            item: item(),
+            float_bucket: Some(FloatBucket::FieldTestedLow),
+            price: Money(10_000),
+            observed_at: placed_at,
+        };
+        let bid = BuyOrder {
+            platform,
+            item: quote.item.clone(),
+            float_bucket: quote.float_bucket,
+            price: Money(8_500),
+            quantity: 1,
+            observed_at: placed_at,
+        };
+        let snapshots = [
+            quote.clone(),
+            PriceSnapshot {
+                price: Money(6_000),
+                observed_at: repriced_at,
+                ..quote
+            },
+        ];
+        let config = PegBidConfig {
+            lower_to_ceiling: true,
+            min_median_samples: 1,
+            ..PegBidConfig::default()
+        };
+        let fees = fees();
+        let ceiling =
+            cs2_arb_strategy::compute_effective_ceiling(Money(8_000), fees.get(platform), &config)
+                .unwrap()
+                .unwrap();
+        let dashboard = run_peg_bid_engine(
+            &snapshots,
+            &[],
+            &[bid],
+            &[],
+            &fees,
+            config,
+            RelistConfig::default(),
+            RiskLimits::default(),
+            &KillSwitch::new(),
+            Some(Money(50_000)),
+            None,
+        )
+        .unwrap();
+        assert_eq!(dashboard.bids_placed, 2);
+        assert_eq!(dashboard.bids_filled, 0);
+        let [replacement] = dashboard.active_mock_bids.as_slice() else {
+            panic!("expected one replacement bid");
+        };
+        assert_eq!(replacement.updated_at, repriced_at);
+        assert_eq!(replacement.order.limit_price, ceiling);
     }
 
     #[test]

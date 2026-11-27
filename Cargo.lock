@@ -494,10 +494,12 @@ dependencies = [
  "cs2-arb-strategy",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "toml",
  "tracing",
  "tracing-subscriber",
+ "wiremock",
 ]
 
 [[package]]

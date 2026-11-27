@@ -244,6 +244,34 @@ pub fn run_peg_bid_engine(
     let mut last_now = None;
 
     for now in times {
+        // Transition any lots whose 7-day lock expired before `now` so they are
+        // listed at `locked_until` before crossing prints at `now` are evaluated.
+        for unlock_at in relist.pending_unlocks_before(now) {
+            let unlock_step = relist.step(
+                &sorted_sales[..sale_idx],
+                &sorted_snapshots[..snap_idx],
+                fees,
+                unlock_at,
+            )?;
+            for settled in &unlock_step.realized_sales {
+                match simulator.settle_relist_sale(
+                    &settled.position_id,
+                    settled.platform,
+                    settled.ask_price,
+                    settled.sold_at,
+                ) {
+                    Ok(report) => {
+                        let _ = risk.record_fill(&report.fill)?;
+                    }
+                    Err(reason) => tracing::warn!(
+                        position_id = %settled.position_id,
+                        ?reason,
+                        "relist settlement rejected by simulator"
+                    ),
+                }
+            }
+        }
+
         last_now = Some(now);
 
         while snap_idx < sorted_snapshots.len() && sorted_snapshots[snap_idx].observed_at <= now {

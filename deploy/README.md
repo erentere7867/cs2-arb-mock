@@ -27,10 +27,10 @@ replacing it. Use systemd `KEY=value` syntax, without `export`.
 Skinport and Waxpeer reads are public and need no keys. CSFloat makes
 unauthenticated requests without `CSFLOAT_API_KEY`; those requests can be rate limited.
 DMarket has no public fallback. Both jobs automatically add DMarket's signed,
-read-only requests when `DMARKET_PUBLIC_KEY` and `DMARKET_SECRET_KEY` are set.
-If either key is blank or missing, the jobs skip DMarket and continue with
-the other venues. Once the keys are in `.env`, restart the jobs; no config
-edit is needed:
+read-only requests when `DMARKET_PUBLIC_KEY` and `DMARKET_SECRET_KEY` form a
+valid key pair. If either key is blank, missing, or invalid, the jobs skip
+DMarket and continue with the other venues. Once the keys are in `.env`,
+restart the jobs; no config edit is needed:
 
 ```sh
 sudo systemctl restart cs2-arb-mock@cs2 cs2-arb-mock@rust

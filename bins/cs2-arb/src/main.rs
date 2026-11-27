@@ -138,15 +138,12 @@ impl Settings {
 
     fn live_platforms(&self, requested: Vec<Market>, secrets: &Secrets) -> Result<Vec<Platform>> {
         let auto_dmarket = self.dmarket_if_configured && requested.is_empty();
-        let mut platforms = live::select_platforms(
-            self.game,
-            requested,
-            self.market_allowlist()?,
-            self.markets.is_some(),
-        )?;
+        let allowlist = self.market_allowlist()?;
+        let mut platforms =
+            live::select_platforms(self.game, requested, allowlist, self.markets.is_some())?;
         if auto_dmarket {
             platforms.retain(|&platform| platform != Platform::DMarket);
-            if self.game.supports_market(Platform::DMarket) && secrets.require_dmarket().is_ok() {
+            if allowlist.contains(&Platform::DMarket) && secrets.require_dmarket().is_ok() {
                 match live::dmarket_credentials(secrets) {
                     Ok(_) => platforms.push(Platform::DMarket),
                     Err(_) => tracing::warn!("invalid DMarket credential pair; skipping DMarket"),
@@ -661,6 +658,22 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn automatic_dmarket_selection_respects_an_explicit_allowlist() {
+        let settings: Settings =
+            toml::from_str("game = 'rust'\nmarkets = ['waxpeer']\ndmarket_if_configured = true")
+                .unwrap();
+        let secrets = dmarket_secrets(Some(EXAMPLE_DMARKET_PUBLIC), Some(EXAMPLE_DMARKET_SEED));
+        assert!(live::dmarket_credentials(&secrets).is_ok());
+        assert_eq!(
+            settings.live_platforms(vec![], &secrets).unwrap(),
+            [Platform::Waxpeer]
+        );
+        assert!(settings
+            .live_platforms(vec![Market::Dmarket], &secrets)
+            .is_err());
     }
 
     #[test]

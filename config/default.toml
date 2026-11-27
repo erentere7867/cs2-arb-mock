@@ -1,5 +1,4 @@
-# Uncomment to replace the default venue allowlist (also used for live reads).
-# markets = ["skinport", "csfloat"]
+markets = ["skinport", "csfloat", "dmarket"]
 dmarket_if_configured = true
 
 # Illustrative mock fees, NOT verified marketplace schedules unless linked.

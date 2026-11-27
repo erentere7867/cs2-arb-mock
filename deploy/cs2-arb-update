@@ -57,3 +57,7 @@ if [[ $dashboard == false ]] && systemctl is-active --quiet cs2-arb-dashboard.se
 fi
 sudo systemctl restart "${units[@]}"
 systemctl --no-pager --lines=0 status "${units[@]}"
+if [[ $dashboard == true ]] && ! systemctl is-enabled --quiet cs2-arb-dashboard.service; then
+    printf '%s\n' 'First dashboard rollout: run sudo systemctl enable --now cs2-arb-dashboard.' \
+        'See deploy/README.md for optional journal access for the dashboard process running as ubuntu.'
+fi

@@ -14,7 +14,7 @@
 //! * Each buy opens a position locked for 7 days from the fill time; locked
 //!   units cannot be sold.
 //! * Buyer fees are added to cost basis; seller fees are deducted from proceeds.
-//!   Fees are integer cents, per unit, with an explicit [`RoundingMode`].
+//!   Percentage fees round per unit with an explicit [`RoundingMode`]; fixed fees apply once per order.
 
 pub mod book;
 pub mod buy_order_fill;

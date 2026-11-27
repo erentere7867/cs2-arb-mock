@@ -67,11 +67,20 @@ pub fn pct_to_ppm(pct: f64) -> Result<i64> {
 pub struct FeeRate {
     /// Commission in parts-per-million of the unit price.
     pub rate_ppm: i64,
-    /// Fixed fee per unit, in cents.
+    /// Fixed fee per filled order, in cents.
     pub fixed: Money,
 }
 
 impl FeeRate {
+    fn order_fee(self, unit_price: Money, quantity: u32, rounding: RoundingMode) -> Result<Money> {
+        let commission = Self {
+            fixed: Money(0),
+            ..self
+        }
+        .unit_fee(unit_price, rounding)?;
+        cs2_arb_core::fee_for_order(commission, self.fixed, quantity)
+    }
+
     /// Fee for a single unit at `unit_price`.
     pub fn unit_fee(self, unit_price: Money, rounding: RoundingMode) -> Result<Money> {
         if unit_price.0 < 0 {
@@ -91,6 +100,9 @@ impl FeeRate {
 pub struct ExactFeeSchedule {
     pub buyer: FeeRate,
     pub seller: FeeRate,
+    pub crypto_deposit: FeeRate,
+    pub crypto_withdrawal: FeeRate,
+    pub bank_cashout: FeeRate,
     pub rounding: RoundingMode,
 }
 
@@ -99,10 +111,11 @@ pub struct ExactFeeSchedule {
 pub struct FeeBreakdown {
     pub quantity: u32,
     pub unit_price: Money,
+    /// Whole-cent average fee per unit. Use `fee` for accounting.
     pub unit_fee: Money,
     /// `quantity * unit_price`.
     pub gross: Money,
-    /// `quantity * unit_fee`.
+    /// Total fee for the fill.
     pub fee: Money,
     /// Buy: `gross + fee` (cash paid). Sell: `gross - fee` (cash received).
     pub net: Money,
@@ -111,6 +124,12 @@ pub struct FeeBreakdown {
 impl ExactFeeSchedule {
     pub fn from_schedule(schedule: FeeSchedule, rounding: RoundingMode) -> Result<Self> {
         schedule.validate()?;
+        let rate = |charge: cs2_arb_core::FundingCharge| -> Result<FeeRate> {
+            Ok(FeeRate {
+                rate_ppm: pct_to_ppm(charge.pct)?,
+                fixed: charge.fixed,
+            })
+        };
         Ok(Self {
             buyer: FeeRate {
                 rate_ppm: pct_to_ppm(schedule.buyer_fee_pct)?,
@@ -120,27 +139,71 @@ impl ExactFeeSchedule {
                 rate_ppm: pct_to_ppm(schedule.seller_fee_pct)?,
                 fixed: schedule.seller_fixed_fee,
             },
+            crypto_deposit: rate(schedule.funding.crypto_deposit)?,
+            crypto_withdrawal: rate(schedule.funding.crypto_withdrawal)?,
+            bank_cashout: rate(schedule.funding.bank_cashout)?,
             rounding,
         })
     }
 
     pub fn buyer_unit_fee(&self, unit_price: Money) -> Result<Money> {
-        self.buyer.unit_fee(unit_price, self.rounding)
+        self.buyer
+            .unit_fee(unit_price, self.rounding)?
+            .checked_add(self.crypto_deposit.unit_fee(unit_price, self.rounding)?)
     }
 
     pub fn seller_unit_fee(&self, unit_price: Money) -> Result<Money> {
-        self.seller.unit_fee(unit_price, self.rounding)
+        self.seller
+            .unit_fee(unit_price, self.rounding)?
+            .checked_add(self.crypto_withdrawal.unit_fee(unit_price, self.rounding)?)?
+            .checked_add(self.bank_cashout.unit_fee(unit_price, self.rounding)?)
     }
 
     /// Cash paid by the buyer for `quantity` units, buyer marketplace fee included.
     pub fn buy(&self, unit_price: Money, quantity: u32) -> Result<FeeBreakdown> {
-        let unit_fee = self.buyer_unit_fee(unit_price)?;
+        self.buy_with_rates(unit_price, quantity, self.buyer, self.crypto_deposit)
+    }
+
+    pub(crate) fn buy_fill(
+        &self,
+        unit_price: Money,
+        index: u32,
+        order_quantity: u32,
+    ) -> Result<(FeeBreakdown, Money, Money)> {
+        let n = i64::from(order_quantity);
+        let platform_remainder = self.buyer.fixed.0 % n;
+        let share = |rate: FeeRate, offset: i64| FeeRate {
+            fixed: Money(
+                rate.fixed.0 / n + i64::from((i64::from(index) + offset) % n < rate.fixed.0 % n),
+            ),
+            ..rate
+        };
+        let buyer = share(self.buyer, 0);
+        let deposit = share(self.crypto_deposit, n - platform_remainder);
+        let fees = self.buy_with_rates(unit_price, 1, buyer, deposit)?;
+        let allocated_deposit = deposit.order_fee(unit_price, 1, self.rounding)?;
+        let fixed = self.buyer.fixed.checked_add(self.crypto_deposit.fixed)?;
+        let allocated_fixed = buyer.fixed.checked_add(deposit.fixed)?;
+        let unallocated_change =
+            if index == 0 { fixed } else { Money(0) }.checked_sub(allocated_fixed)?;
+        Ok((fees, allocated_deposit, unallocated_change))
+    }
+
+    fn buy_with_rates(
+        &self,
+        unit_price: Money,
+        quantity: u32,
+        buyer: FeeRate,
+        deposit: FeeRate,
+    ) -> Result<FeeBreakdown> {
         let gross = unit_price.checked_mul(quantity)?;
-        let fee = unit_fee.checked_mul(quantity)?;
+        let fee = buyer
+            .order_fee(unit_price, quantity, self.rounding)?
+            .checked_add(deposit.order_fee(unit_price, quantity, self.rounding)?)?;
         Ok(FeeBreakdown {
             quantity,
             unit_price,
-            unit_fee,
+            unit_fee: Money(fee.0.checked_div(i64::from(quantity)).unwrap_or(0)),
             gross,
             fee,
             net: gross.checked_add(fee)?,
@@ -149,13 +212,22 @@ impl ExactFeeSchedule {
 
     /// Cash received by the seller for `quantity` units, seller fee deducted.
     pub fn sell(&self, unit_price: Money, quantity: u32) -> Result<FeeBreakdown> {
-        let unit_fee = self.seller_unit_fee(unit_price)?;
         let gross = unit_price.checked_mul(quantity)?;
-        let fee = unit_fee.checked_mul(quantity)?;
+        let fee = self
+            .seller
+            .order_fee(unit_price, quantity, self.rounding)?
+            .checked_add(
+                self.crypto_withdrawal
+                    .order_fee(unit_price, quantity, self.rounding)?,
+            )?
+            .checked_add(
+                self.bank_cashout
+                    .order_fee(unit_price, quantity, self.rounding)?,
+            )?;
         Ok(FeeBreakdown {
             quantity,
             unit_price,
-            unit_fee,
+            unit_fee: Money(fee.0.checked_div(i64::from(quantity)).unwrap_or(0)),
             gross,
             fee,
             net: gross.checked_sub(fee)?,
@@ -169,6 +241,7 @@ pub struct PlatformFees {
     pub skinport: ExactFeeSchedule,
     pub csfloat: ExactFeeSchedule,
     pub dmarket: ExactFeeSchedule,
+    pub waxpeer: ExactFeeSchedule,
 }
 
 impl PlatformFees {
@@ -177,6 +250,7 @@ impl PlatformFees {
             skinport: ExactFeeSchedule::from_schedule(schedules.skinport, rounding)?,
             csfloat: ExactFeeSchedule::from_schedule(schedules.csfloat, rounding)?,
             dmarket: ExactFeeSchedule::from_schedule(schedules.dmarket, rounding)?,
+            waxpeer: ExactFeeSchedule::from_schedule(schedules.waxpeer, rounding)?,
         })
     }
 
@@ -187,6 +261,7 @@ impl PlatformFees {
             skinport: exact,
             csfloat: exact,
             dmarket: exact,
+            waxpeer: exact,
         })
     }
 
@@ -195,6 +270,7 @@ impl PlatformFees {
             Platform::Skinport => &self.skinport,
             Platform::CsFloat => &self.csfloat,
             Platform::DMarket => &self.dmarket,
+            Platform::Waxpeer => &self.waxpeer,
         }
     }
 }
@@ -214,6 +290,7 @@ mod tests {
             seller_fee_pct: seller_pct,
             buyer_fixed_fee: Money(buyer_fixed),
             seller_fixed_fee: Money(seller_fixed),
+            ..FeeSchedule::default()
         }
     }
 
@@ -393,7 +470,7 @@ mod tests {
         assert_eq!(fees.get(Platform::Skinport).seller.rate_ppm, 80_000);
         assert_eq!(fees.get(Platform::CsFloat).seller.rate_ppm, 20_000);
         assert_eq!(fees.get(Platform::DMarket).seller.rate_ppm, 70_000);
-        for platform in [Platform::Skinport, Platform::CsFloat, Platform::DMarket] {
+        for platform in Platform::ALL {
             let core = schedules.get(platform);
             let ours = fees.get(platform);
             for price in [1, 99, 1020, 1999, 12_345, 250_000] {
@@ -408,5 +485,35 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn waxpeer_charges_funding_per_unit_and_separates_fee_components() {
+        use cs2_arb_core::TradeFees;
+
+        let schedules =
+            FeeSchedules::from_toml(include_str!("../../../config/default.toml")).unwrap();
+        let schedule = schedules.waxpeer;
+        let exact = exact(schedule, RoundingMode::HalfUp);
+        let buy = exact.buy(Money(1000), 2).unwrap();
+        let sell = exact.sell(Money(1200), 2).unwrap();
+        assert_eq!(buy.net, Money(2020));
+        assert_eq!(sell.net, Money(2220));
+        let fees = TradeFees::from_trade(
+            schedule,
+            schedule,
+            buy.fee,
+            sell.fee,
+            buy.unit_price,
+            sell.unit_price,
+            2,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(fees.platform_buy, Money(0));
+        assert_eq!(fees.platform_sell, Money(144));
+        assert_eq!(fees.crypto_deposit, Money(20));
+        assert_eq!(fees.crypto_withdrawal, Money(36));
+        assert_eq!(fees.bank_cashout, Money(0));
     }
 }

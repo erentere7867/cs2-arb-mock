@@ -32,6 +32,6 @@ let summary = exec.portfolio().summary();     // realized P&L, fee totals, cash 
 | Buy price | best eligible ask only (one exact price level per fill); limit must be >= best ask |
 | Trade hold | each buy opens a `Position` with `locked_until = filled_at + 7d`; locked units cannot be sold |
 | Sell price | fills at the limit if it is <= the best fresh comparable competing ask, else <= lower median of trailing verified sales |
-| Fees | per unit, integer cents, rate in ppm, explicit `RoundingMode` (default half-up, matching core); buyer fee into cost basis, seller fee out of proceeds |
+| Fees | Percentage charges round per unit (half-up by default); fixed charges apply once per filled order. A passive bid pays fixed charges on its first fill and allocates them across its intended units. Unallocated fees count toward drawdown while the bid is open and are realized as a loss on cancellation or configured expiry. Buy reports distinguish total cash paid from lot cost basis. |
 | P&L | FIFO lots; realized P&L = net proceeds - released cost basis |
 | Determinism | seeded SplitMix64 for tie-breaks and fill latency; injected `Clock` |

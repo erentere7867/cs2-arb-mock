@@ -1,4 +1,7 @@
-# Illustrative mock fees, NOT verified marketplace schedules.
+# Uncomment to replace the default venue allowlist (also used for live reads).
+# markets = ["skinport", "csfloat"]
+
+# Illustrative mock fees, NOT verified marketplace schedules unless linked.
 # Percentage points (5.0 = 5%); fixed fees are USD cents.
 [fees.skinport]
 buyer_fee_pct = 0.0
@@ -17,6 +20,23 @@ buyer_fee_pct = 0.0
 seller_fee_pct = 7.0
 buyer_fixed_fee = 0
 seller_fixed_fee = 0
+
+# Include "waxpeer" in markets to opt in to CS2 Waxpeer.
+[fees.waxpeer]
+buyer_fee_pct = 0.0 # Assumption for purchases using existing marketplace balance.
+seller_fee_pct = 6.0 # Standard fee: https://faq.waxpeer.com/faq/fees-sell
+buyer_fixed_fee = 0
+seller_fixed_fee = 0
+
+# Examples apply only to Waxpeer. Fixed network / bank fees are assumed zero until configured.
+[fees.waxpeer.funding]
+crypto_deposit = { pct = 1.0, fixed = 0 } # Most coins: https://faq.waxpeer.com/faq/fees-deposit
+crypto_withdrawal = { pct = 1.5, fixed = 0 } # Standard crypto rate excluding network: https://faq.waxpeer.com/faq/fees-withdraw
+bank_cashout = { pct = 0.0, fixed = 0 }
+
+[rate_limits.waxpeer.default]
+max_requests = 2
+window_seconds = 10
 
 [rate_limits.skinport.items]
 path = "/v1/items"

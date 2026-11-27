@@ -22,6 +22,10 @@ pub enum FillOutcome {
 /// Pluggable simulated execution. The real `cs2-arb-sim` can be adapted to this
 /// trait at integration time (for example by synthesizing a `Listing` from the quote).
 pub trait FillModel {
+    fn preview_fill(&self, _strategy: &str, order: &Order) -> Option<(Money, u32)> {
+        Some((order.limit_price, order.quantity))
+    }
+
     fn add_quote_update_times(&self, _times: &mut BTreeSet<DateTime<Utc>>) {}
 
     fn invalidate_quotes(
@@ -37,7 +41,9 @@ pub trait FillModel {
         quantity: u32,
         fees: FeeSchedule,
     ) -> Result<Money> {
-        fees.seller_proceeds(unit_price.checked_mul(quantity)?)
+        unit_price
+            .checked_mul(quantity)?
+            .checked_sub(fees.seller_order_fee(unit_price, quantity)?)
     }
 
     fn prepare_run(&self) {}
@@ -76,7 +82,7 @@ pub trait FillModel {
 }
 
 /// Fills the full order quantity at the quote price when the limit allows it.
-/// Buy fees use `buyer_fee`, sell fees use `seller_fee`, both on the order subtotal.
+/// Percentage fees round per unit; each fixed fee is charged once per order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SnapshotFillModel {
     pub trade_hold: Duration,
@@ -111,10 +117,9 @@ impl FillModel for SnapshotFillModel {
                 order.limit_price.0, quote.price.0
             )));
         }
-        let subtotal = quote.price.checked_mul(order.quantity)?;
         let fee = match order.side {
-            OrderSide::Buy => fees.buyer_fee(subtotal)?,
-            OrderSide::Sell => fees.seller_fee(subtotal)?,
+            OrderSide::Buy => fees.buyer_order_fee(quote.price, order.quantity)?,
+            OrderSide::Sell => fees.seller_order_fee(quote.price, order.quantity)?,
         };
         Ok(FillOutcome::Filled(Fill {
             order: order.clone(),
@@ -169,6 +174,7 @@ mod tests {
         seller_fee_pct: 2.0,
         buyer_fixed_fee: Money(5),
         seller_fixed_fee: Money(0),
+        funding: cs2_arb_core::FundingFees::NONE,
     };
 
     #[test]
@@ -192,6 +198,34 @@ mod tests {
             panic!("expected fill");
         };
         assert_eq!(sell.fee, Money(40)); // 2% of 2000
+    }
+
+    #[test]
+    fn funding_does_not_multiply_per_order_platform_fees() {
+        let model = SnapshotFillModel::default();
+        let mut fees = FEES;
+        fees.seller_fixed_fee = Money(7);
+        fees.funding.crypto_withdrawal.fixed = Money(3);
+        let quote = quote(1000);
+        let now = quote.observed_at;
+        let FillOutcome::Filled(buy) = model
+            .fill(&order(OrderSide::Buy, 1000, 2), &quote, fees, now)
+            .unwrap()
+        else {
+            panic!("expected buy");
+        };
+        let FillOutcome::Filled(sell) = model
+            .fill(&order(OrderSide::Sell, 1000, 2), &quote, fees, now)
+            .unwrap()
+        else {
+            panic!("expected sell");
+        };
+        assert_eq!(buy.fee, Money(25));
+        assert_eq!(sell.fee, Money(50));
+        assert_eq!(
+            model.seller_proceeds(Money(1000), 2, fees).unwrap(),
+            Money(1950)
+        );
     }
 
     #[test]

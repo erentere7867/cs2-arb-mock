@@ -6,8 +6,8 @@ use std::fmt::Write as _;
 
 use chrono::{DateTime, Duration, Utc};
 use cs2_arb_core::{
-    BuyOrder, FeeSchedules, FloatBucket, ItemId, Money, Platform, Position, PriceSnapshot, Result,
-    Sale, SimulationMode,
+    BuyOrder, FeeSchedules, FloatBucket, ItemId, Money, Platform, PriceSnapshot, Result, Sale,
+    SimulationMode,
 };
 use cs2_arb_sim::{BuyOrderFillConfig, BuyOrderFillSimulator};
 use cs2_arb_strategy::{
@@ -40,6 +40,8 @@ pub struct PegBidDashboard {
     pub bids_filled: usize,
     pub realized_sales: Vec<RealizedRelistSale>,
     pub realized_buy_order_pnl: Money,
+    #[serde(skip_serializing_if = "money_is_zero")]
+    pub prepaid_open_bid_fees: Money,
     pub total_seller_fees: Money,
     pub cash_balance: Option<Money>,
 }
@@ -119,6 +121,13 @@ impl PegBidDashboard {
         if let Some(cash) = self.cash_balance {
             let _ = writeln!(out, "| Mock Cash Balance | {} |", format_money(cash));
         }
+        if !money_is_zero(&self.prepaid_open_bid_fees) {
+            let _ = writeln!(
+                out,
+                "| Prepaid Fees on Open Bids | {} |",
+                format_money(self.prepaid_open_bid_fees)
+            );
+        }
 
         let _ = writeln!(out, "\n### Active Mock Bids\n");
         if self.active_mock_bids.is_empty() {
@@ -169,6 +178,12 @@ impl PegBidDashboard {
             out.push('\n');
         }
 
+        cs2_arb_backtest::report::write_fee_breakdowns(
+            &mut out,
+            self.realized_sales
+                .iter()
+                .filter_map(|s| s.fee_breakdown.map(|f| (s.position_id.as_str(), f))),
+        );
         out
     }
 }
@@ -178,7 +193,12 @@ impl PegBidDashboard {
 pub fn derive_offline_buy_orders(snapshots: &[PriceSnapshot]) -> Vec<BuyOrder> {
     snapshots
         .iter()
-        .filter(|q| matches!(q.platform, Platform::CsFloat | Platform::Skinport) && q.price.0 > 0)
+        .filter(|q| {
+            matches!(
+                q.platform,
+                Platform::CsFloat | Platform::Skinport | Platform::Waxpeer
+            ) && q.price.0 > 0
+        })
         .map(|q| {
             // Illustrative top-of-book bid at 86% of ask snapshot so peg-bidding
             // stays within the strict >= 7% net margin ceiling after fees & hold.
@@ -209,6 +229,9 @@ pub fn run_peg_bid_engine(
     kill_switch: &KillSwitch,
     starting_cash: Option<Money>,
 ) -> Result<PegBidDashboard> {
+    let resting_ttl = peg_config
+        .resting_bid_ttl_secs
+        .map(|seconds| Duration::seconds(i64::from(seconds)));
     let mut strategy = PegBidStrategy::new(peg_config)?;
     let mut risk = RiskManager::new(risk_limits, kill_switch.clone())?;
     let sim_config = BuyOrderFillConfig {
@@ -236,6 +259,7 @@ pub fn run_peg_bid_engine(
     times.extend(sorted_snapshots.iter().map(|s| s.observed_at));
     times.extend(sorted_sales.iter().map(|s| s.sold_at));
     times.extend(sorted_bids.iter().map(|b| b.observed_at));
+    let replay_end = times.last().copied();
 
     let mut snap_idx = 0usize;
     let mut sale_idx = 0usize;
@@ -244,45 +268,51 @@ pub fn run_peg_bid_engine(
     let mut bids_filled = 0usize;
     let mut last_now = None;
     let mut latest_prices: HashMap<(Platform, ItemId, Option<FloatBucket>), Money> = HashMap::new();
+    let mut accounted_fee_losses = Money(0);
 
-    for now in times {
+    while let Some(now) = times.pop_first() {
+        let market_tick = sorted_snapshots
+            .get(snap_idx)
+            .is_some_and(|s| s.observed_at == now)
+            || sorted_sales.get(sale_idx).is_some_and(|s| s.sold_at == now)
+            || sorted_bids
+                .get(bid_idx)
+                .is_some_and(|b| b.observed_at == now);
+        if !market_tick
+            && !resting_ttl.is_some_and(|ttl| {
+                simulator
+                    .active_bids()
+                    .iter()
+                    .any(|bid| now - bid.placed_at >= ttl)
+            })
+        {
+            continue;
+        }
         // Transition any lots whose 7-day lock expired before `now` so they are
         // listed at `locked_until` before crossing prints at `now` are evaluated.
         for unlock_at in relist.pending_unlocks_before(now) {
-            let unlock_step = relist.step(
+            relist.list_at_unlock(
                 &sorted_sales[..sale_idx],
                 &sorted_snapshots[..snap_idx],
                 fees,
                 unlock_at,
             )?;
-            for settled in &unlock_step.realized_sales {
-                match simulator.settle_relist_sale(
-                    &settled.position_id,
-                    settled.platform,
-                    settled.ask_price,
-                    settled.sold_at,
-                ) {
-                    Ok(report) => {
-                        let unrealized = compute_unrealized_pnl(
-                            simulator.portfolio().positions(),
-                            &latest_prices,
-                        );
-                        let _ = risk.record_marked_fill(
-                            &report.fill,
-                            unrealized,
-                            report.ledger_entry.cost_basis_released.unwrap_or(Money(0)),
-                        )?;
-                    }
-                    Err(reason) => tracing::warn!(
-                        position_id = %settled.position_id,
-                        ?reason,
-                        "relist settlement rejected by simulator"
-                    ),
-                }
-            }
         }
 
         last_now = Some(now);
+
+        if let Some(ttl) = resting_ttl {
+            for id in simulator.expire_bids(now, ttl)? {
+                strategy.mark_filled(&id);
+            }
+            account_bid_fee_losses(
+                &mut risk,
+                &simulator,
+                &latest_prices,
+                now,
+                &mut accounted_fee_losses,
+            )?;
+        }
 
         while snap_idx < sorted_snapshots.len() && sorted_snapshots[snap_idx].observed_at <= now {
             let snap = &sorted_snapshots[snap_idx];
@@ -311,14 +341,19 @@ pub fn run_peg_bid_engine(
             strategy.observe_sale(sale);
             for report in simulator.process_transaction(sale, now) {
                 bids_filled += 1;
-                let unrealized =
-                    compute_unrealized_pnl(simulator.portfolio().positions(), &latest_prices);
+                let unrealized = compute_unrealized_pnl(&simulator, &latest_prices);
                 let _ = risk.record_marked_fill(&report.fill, unrealized, Money(0))?;
                 if simulator.is_order_filled(&report.fill.order.id) {
                     strategy.mark_filled(&report.fill.order.id);
                 }
                 if let Some(pos) = report.position {
-                    relist.track_position(pos, report.fill.filled_at);
+                    relist.track_filled_position(
+                        pos,
+                        &report.fill,
+                        report
+                            .allocated_deposit
+                            .expect("passive buy allocates deposit"),
+                    );
                 }
             }
             sale_idx += 1;
@@ -338,8 +373,7 @@ pub fn run_peg_bid_engine(
                 settled.sold_at,
             ) {
                 Ok(report) => {
-                    let unrealized =
-                        compute_unrealized_pnl(simulator.portfolio().positions(), &latest_prices);
+                    let unrealized = compute_unrealized_pnl(&simulator, &latest_prices);
                     let _ = risk.record_marked_fill(
                         &report.fill,
                         unrealized,
@@ -354,7 +388,7 @@ pub fn run_peg_bid_engine(
             }
         }
 
-        let unrealized = compute_unrealized_pnl(simulator.portfolio().positions(), &latest_prices);
+        let unrealized = compute_unrealized_pnl(&simulator, &latest_prices);
         risk.set_unrealized_pnl(unrealized, now);
 
         let bid_start = bid_idx;
@@ -373,6 +407,18 @@ pub fn run_peg_bid_engine(
                 }
                 if simulator.place_bid(order.clone(), now).is_ok() {
                     bids_placed += 1;
+                    if let Some(expiry) = resting_ttl.and_then(|ttl| now.checked_add_signed(ttl)) {
+                        if Some(expiry) <= replay_end {
+                            times.insert(expiry);
+                        }
+                    }
+                    account_bid_fee_losses(
+                        &mut risk,
+                        &simulator,
+                        &latest_prices,
+                        now,
+                        &mut accounted_fee_losses,
+                    )?;
                 } else {
                     strategy.mark_filled(&order.id);
                 }
@@ -386,9 +432,21 @@ pub fn run_peg_bid_engine(
             for obs in batch {
                 let key = (obs.platform, obs.item.clone(), obs.float_bucket);
                 if !active_keys.contains(&key) {
-                    simulator.cancel_bids_for_item(obs.platform, &obs.item, obs.float_bucket);
+                    simulator.cancel_bids_for_item(
+                        obs.platform,
+                        &obs.item,
+                        obs.float_bucket,
+                        now,
+                    )?;
                 }
             }
+            account_bid_fee_losses(
+                &mut risk,
+                &simulator,
+                &latest_prices,
+                now,
+                &mut accounted_fee_losses,
+            )?;
         }
     }
 
@@ -419,7 +477,10 @@ pub fn run_peg_bid_engine(
         bids_placed,
         bids_filled,
         realized_sales: relist.realized_sales().to_vec(),
-        realized_buy_order_pnl: relist.total_realized_pnl(),
+        realized_buy_order_pnl: relist
+            .total_realized_pnl()
+            .checked_sub(simulator.realized_bid_fee_losses())?,
+        prepaid_open_bid_fees: simulator.unallocated_buy_fees(),
         total_seller_fees: relist.total_seller_fees(),
         cash_balance: simulator.cash(),
     })
@@ -444,11 +505,36 @@ fn escape_md_cell(value: &str) -> String {
     value.replace('|', "\\|")
 }
 
+fn money_is_zero(money: &Money) -> bool {
+    money.0 == 0
+}
+
+fn account_bid_fee_losses(
+    risk: &mut RiskManager,
+    simulator: &BuyOrderFillSimulator,
+    prices: &HashMap<(Platform, ItemId, Option<FloatBucket>), Money>,
+    now: DateTime<Utc>,
+    accounted: &mut Money,
+) -> Result<()> {
+    let realized = simulator.realized_bid_fee_losses();
+    if realized != *accounted {
+        risk.record_marked_pnl_adjustment(
+            accounted.checked_sub(realized)?,
+            compute_unrealized_pnl(simulator, prices),
+            now,
+        );
+        *accounted = realized;
+    }
+    Ok(())
+}
+
 fn compute_unrealized_pnl(
-    positions: &[Position],
+    simulator: &BuyOrderFillSimulator,
     latest_prices: &HashMap<(Platform, ItemId, Option<FloatBucket>), Money>,
 ) -> Money {
-    let cents: i64 = positions
+    let cents: i64 = simulator
+        .portfolio()
+        .positions()
         .iter()
         .filter_map(|pos| {
             let mark = latest_prices.get(&(pos.acquired_on, pos.item.clone(), pos.float_bucket))?;
@@ -456,7 +542,7 @@ fn compute_unrealized_pnl(
             Some(market_value.saturating_sub(pos.cost_basis.0))
         })
         .fold(0_i64, |acc, delta| acc.saturating_add(delta));
-    Money(cents)
+    Money(cents.saturating_sub(simulator.unallocated_buy_fees().0))
 }
 
 #[cfg(test)]
@@ -479,6 +565,134 @@ mod tests {
 
     fn t(day: u32, hour: u32) -> DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 4, day, hour, 0, 0).unwrap()
+    }
+
+    #[test]
+    fn prepaid_fixed_fee_counts_toward_peg_drawdown_before_and_after_cancellation() {
+        let at = t(4, 12);
+        let mut fees = fees();
+        fees.csfloat.buyer_fixed_fee = Money(200);
+        let mut sim = BuyOrderFillSimulator::new(
+            SimulationMode,
+            BuyOrderFillConfig {
+                min_recorded_sales_7d: 1,
+                ..BuyOrderFillConfig::default()
+            },
+            &fees,
+            1,
+        )
+        .unwrap();
+        let order = cs2_arb_core::Order {
+            id: "bid".into(),
+            side: cs2_arb_core::OrderSide::Buy,
+            platform: Platform::CsFloat,
+            item: item(),
+            float_bucket: None,
+            quantity: 2,
+            limit_price: Money(8500),
+            submitted_at: at,
+        };
+        sim.place_bid(order.clone(), at).unwrap();
+        let fill_at = at + Duration::minutes(1);
+        let fill = sim
+            .process_transaction(
+                &Sale {
+                    id: "first".into(),
+                    platform: order.platform,
+                    item: order.item.clone(),
+                    price: Money(8499),
+                    float_value: None,
+                    sold_at: fill_at,
+                    verified: true,
+                },
+                fill_at,
+            )
+            .pop()
+            .unwrap();
+        let mark = fill.position.unwrap().cost_basis;
+        let prices = HashMap::from([((order.platform, order.item.clone(), None), mark)]);
+        let mut risk = RiskManager::new(
+            RiskLimits {
+                daily_drawdown_cap: Money(100),
+                ..RiskLimits::default()
+            },
+            KillSwitch::new(),
+        )
+        .unwrap();
+        risk.set_unrealized_pnl(Money(0), at);
+        risk.record_marked_fill(&fill.fill, compute_unrealized_pnl(&sim, &prices), Money(0))
+            .unwrap();
+        assert_eq!(risk.day_drawdown(), Money(100));
+        assert!(risk.entries_halted(fill_at));
+        let cancel_at = fill_at + Duration::minutes(1);
+        sim.cancel_bids_for_item(order.platform, &order.item, None, cancel_at)
+            .unwrap();
+        account_bid_fee_losses(&mut risk, &sim, &prices, cancel_at, &mut Money(0)).unwrap();
+        assert_eq!(risk.day_drawdown(), Money(100));
+        assert_eq!(sim.portfolio().realized_pnl(), Money(-100));
+    }
+
+    #[test]
+    fn filled_bid_expiry_does_not_fill_a_relist_between_market_ticks() {
+        let snapshots: Vec<_> = (1..=11)
+            .map(|day| t(day, 12))
+            .chain([t(11, 15), t(11, 17)])
+            .map(|observed_at| PriceSnapshot {
+                platform: Platform::CsFloat,
+                item: item(),
+                float_bucket: Some(FloatBucket::FieldTestedLow),
+                price: Money(10_000),
+                observed_at,
+            })
+            .collect();
+        let mut sales: Vec<_> = (1..=10)
+            .flat_map(|day| (16..=20).map(move |hour| (day, hour)))
+            .map(|(day, hour)| Sale {
+                id: format!("{day}-{hour}"),
+                platform: Platform::CsFloat,
+                item: item(),
+                price: Money(10_000),
+                float_value: Some(0.20),
+                sold_at: t(day, hour),
+                verified: true,
+            })
+            .collect();
+        sales.push(Sale {
+            id: "trigger".into(),
+            price: Money(8_450),
+            sold_at: t(4, 14),
+            ..sales[0].clone()
+        });
+        let bids = [BuyOrder {
+            platform: Platform::CsFloat,
+            item: item(),
+            float_bucket: Some(FloatBucket::FieldTestedLow),
+            price: Money(8_500),
+            quantity: 1,
+            observed_at: t(4, 12),
+        }];
+        let dashboard = run_peg_bid_engine(
+            &snapshots,
+            &sales,
+            &bids,
+            &fees(),
+            PegBidConfig {
+                resting_bid_ttl_secs: Some(7 * 86_400 + 4 * 3_600),
+                ..PegBidConfig::default()
+            },
+            RelistConfig {
+                min_listing_age_secs: 2 * 3_600,
+                ..RelistConfig::default()
+            },
+            RiskLimits::default(),
+            &KillSwitch::new(),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(dashboard.bids_filled, 1);
+        assert_eq!(dashboard.realized_sales.len(), 1);
+        assert_eq!(dashboard.realized_sales[0].sold_at, t(11, 17));
     }
 
     #[test]

@@ -213,17 +213,13 @@ pub fn spread_breakdown(
 
     let buy_fees = fees.get(buy.platform);
     let sell_fees = fees.get(sell.platform);
-    let unit_cost = buy_fees.buyer_total(buy.price)?;
     let drifted_price = cents_floor(sell_price.0 as f64 * (1.0 - config.drift_fraction()))?;
-    let unit_proceeds_no_drift = sell_fees.seller_proceeds(sell_price)?;
-    let unit_proceeds = sell_fees.seller_proceeds(drifted_price)?;
-
     let qty = config.quantity;
-    let buy_cost = unit_cost.checked_mul(qty)?;
-    let sell_proceeds = unit_proceeds.checked_mul(qty)?;
-    let drift_haircut = unit_proceeds_no_drift
-        .checked_sub(unit_proceeds)?
-        .checked_mul(qty)?;
+    let buy_cost = buy_fees.buyer_order_total(buy.price, qty)?;
+    let sell_proceeds = sell_fees.seller_order_proceeds(drifted_price, qty)?;
+    let drift_haircut = sell_fees
+        .seller_order_proceeds(sell_price, qty)?
+        .checked_sub(sell_proceeds)?;
     let opportunity_cost = cents_ceil(buy_cost.0 as f64 * config.opportunity_cost_fraction())?;
     let expected_net_profit = sell_proceeds
         .checked_sub(buy_cost)?
@@ -294,7 +290,12 @@ pub fn evaluate_spread(
                     continue;
                 }
                 match spread_breakdown(buy, sell, fees, config) {
-                    Ok(breakdown) if breakdown.expected_net_profit > config.min_net_profit => {
+                    Ok(breakdown)
+                        if breakdown.expected_net_profit > config.min_net_profit
+                            && (breakdown.expected_net_profit.0 > 0
+                                || (!fees.get(buy.platform).funding.enabled()
+                                    && !fees.get(sell.platform).funding.enabled())) =>
+                    {
                         out.push(breakdown)
                     }
                     Ok(_) => {}
@@ -358,6 +359,7 @@ mod tests {
             seller_fee_pct: seller_pct,
             buyer_fixed_fee: Money(buyer_fixed),
             seller_fixed_fee: Money(seller_fixed),
+            ..FeeSchedule::default()
         }
     }
 
@@ -366,6 +368,7 @@ mod tests {
             skinport: schedule(0.0, 8.0, 0, 0),
             csfloat: schedule(2.5, 2.0, 10, 0),
             dmarket: schedule(0.0, 7.0, 0, 5),
+            waxpeer: schedule(0.0, 6.0, 0, 0),
         }
     }
 
@@ -453,6 +456,47 @@ mod tests {
         assert_eq!(b.sell_proceeds, Money(11_348));
         assert_eq!(b.drift_haircut, Money(412));
         assert_eq!(b.expected_net_profit, Money(1_348));
+    }
+
+    #[test]
+    fn waxpeer_can_win_either_side_and_funding_can_erase_the_spread() {
+        let mut config = cfg();
+        config.annual_opportunity_rate_pct = 0.0;
+        let mut fees = fees();
+        let waxpeer_buy = quote(Platform::Waxpeer, 10_000);
+        let skinport_sell = quote(Platform::Skinport, 11_000);
+        let found = evaluate_spread(
+            &[waxpeer_buy.clone(), skinport_sell.clone()],
+            &fees,
+            &config,
+            t0(),
+        )
+        .unwrap();
+        assert_eq!(found[0].buy_platform, Platform::Waxpeer);
+        fees.waxpeer.funding.crypto_deposit.fixed = Money(120);
+        assert!(
+            evaluate_spread(&[waxpeer_buy, skinport_sell], &fees, &config, t0())
+                .unwrap()
+                .is_empty()
+        );
+
+        let waxpeer_sell = quote(Platform::Waxpeer, 11_000);
+        let skinport_buy = quote(Platform::Skinport, 10_000);
+        let found = evaluate_spread(
+            &[waxpeer_sell.clone(), skinport_buy.clone()],
+            &fees,
+            &config,
+            t0(),
+        )
+        .unwrap();
+        assert_eq!(found[0].sell_platform, Platform::Waxpeer);
+        fees.waxpeer.funding.crypto_withdrawal.fixed = Money(200);
+        fees.waxpeer.funding.bank_cashout.fixed = Money(150);
+        assert!(
+            evaluate_spread(&[waxpeer_sell, skinport_buy], &fees, &config, t0())
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

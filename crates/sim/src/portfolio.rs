@@ -1,10 +1,10 @@
 //! Simulated inventory, cash and an append-only ledger with realized P&L.
 
 use chrono::{DateTime, Utc};
-use cs2_arb_core::{FloatBucket, ItemId, Money, OrderSide, Platform, Position};
+use cs2_arb_core::{FloatBucket, ItemId, Money, Order, OrderSide, Platform, Position};
 use serde::Serialize;
 
-/// One filled order. Buys have negative `cash_delta`; sells positive.
+/// One order fill or a write-off of an already-paid bid fee.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct LedgerEntry {
     pub seq: u64,
@@ -20,12 +20,15 @@ pub struct LedgerEntry {
     pub gross: Money,
     /// Total marketplace fee: buyer fee on buys, seller fee on sells.
     pub fee: Money,
-    /// Buy: `-(gross + fee)`. Sell: `gross - fee`.
+    /// Buy: `-(gross + fee)`. Sell: `gross - fee`. Write-off: zero.
     pub cash_delta: Money,
     /// Sells only: cost basis (including entry fees) of the units sold.
     pub cost_basis_released: Option<Money>,
-    /// Sells only: `cash_delta - cost_basis_released`.
+    /// Sell: `cash_delta - cost_basis_released`. Write-off: negative prepaid fee.
     pub realized_pnl: Option<Money>,
+    /// Fee recognized as a loss when a passive bid terminates. Already paid at fill.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prepaid_fee_loss: Option<Money>,
     pub filled_at: DateTime<Utc>,
     /// Buys: listings consumed, with quantity taken from each.
     pub listings: Vec<(String, u32)>,
@@ -158,7 +161,11 @@ impl Portfolio {
             cash: self.cash(),
             open_cost_basis: self.open_cost_basis(),
             open_quantity: self.positions.iter().map(|p| u64::from(p.quantity)).sum(),
-            fills: self.ledger.len() as u64,
+            fills: self
+                .ledger
+                .iter()
+                .filter(|entry| entry.quantity > 0)
+                .count() as u64,
         }
     }
 
@@ -174,6 +181,41 @@ impl Portfolio {
 
     pub(crate) fn next_seq(&self) -> u64 {
         self.ledger.len() as u64
+    }
+
+    pub(crate) fn realize_prepaid_fee_losses<'a>(
+        &mut self,
+        bids: impl IntoIterator<Item = (&'a Order, Money)>,
+        at: DateTime<Utc>,
+    ) -> cs2_arb_core::Result<()> {
+        let mut entries = Vec::new();
+        let mut realized = self.realized_pnl;
+        for (order, fee) in bids.into_iter().filter(|(_, fee)| fee.0 > 0) {
+            realized = realized.checked_sub(fee)?;
+            entries.push(LedgerEntry {
+                seq: self.next_seq() + entries.len() as u64,
+                order_id: order.id.clone(),
+                side: order.side,
+                platform: order.platform,
+                item: order.item.clone(),
+                float_bucket: order.float_bucket,
+                quantity: 0,
+                unit_price: Money(0),
+                unit_fee: Money(0),
+                gross: Money(0),
+                fee: Money(0),
+                cash_delta: Money(0),
+                cost_basis_released: None,
+                realized_pnl: Some(Money(-fee.0)),
+                prepaid_fee_loss: Some(fee),
+                filled_at: at,
+                listings: vec![],
+                positions: vec![],
+            });
+        }
+        self.realized_pnl = realized;
+        self.ledger.extend(entries);
+        Ok(())
     }
 
     /// Apply a buy whose totals have been validated by the caller.

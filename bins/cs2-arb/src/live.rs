@@ -12,19 +12,29 @@ use cs2_arb_events::EventQueue;
 use cs2_arb_markets::{
     CsFloatClient, CsFloatConfig, CsFloatCredentials, DMarketClient, DMarketConfig,
     DMarketCredentials, NetGate, RequestGate, ResilientMarket, SkinportClient, SkinportConfig,
+    WaxpeerClient,
 };
-use cs2_arb_net::{NetConfig, TokioClock};
+use cs2_arb_net::{NetConfig, RateLimit, RateLimiter, TokioClock, DEFAULT_ENDPOINT};
 use cs2_arb_sim::wear::quote_bucket;
 
 use crate::{bundled_snapshots, watch, Inputs, Market};
 
 type MarketClients = Vec<(Platform, Box<dyn MarketClient>)>;
 
-pub fn select_platforms(game: Game, requested: Vec<Market>) -> Result<Vec<Platform>> {
+pub fn select_platforms(
+    game: Game,
+    requested: Vec<Market>,
+    allowlist: &[Platform],
+    explicit_allowlist: bool,
+) -> Result<Vec<Platform>> {
     let platforms = if requested.is_empty() {
-        match game {
-            Game::Cs2 => vec![Platform::Skinport, Platform::CsFloat],
-            Game::Rust => vec![Platform::Skinport],
+        if explicit_allowlist {
+            allowlist.to_vec()
+        } else {
+            match game {
+                Game::Cs2 => vec![Platform::Skinport, Platform::CsFloat],
+                Game::Rust => vec![Platform::Skinport, Platform::Waxpeer],
+            }
         }
     } else {
         requested.into_iter().map(Platform::from).collect()
@@ -33,6 +43,11 @@ pub fn select_platforms(game: Game, requested: Vec<Market>) -> Result<Vec<Platfo
         if !game.supports_market(platform) {
             return Err(Error::InvalidConfig(format!(
                 "{platform:?} is not supported for {game:?}"
+            )));
+        }
+        if !allowlist.contains(&platform) {
+            return Err(Error::InvalidConfig(format!(
+                "{platform:?} is not enabled in markets"
             )));
         }
     }
@@ -46,8 +61,7 @@ fn make_clients(
     game: Game,
 ) -> Result<MarketClients> {
     let net = NetConfig::from_toml(source)?;
-    let gate: Arc<dyn RequestGate> =
-        Arc::new(NetGate(Arc::new(net.build_limiter(Arc::new(TokioClock))?)));
+    let gate: Arc<dyn RequestGate> = Arc::new(NetGate(Arc::new(build_limiter(&net, &platforms)?)));
     let clock = Arc::new(SystemClock);
     let secrets = Secrets::from_env();
     let mut seen = HashSet::new();
@@ -65,6 +79,10 @@ fn make_clients(
                     gate.clone(),
                     clock.clone(),
                 )?,
+                net.retry,
+            )),
+            Platform::Waxpeer => Box::new(ResilientMarket::new(
+                WaxpeerClient::new(schedule, game, gate.clone(), clock.clone())?,
                 net.retry,
             )),
             Platform::CsFloat => {
@@ -103,6 +121,24 @@ fn make_clients(
         clients.push((platform, client));
     }
     Ok(clients)
+}
+
+fn build_limiter(net: &NetConfig, platforms: &[Platform]) -> Result<RateLimiter> {
+    let mut limiter = net.build_limiter(Arc::new(TokioClock))?;
+    if platforms.contains(&Platform::Waxpeer)
+        && !net.endpoints.iter().any(|entry| {
+            entry.platform == Platform::Waxpeer
+                && (entry.name == DEFAULT_ENDPOINT
+                    || entry.path.as_deref() == Some(DEFAULT_ENDPOINT))
+        })
+    {
+        limiter.register(
+            Platform::Waxpeer,
+            DEFAULT_ENDPOINT,
+            RateLimit::new(2, std::time::Duration::from_secs(10))?,
+        )?;
+    }
+    Ok(limiter)
 }
 
 pub async fn collect(
@@ -161,7 +197,10 @@ pub async fn collect(
                         tracing::warn!(?platform, %error, "read-only sales request skipped")
                     }
                 }
-                if matches!(platform, Platform::CsFloat | Platform::Skinport) {
+                if matches!(
+                    platform,
+                    Platform::CsFloat | Platform::Skinport | Platform::Waxpeer
+                ) {
                     match client.top_buy_orders(item).await {
                         Ok(orders) => buy_orders.extend(orders),
                         Err(error) => {
@@ -216,4 +255,21 @@ pub async fn collect(
         depth,
         buy_orders,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn waxpeer_live_reads_get_a_limit_even_without_rate_limit_config() {
+        let net = NetConfig::from_toml("markets = ['waxpeer']").unwrap();
+        let limiter = build_limiter(&net, &[Platform::Waxpeer]).unwrap();
+        for endpoint in [
+            cs2_arb_markets::waxpeer::PRICES,
+            cs2_arb_markets::waxpeer::BUY_ORDERS,
+        ] {
+            assert!(limiter.resolve(endpoint.platform, endpoint.path).is_ok());
+        }
+    }
 }

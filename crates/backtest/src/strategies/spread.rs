@@ -65,8 +65,8 @@ impl StrategyAdapter for SpreadStrategy {
             let quotes = view.quotes_for(&snapshot.item, snapshot.float_bucket);
             let mut best_buy = None;
             for quote in &quotes {
-                let subtotal = quote.price.checked_mul(self.quantity)?;
-                let cost = view.fees.get(quote.platform).buyer_total(subtotal)?;
+                let fees = view.fees.get(quote.platform);
+                let cost = fees.buyer_order_total(quote.price, self.quantity)?;
                 if best_buy.as_ref().is_none_or(|(_, c)| cost < *c) {
                     best_buy = Some((*quote, cost));
                 }
@@ -82,7 +82,12 @@ impl StrategyAdapter for SpreadStrategy {
             let Some(exit) = best_exit else {
                 continue;
             };
-            if pct_of(exit.checked_sub(cost)?, cost) >= self.min_edge_pct {
+            if pct_of(exit.checked_sub(cost)?, cost) >= self.min_edge_pct
+                && (exit > cost
+                    || !quotes
+                        .iter()
+                        .any(|q| view.fees.get(q.platform).funding.enabled()))
+            {
                 orders.push(buy_order(Self::next_id(&name, counter), buy, self.quantity));
             }
         }

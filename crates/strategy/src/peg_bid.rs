@@ -42,6 +42,8 @@ pub struct PegBidConfig {
     pub min_reprice_delta: Money,
     /// Maximum age of top-of-book buy orders in seconds (`None` disables age check).
     pub max_order_age_secs: Option<i64>,
+    /// Optional simulated lifetime of a resting bid. Expiration cancels remaining units.
+    pub resting_bid_ttl_secs: Option<u32>,
     /// When `target_bid` exceeds the strict margin ceiling:
     /// - `false` (default): discard the bid;
     /// - `true`: clamp the bid down to the exact margin ceiling.
@@ -64,9 +66,10 @@ impl Default for PegBidConfig {
             cooldown_secs: 300,
             min_reprice_delta: Money(2),
             max_order_age_secs: Some(3600),
+            resting_bid_ttl_secs: None,
             lower_to_ceiling: false,
             quantity: 1,
-            allowed_platforms: vec![Platform::CsFloat, Platform::Skinport],
+            allowed_platforms: vec![Platform::CsFloat, Platform::Skinport, Platform::Waxpeer],
         }
     }
 }
@@ -103,6 +106,9 @@ impl PegBidConfig {
         }
         if matches!(self.max_order_age_secs, Some(age) if age < 0) {
             return bad("max_order_age_secs must be >= 0");
+        }
+        if self.resting_bid_ttl_secs == Some(0) {
+            return bad("resting_bid_ttl_secs must be positive");
         }
         if self.quantity == 0 {
             return bad("quantity must be >= 1");
@@ -536,37 +542,17 @@ pub fn compute_effective_ceiling(
         return Ok(None);
     }
 
-    let unit_sell_proceeds = fees.seller_proceeds(rolling_median)?;
-    if unit_sell_proceeds.0 <= 0 {
-        return Ok(None);
+    let (mut low, mut high) = (0, raw_ceiling.0);
+    while low < high {
+        let mid = high - (high - low) / 2;
+        if meets_net_margin(Money(mid), rolling_median, fees, config)? {
+            low = mid;
+        } else {
+            high = mid - 1;
+        }
     }
 
-    let opp_fraction = config.opportunity_cost_fraction();
-    let buyer_factor = 1.0 + fees.buyer_fee_pct / 100.0;
-    let total_multiplier = (1.0 + target_margin + opp_fraction) * buyer_factor;
-    let per_unit_proceeds = unit_sell_proceeds.0 as f64
-        - fees.buyer_fixed_fee.0 as f64 * (1.0 + target_margin + opp_fraction);
-    let mut candidate = ((per_unit_proceeds / total_multiplier).floor() as i64).min(raw_ceiling.0);
-
-    if candidate <= 0 {
-        return Ok(None);
-    }
-
-    // Refine downward (if rounding pushed margin slightly below target) or upward
-    // (if conservative fixed-fee estimate left 1 cent of room) while staying <= raw_ceiling.
-    while candidate > 0 && !meets_net_margin(Money(candidate), rolling_median, fees, config)? {
-        candidate -= 1;
-    }
-    if candidate <= 0 {
-        return Ok(None);
-    }
-    while candidate < raw_ceiling.0
-        && meets_net_margin(Money(candidate + 1), rolling_median, fees, config)?
-    {
-        candidate += 1;
-    }
-
-    Ok(Some(Money(candidate)))
+    Ok((low > 0).then_some(Money(low)))
 }
 
 /// Checks whether a candidate unit bid guarantees at least `config.target_margin_pct`
@@ -577,12 +563,20 @@ pub fn meets_net_margin(
     fees: FeeSchedule,
     config: &PegBidConfig,
 ) -> Result<bool> {
-    if unit_bid.0 <= 0 || rolling_median.0 <= 0 {
+    if unit_bid.0 <= 0 || rolling_median.0 <= 0 || config.quantity == 0 {
         return Ok(false);
     }
     let econ = evaluate_bid_economics(unit_bid, rolling_median, unit_bid, fees, config)?;
+    if fees.buyer_fixed_fee.0 > 0 || fees.funding.crypto_deposit.fixed.0 > 0 {
+        let qty = i64::from(config.quantity);
+        let largest_basis = Money(econ.buy_cost.0 / qty + i64::from(econ.buy_cost.0 % qty != 0));
+        if fees.seller_order_proceeds(rolling_median, 1)? <= largest_basis {
+            return Ok(false);
+        }
+    }
     let required_net_profit = cents_ceil(econ.buy_cost.0 as f64 * config.target_margin_fraction())?;
-    Ok(econ.expected_net_profit >= required_net_profit)
+    Ok(econ.expected_net_profit >= required_net_profit
+        && (!fees.funding.enabled() || econ.expected_net_profit.0 > 0))
 }
 
 /// Computes full integer-cent economics for a candidate unit bid.
@@ -595,10 +589,10 @@ pub fn evaluate_bid_economics(
 ) -> Result<PegBidEconomics> {
     let raw_margin_ceiling =
         Money((rolling_median.0 as f64 * (1.0 - config.target_margin_fraction())).floor() as i64);
-    let unit_buy_cost = fees.buyer_total(unit_bid)?;
-    let buy_cost = unit_buy_cost.checked_mul(config.quantity)?;
-    let unit_sell_proceeds = fees.seller_proceeds(rolling_median)?;
-    let sell_proceeds = unit_sell_proceeds.checked_mul(config.quantity)?;
+    let buy_cost = fees.buyer_order_total(unit_bid, config.quantity)?;
+    let sell_proceeds = fees
+        .seller_order_proceeds(rolling_median, 1)?
+        .checked_mul(config.quantity)?;
     let opportunity_cost = cents_ceil(buy_cost.0 as f64 * config.opportunity_cost_fraction())?;
     let expected_net_profit = sell_proceeds
         .checked_sub(buy_cost)?

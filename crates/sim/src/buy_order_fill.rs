@@ -105,6 +105,7 @@ pub enum BuyOrderStatus {
     Resting,
     Filled,
     Cancelled,
+    Expired,
 }
 
 /// A mock passive buy order resting on the simulated queue.
@@ -120,6 +121,8 @@ pub struct RestingBuyOrder {
     /// Remaining unfilled units on this passive buy order.
     pub remaining_quantity: u32,
     pub status: BuyOrderStatus,
+    /// Fixed fees already paid but not allocated to any filled inventory.
+    pub prepaid_fixed_fee: Money,
 }
 
 /// Deterministic passive buy-order fill and inventory simulator.
@@ -135,6 +138,8 @@ pub struct BuyOrderFillSimulator {
     seen_sale_ids: HashSet<String>,
     filled_order_ids: HashSet<String>,
     rejections: Vec<RejectionRecord>,
+    unallocated_buy_fees: Money,
+    realized_bid_fee_losses: Money,
 }
 
 impl BuyOrderFillSimulator {
@@ -157,6 +162,8 @@ impl BuyOrderFillSimulator {
             seen_sale_ids: HashSet::new(),
             filled_order_ids: HashSet::new(),
             rejections: Vec::new(),
+            unallocated_buy_fees: Money(0),
+            realized_bid_fee_losses: Money(0),
         })
     }
 
@@ -189,6 +196,14 @@ impl BuyOrderFillSimulator {
         self.filled_order_ids.contains(order_id)
     }
 
+    pub fn unallocated_buy_fees(&self) -> Money {
+        self.unallocated_buy_fees
+    }
+
+    pub fn realized_bid_fee_losses(&self) -> Money {
+        self.realized_bid_fee_losses
+    }
+
     /// All recorded historical/live sales known to the simulator.
     pub fn sales_tape(&self) -> &[Sale] {
         &self.sales_tape
@@ -211,19 +226,57 @@ impl BuyOrderFillSimulator {
         platform: Platform,
         item: &ItemId,
         float_bucket: Option<FloatBucket>,
-    ) -> usize {
-        let mut cancelled = 0;
-        for existing in &mut self.resting_bids {
-            if existing.status == BuyOrderStatus::Resting
-                && existing.order.platform == platform
+        now: DateTime<Utc>,
+    ) -> Result<usize> {
+        self.finish_bids(BuyOrderStatus::Cancelled, now, |existing| {
+            existing.order.platform == platform
                 && &existing.order.item == item
                 && existing.order.float_bucket == float_bucket
-            {
-                existing.status = BuyOrderStatus::Cancelled;
-                cancelled += 1;
-            }
+        })
+        .map(|ids| ids.len())
+    }
+
+    pub fn expire_bids(&mut self, now: DateTime<Utc>, max_age: TimeDelta) -> Result<Vec<String>> {
+        self.finish_bids(BuyOrderStatus::Expired, now, |bid| {
+            now - bid.placed_at >= max_age
+        })
+    }
+
+    fn finish_bids(
+        &mut self,
+        status: BuyOrderStatus,
+        now: DateTime<Utc>,
+        matches: impl Fn(&RestingBuyOrder) -> bool,
+    ) -> Result<Vec<String>> {
+        let indices: Vec<_> = self
+            .resting_bids
+            .iter()
+            .enumerate()
+            .filter(|(_, bid)| bid.status == BuyOrderStatus::Resting && matches(bid))
+            .map(|(idx, _)| idx)
+            .collect();
+        let prepaid = indices.iter().try_fold(Money(0), |sum, &idx| {
+            sum.checked_add(self.resting_bids[idx].prepaid_fixed_fee)
+        })?;
+        let losses = self.realized_bid_fee_losses.checked_add(prepaid)?;
+        let unallocated = self.unallocated_buy_fees.checked_sub(prepaid)?;
+        self.portfolio.realize_prepaid_fee_losses(
+            indices.iter().map(|&idx| {
+                let bid = &self.resting_bids[idx];
+                (&bid.order, bid.prepaid_fixed_fee)
+            }),
+            now,
+        )?;
+        self.realized_bid_fee_losses = losses;
+        self.unallocated_buy_fees = unallocated;
+        let mut ids = Vec::new();
+        for idx in indices {
+            let existing = &mut self.resting_bids[idx];
+            existing.status = status;
+            existing.prepaid_fixed_fee = Money(0);
+            ids.push(existing.order.id.clone());
         }
-        cancelled
+        Ok(ids)
     }
 
     /// Place (or reprice) a passive mock buy order. Never fills immediately.
@@ -259,15 +312,7 @@ impl BuyOrderFillSimulator {
 
         // Cancel any previous resting bid on the same (platform, item, float_bucket);
         // repricing resets queue priority.
-        for existing in &mut self.resting_bids {
-            if existing.status == BuyOrderStatus::Resting
-                && existing.order.platform == order.platform
-                && existing.order.item == order.item
-                && existing.order.float_bucket == order.float_bucket
-            {
-                existing.status = BuyOrderStatus::Cancelled;
-            }
-        }
+        self.cancel_bids_for_item(order.platform, &order.item, order.float_bucket, now)?;
 
         let tie_ready_at = now + self.draw_tie_latency();
         let resting = RestingBuyOrder {
@@ -277,6 +322,7 @@ impl BuyOrderFillSimulator {
             tie_ready_at,
             tie_prints_seen: 0,
             status: BuyOrderStatus::Resting,
+            prepaid_fixed_fee: Money(0),
         };
         self.resting_bids.push(resting.clone());
         Ok(resting)
@@ -374,21 +420,39 @@ impl BuyOrderFillSimulator {
 
             // A single historical/live sale print represents one traded skin unit.
             let fill_qty = 1u32;
-            let Ok(fees) = self
-                .fees
-                .get(order.platform)
-                .buy(order.limit_price, fill_qty)
+            let Ok((fees, allocated_deposit, unallocated_change)) =
+                self.fees.get(order.platform).buy_fill(
+                    order.limit_price,
+                    order.quantity - remaining_quantity,
+                    order.quantity,
+                )
+            else {
+                continue;
+            };
+            let Ok(paid_fee) = fees.fee.checked_add(unallocated_change) else {
+                continue;
+            };
+            let Ok(paid) = fees.gross.checked_add(paid_fee) else {
+                continue;
+            };
+            let Ok(unallocated) = self.resting_bids[idx]
+                .prepaid_fixed_fee
+                .checked_add(unallocated_change)
+            else {
+                continue;
+            };
+            let Ok(total_unallocated) = self.unallocated_buy_fees.checked_add(unallocated_change)
             else {
                 continue;
             };
 
             if let Some(cash) = self.portfolio.cash() {
-                if fees.net > cash {
+                if paid > cash {
                     self.rejections.push(RejectionRecord {
                         order_id: order.id.clone(),
                         rejected_at: sale.sold_at,
                         rejection: Rejection::InsufficientFunds {
-                            required: fees.net,
+                            required: paid,
                             available: cash,
                         },
                     });
@@ -396,7 +460,7 @@ impl BuyOrderFillSimulator {
                 }
             }
 
-            let Ok(cash_delta) = Money(0).checked_sub(fees.net) else {
+            let Ok(cash_delta) = Money(0).checked_sub(paid) else {
                 continue;
             };
 
@@ -426,12 +490,13 @@ impl BuyOrderFillSimulator {
                 float_bucket: order.float_bucket,
                 quantity: fill_qty,
                 unit_price: order.limit_price,
-                unit_fee: fees.unit_fee,
+                unit_fee: paid_fee,
                 gross: fees.gross,
-                fee: fees.fee,
+                fee: paid_fee,
                 cash_delta,
                 cost_basis_released: None,
                 realized_pnl: None,
+                prepaid_fee_loss: None,
                 filled_at,
                 listings: vec![(sale.id.clone(), fill_qty)],
                 positions: vec![(position.id.clone(), fill_qty)],
@@ -442,6 +507,8 @@ impl BuyOrderFillSimulator {
                 .record_buy(position.clone(), entry.clone())
                 .is_ok()
             {
+                self.resting_bids[idx].prepaid_fixed_fee = unallocated;
+                self.unallocated_buy_fees = total_unallocated;
                 let new_remaining = remaining_quantity - fill_qty;
                 self.resting_bids[idx].remaining_quantity = new_remaining;
                 if new_remaining == 0 {
@@ -449,6 +516,8 @@ impl BuyOrderFillSimulator {
                     self.filled_order_ids.insert(order.id.clone());
                 }
                 reports.push(ExecutionReport {
+                    cash_paid: Some(paid),
+                    allocated_deposit: Some(allocated_deposit),
                     fill: Fill {
                         order,
                         quantity: fill_qty,
@@ -555,6 +624,7 @@ impl BuyOrderFillSimulator {
             cash_delta: fees.net,
             cost_basis_released: Some(released),
             realized_pnl: Some(realized_pnl),
+            prepaid_fee_loss: None,
             filled_at: now,
             listings: Vec::new(),
             positions: vec![(position.id.clone(), position.quantity)],
@@ -564,6 +634,8 @@ impl BuyOrderFillSimulator {
         self.filled_order_ids.insert(order_id);
 
         Ok(ExecutionReport {
+            cash_paid: None,
+            allocated_deposit: None,
             fill: Fill {
                 order,
                 quantity: position.quantity,
@@ -776,6 +848,99 @@ mod tests {
         let fills = sim.process_transaction(&tie3, t(10, 12, 35));
         assert_eq!(fills.len(), 1);
         assert_eq!(fills[0].fill.unit_price, Money(8_500));
+    }
+
+    #[test]
+    fn partial_bid_pays_all_fixed_charges_but_allocates_cents_across_lots() {
+        let now = t(10, 12, 0);
+        let mut fees = fees();
+        fees.csfloat.buyer_fixed_fee = Money(101);
+        fees.csfloat.funding.crypto_deposit.fixed = Money(101);
+        let mut sim =
+            BuyOrderFillSimulator::new(SimulationMode, BuyOrderFillConfig::default(), &fees, 7)
+                .unwrap();
+        seed_liquidity(&mut sim, 20, now);
+        let mut bid = bid_order("allocated", 8500, now);
+        bid.quantity = 2;
+        sim.place_bid(bid, now).unwrap();
+        let first_at = now + TimeDelta::seconds(1);
+        let first = sim
+            .process_transaction(&make_sale("first", 8400, first_at, true), first_at)
+            .pop()
+            .unwrap();
+        assert_eq!(first.position.unwrap().cost_basis, Money(8601));
+        assert_eq!(first.ledger_entry.fee, Money(202));
+        assert_eq!(first.cash_paid, Some(Money(8702)));
+        assert_eq!(first.cash_paid.unwrap().0, -first.ledger_entry.cash_delta.0);
+        assert_eq!(first.allocated_deposit, Some(Money(50)));
+        assert_eq!(sim.unallocated_buy_fees(), Money(101));
+        let second_at = now + TimeDelta::seconds(2);
+        let second = sim
+            .process_transaction(&make_sale("second", 8400, second_at, true), second_at)
+            .pop()
+            .unwrap();
+        assert_eq!(second.position.unwrap().cost_basis, Money(8601));
+        assert_eq!(second.allocated_deposit, Some(Money(51)));
+        assert_eq!(second.cash_paid, Some(Money(8500)));
+        assert_eq!(
+            second.cash_paid.unwrap().0,
+            -second.ledger_entry.cash_delta.0
+        );
+        assert_eq!(sim.unallocated_buy_fees(), Money(0));
+        assert_eq!(sim.portfolio().buyer_fees_paid(), Money(202));
+    }
+
+    #[test]
+    fn expiration_and_repricing_realize_prepaid_fees_without_debiting_cash_twice() {
+        let now = t(10, 12, 0);
+        for expire in [false, true] {
+            let mut fees = fees();
+            fees.csfloat.buyer_fixed_fee = Money(200);
+            let mut sim =
+                BuyOrderFillSimulator::new(SimulationMode, BuyOrderFillConfig::default(), &fees, 7)
+                    .unwrap();
+            seed_liquidity(&mut sim, 20, now);
+            let mut bid = bid_order("initial", 8500, now);
+            bid.quantity = 2;
+            sim.place_bid(bid, now).unwrap();
+            let first_at = now + TimeDelta::seconds(1);
+            assert_eq!(
+                sim.process_transaction(&make_sale("first", 8400, first_at, true), first_at)
+                    .len(),
+                1
+            );
+            let end = now + TimeDelta::seconds(2);
+            if expire {
+                assert_eq!(
+                    sim.expire_bids(end, TimeDelta::seconds(2)).unwrap(),
+                    ["initial"]
+                );
+            } else {
+                sim.place_bid(bid_order("replacement", 8501, end), end)
+                    .unwrap();
+            }
+            assert_eq!(sim.unallocated_buy_fees(), Money(0));
+            assert_eq!(sim.realized_bid_fee_losses(), Money(100));
+            assert_eq!(sim.portfolio().realized_pnl(), Money(-100));
+            assert_eq!(sim.portfolio().net_cash_flow(), Money(-8700));
+            assert_eq!(sim.portfolio().buyer_fees_paid(), Money(200));
+            let ledger = sim.portfolio().ledger();
+            assert_eq!(ledger.len(), 2);
+            let writeoff = &ledger[1];
+            assert_eq!(writeoff.seq, 1);
+            assert_eq!(writeoff.order_id, "initial");
+            assert_eq!(writeoff.filled_at, end);
+            assert_eq!(writeoff.prepaid_fee_loss, Some(Money(100)));
+            assert_eq!(writeoff.cash_delta, Money(0));
+            assert_eq!(writeoff.fee, Money(0));
+            assert_eq!(sim.portfolio().summary().fills, 1);
+            let ledger_pnl: i64 = ledger
+                .iter()
+                .filter_map(|e| e.realized_pnl)
+                .map(|pnl| pnl.0)
+                .sum();
+            assert_eq!(Money(ledger_pnl), sim.portfolio().realized_pnl());
+        }
     }
 
     #[test]

@@ -23,9 +23,14 @@ use crate::wear::{order_matches, order_matches_float};
 /// Everything produced by an accepted order.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ExecutionReport {
+    /// Cash debited on a buy, including any prepayment for unfilled units.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cash_paid: Option<Money>,
+    pub allocated_deposit: Option<Money>,
     /// `fill.fee` is the **total** marketplace fee for the fill (buyer fee on a
     /// buy, seller fee on a sell), not a per-unit fee.
     pub fill: Fill,
+    /// Fees allocated to the filled units. Buy-side net is the inventory cost basis.
     pub fees: FeeBreakdown,
     pub liquidity: LiquidityStats,
     pub ledger_entry: LedgerEntry,
@@ -43,6 +48,7 @@ pub struct MockExecutor {
     _mode: SimulationMode,
     config: SimConfig,
     fees: PlatformFees,
+    order_fees: Option<FeeSchedules>,
     clock: Arc<dyn Clock>,
     rng: SplitMix64,
     book: MarketBook,
@@ -78,6 +84,7 @@ impl MockExecutor {
             portfolio: Portfolio::new(config.starting_cash),
             config,
             fees,
+            order_fees: None,
             clock,
             rng: SplitMix64::new(seed),
             book: MarketBook::new(),
@@ -92,6 +99,53 @@ impl MockExecutor {
 
     pub fn fees(&self) -> &PlatformFees {
         &self.fees
+    }
+
+    /// Charge platform fees once per order and funding fees per unit during replay.
+    pub fn with_order_fees(mut self, schedules: FeeSchedules) -> Self {
+        self.order_fees = Some(schedules);
+        self
+    }
+
+    pub fn buy_cost_at_limit(&self, order: &Order) -> Result<Money> {
+        Ok(self
+            .execution_fees(order, order.limit_price, order.quantity)?
+            .net)
+    }
+
+    fn execution_fees(
+        &self,
+        order: &Order,
+        unit_price: Money,
+        quantity: u32,
+    ) -> Result<FeeBreakdown> {
+        let Some(schedules) = &self.order_fees else {
+            let schedule = self.fees.get(order.platform);
+            return match order.side {
+                OrderSide::Buy => schedule.buy(unit_price, quantity),
+                OrderSide::Sell => schedule.sell(unit_price, quantity),
+            };
+        };
+        let schedule = schedules.get(order.platform);
+        let gross = unit_price.checked_mul(quantity)?;
+        let (fee, net) = match order.side {
+            OrderSide::Buy => {
+                let fee = schedule.buyer_order_fee(unit_price, quantity)?;
+                (fee, gross.checked_add(fee)?)
+            }
+            OrderSide::Sell => {
+                let fee = schedule.seller_order_fee(unit_price, quantity)?;
+                (fee, gross.checked_sub(fee)?)
+            }
+        };
+        Ok(FeeBreakdown {
+            quantity,
+            unit_price,
+            unit_fee: Money(fee.0.checked_div(i64::from(quantity)).unwrap_or(0)),
+            gross,
+            fee,
+            net,
+        })
     }
 
     pub fn now(&self) -> DateTime<Utc> {
@@ -175,6 +229,33 @@ impl MockExecutor {
         order: &Order,
         now: DateTime<Utc>,
     ) -> std::result::Result<ExecutionReport, Rejection> {
+        let (target, stats) = self.executable_target(order, now)?;
+        match order.side {
+            OrderSide::Buy => self.execute_buy(order, target, stats, now),
+            OrderSide::Sell => self.execute_sell(order, target, stats, now),
+        }
+    }
+
+    pub fn preview_fill(&self, order: &Order) -> std::result::Result<(Money, u32), Rejection> {
+        let now = self.clock.now();
+        let (target, _) = self.executable_target(order, now)?;
+        match order.side {
+            OrderSide::Buy => {
+                let level = self.buy_level(order, target, now)?;
+                Ok((level.price, level.quantity))
+            }
+            OrderSide::Sell => {
+                self.validate_sell_price(order, target, now)?;
+                Ok((order.limit_price, target))
+            }
+        }
+    }
+
+    fn executable_target(
+        &self,
+        order: &Order,
+        now: DateTime<Utc>,
+    ) -> std::result::Result<(u32, LiquidityStats), Rejection> {
         self.validate_order(order)?;
         let stats = self.liquidity_at(order, now);
         if !stats.meets_minimum {
@@ -190,11 +271,7 @@ impl MockExecutor {
                 window_days: stats.window_days,
             });
         }
-        let target = order.quantity.min(stats.max_order_quantity);
-        match order.side {
-            OrderSide::Buy => self.execute_buy(order, target, stats, now),
-            OrderSide::Sell => self.execute_sell(order, target, stats, now),
-        }
+        Ok((order.quantity.min(stats.max_order_quantity), stats))
     }
 
     fn validate_order(&self, order: &Order) -> std::result::Result<(), Rejection> {
@@ -255,13 +332,12 @@ impl MockExecutor {
         now + latency.min + TimeDelta::milliseconds(offset)
     }
 
-    fn execute_buy(
-        &mut self,
+    fn buy_level(
+        &self,
         order: &Order,
         target: u32,
-        stats: LiquidityStats,
         now: DateTime<Utc>,
-    ) -> std::result::Result<ExecutionReport, Rejection> {
+    ) -> std::result::Result<BuyLevel, Rejection> {
         // Visible listings: right platform/item, observed no later than now, with stock.
         let visible: Vec<&Listing> = self
             .book
@@ -315,15 +391,33 @@ impl MockExecutor {
             });
         }
         // Only the best price level fills, so the fill has one exact unit price.
-        let mut level: Vec<(String, u32)> = fresh
+        let listings: Vec<(String, u32)> = fresh
             .iter()
             .filter(|l| l.price == best_ask)
             .map(|l| (l.id.clone(), l.quantity))
             .collect();
-        let depth: u64 = level.iter().map(|(_, q)| u64::from(*q)).sum();
+        let depth: u64 = listings.iter().map(|(_, q)| u64::from(*q)).sum();
         let quantity = u32::try_from(depth.min(u64::from(target))).unwrap_or(target);
+        Ok(BuyLevel {
+            price: best_ask,
+            quantity,
+            listings,
+        })
+    }
 
-        let fees = self.fees.get(order.platform).buy(best_ask, quantity)?;
+    fn execute_buy(
+        &mut self,
+        order: &Order,
+        target: u32,
+        stats: LiquidityStats,
+        now: DateTime<Utc>,
+    ) -> std::result::Result<ExecutionReport, Rejection> {
+        let BuyLevel {
+            price: best_ask,
+            quantity,
+            listings: mut level,
+        } = self.buy_level(order, target, now)?;
+        let fees = self.execution_fees(order, best_ask, quantity)?;
         if let Some(cash) = self.portfolio.cash() {
             if fees.net > cash {
                 return Err(Rejection::InsufficientFunds {
@@ -373,6 +467,7 @@ impl MockExecutor {
             cash_delta,
             cost_basis_released: None,
             realized_pnl: None,
+            prepaid_fee_loss: None,
             filled_at,
             listings: taken.clone(),
             positions: vec![(position.id.clone(), quantity)],
@@ -382,6 +477,8 @@ impl MockExecutor {
             self.book.consume(order.platform, id, *take);
         }
         Ok(ExecutionReport {
+            cash_paid: Some(fees.net),
+            allocated_deposit: None,
             fill: Fill {
                 order: order.clone(),
                 quantity,
@@ -491,26 +588,7 @@ impl MockExecutor {
             });
         }
 
-        // The liquidity gate guarantees verified sales exist, so a reference exists.
-        let reference = self
-            .sell_reference(order, now)
-            .ok_or(Rejection::Arithmetic)?;
-        if order.limit_price > reference {
-            return Err(Rejection::SellLimitAboveMarket {
-                limit: order.limit_price,
-                reference,
-            });
-        }
-        let fees = self
-            .fees
-            .get(order.platform)
-            .sell(order.limit_price, target)?;
-        if fees.unit_fee >= fees.unit_price {
-            return Err(Rejection::NonPositiveProceeds {
-                unit_price: fees.unit_price,
-                unit_fee: fees.unit_fee,
-            });
-        }
+        let fees = self.validate_sell_price(order, target, now)?;
 
         // FIFO over tradable lots: oldest acquisition first, then position id.
         let mut lots: Vec<(usize, &Position)> = matching
@@ -554,12 +632,15 @@ impl MockExecutor {
             cash_delta: fees.net,
             cost_basis_released: Some(released),
             realized_pnl: Some(realized),
+            prepaid_fee_loss: None,
             filled_at,
             listings: Vec::new(),
             positions: drawn_ids,
         };
         self.portfolio.record_sell(entry.clone(), &draws)?;
         Ok(ExecutionReport {
+            cash_paid: None,
+            allocated_deposit: None,
             fill: Fill {
                 order: order.clone(),
                 quantity: target,
@@ -573,4 +654,35 @@ impl MockExecutor {
             position: None,
         })
     }
+
+    fn validate_sell_price(
+        &self,
+        order: &Order,
+        target: u32,
+        now: DateTime<Utc>,
+    ) -> std::result::Result<FeeBreakdown, Rejection> {
+        let reference = self
+            .sell_reference(order, now)
+            .ok_or(Rejection::Arithmetic)?;
+        if order.limit_price > reference {
+            return Err(Rejection::SellLimitAboveMarket {
+                limit: order.limit_price,
+                reference,
+            });
+        }
+        let fees = self.execution_fees(order, order.limit_price, target)?;
+        if fees.net.0 <= 0 {
+            return Err(Rejection::NonPositiveProceeds {
+                unit_price: fees.unit_price,
+                unit_fee: fees.unit_fee,
+            });
+        }
+        Ok(fees)
+    }
+}
+
+struct BuyLevel {
+    price: Money,
+    quantity: u32,
+    listings: Vec<(String, u32)>,
 }

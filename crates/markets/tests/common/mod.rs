@@ -14,6 +14,7 @@ pub fn fees() -> FeeSchedule {
         seller_fee_pct: 4.0,
         buyer_fixed_fee: Money(3),
         seller_fixed_fee: Money(0),
+        ..FeeSchedule::default()
     }
 }
 

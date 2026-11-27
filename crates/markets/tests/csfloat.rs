@@ -192,6 +192,40 @@ async fn maps_429_with_ratelimit_reset_and_http_errors() {
 }
 
 #[tokio::test]
+async fn csfloat_429_applies_server_delay_or_fallback_to_limiter() {
+    for (header_value, expected_secs) in [(None, 60), (Some("90"), 90)] {
+        let server = MockServer::start().await;
+        let mut response = ResponseTemplate::new(429);
+        if let Some(value) = header_value {
+            response = response.insert_header("Retry-After", value);
+        }
+        Mock::given(method("GET"))
+            .and(path("/api/v1/listings"))
+            .respond_with(response)
+            .expect(1)
+            .mount(&server)
+            .await;
+        let config = NetConfig::from_toml(
+            "[rate_limits.csfloat.default]\nmax_requests = 1\nwindow_seconds = 1",
+        )
+        .unwrap();
+        let limiter = Arc::new(config.build_limiter(Arc::new(TokioClock)).unwrap());
+        let cf = client(&server, None, Arc::new(NetGate(limiter.clone())));
+        let expected = Duration::from_secs(expected_secs);
+        assert!(matches!(
+            cf.list_listings(&redline()).await,
+            Err(Error::RateLimited { retry_after }) if retry_after == expected
+        ));
+        assert!(matches!(
+            limiter.try_acquire(Platform::CsFloat, "/api/v1/listings"),
+            Err(Error::RateLimited { retry_after })
+                if retry_after > expected - Duration::from_secs(5) && retry_after <= expected
+        ));
+        server.verify().await;
+    }
+}
+
+#[tokio::test]
 async fn retries_5xx_but_records_and_does_not_retry_429() {
     let server = MockServer::start().await;
     let attempts = AtomicUsize::new(0);

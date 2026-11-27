@@ -1,0 +1,22 @@
+[Unit]
+Description=CS2 arbitrage mock simulation (%i)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+User=ubuntu
+Environment=RUST_LOG=info,cs2_arb_markets::http=debug
+EnvironmentFile=/home/ubuntu/cs2-arb-mock/.env
+WorkingDirectory=/home/ubuntu/cs2-arb-mock-data
+ExecStart=/usr/local/bin/cs2-arb-run %i
+Restart=always
+RestartSec=180s
+RuntimeMaxSec=1h
+UMask=0077
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/ubuntu/cs2-arb-mock-data
+
+[Install]
+WantedBy=multi-user.target

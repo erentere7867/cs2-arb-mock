@@ -27,17 +27,36 @@ struct WatcherEvent {
 }
 
 pub async fn watcher(path: &Path) -> Option<Watcher> {
-    tokio::time::timeout(Duration::from_secs(2), read_watcher(path))
-        .await
-        .ok()?
-        .ok()
+    tokio::time::timeout(Duration::from_secs(2), async {
+        match read_watcher(path, false).await {
+            Ok(watcher) => Some(watcher),
+            Err(error) if can_read_checkpoint(path, &error) => read_watcher(path, true).await.ok(),
+            Err(_) => None,
+        }
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
-async fn read_watcher(path: &Path) -> Result<Watcher, sqlx::Error> {
+fn can_read_checkpoint(path: &Path, error: &sqlx::Error) -> bool {
+    let code = error
+        .as_database_error()
+        .and_then(|error| error.code())
+        .and_then(|code| code.parse::<i32>().ok())
+        .map(|code| code & 0xff);
+    let mut wal = path.as_os_str().to_os_string();
+    wal.push("-wal");
+    // Fall back only for SQLITE_READONLY/CANTOPEN without a live WAL to replay.
+    matches!(code, Some(8 | 14)) && Path::new(&wal).try_exists().is_ok_and(|exists| !exists)
+}
+
+async fn read_watcher(path: &Path, immutable: bool) -> Result<Watcher, sqlx::Error> {
     let mut db = SqliteConnectOptions::new()
         .filename(path)
         .read_only(true)
         .create_if_missing(false)
+        .immutable(immutable)
         .busy_timeout(Duration::from_millis(250))
         .connect()
         .await?;
@@ -164,6 +183,45 @@ fn parse_health(output: &[u8]) -> MarketHealth {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reads_checkpointed_wal_without_writable_sidecars() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        use sqlx::sqlite::SqliteJournalMode;
+        use sqlx::Connection;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.db");
+        let mut writer = SqliteConnectOptions::new()
+            .filename(&path)
+            .create_if_missing(true)
+            .journal_mode(SqliteJournalMode::Wal)
+            .connect()
+            .await
+            .unwrap();
+        sqlx::raw_sql(include_str!(
+            "../../../crates/events/migrations/20261126000001_init.sql"
+        ))
+        .execute(&mut writer)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO app_state VALUES (730, 10, 1795780000000)")
+            .execute(&mut writer)
+            .await
+            .unwrap();
+        writer.close().await.unwrap();
+
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o500)).unwrap();
+        let result = watcher(&path).await;
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert_eq!(result.unwrap().observed_at.unwrap().timestamp(), 1795780000);
+        assert!(!dir.path().join("events.db-wal").exists());
+        assert!(!dir.path().join("events.db-shm").exists());
+    }
 
     #[test]
     fn distinguishes_explicit_429s_from_throttled_reads_and_other_venues() {

@@ -153,6 +153,15 @@ impl<'a> SimFillModel<'a> {
 }
 
 impl FillModel for SimFillModel<'_> {
+    fn preview_fill(&self, strategy: &str, order: &Order) -> Option<(Money, u32)> {
+        self.sessions
+            .borrow()
+            .get(strategy)?
+            .executor
+            .preview_fill(order)
+            .ok()
+    }
+
     fn add_quote_update_times(&self, times: &mut BTreeSet<DateTime<Utc>>) {
         times.extend(self.depth.replaced_books.keys().copied());
     }
@@ -312,23 +321,61 @@ impl StrategyAdapter for SpreadAdapter {
                         view.latest_quote(platform, &position.item, position.float_bucket)
                     {
                         let price = quote.price.checked_sub(self.config.sell_undercut)?;
-                        if price.0 > 0
-                            && view.seller_proceeds(
-                                &PriceSnapshot {
-                                    price,
-                                    ..quote.clone()
-                                },
-                                position.quantity,
-                            )? > position.cost_basis
-                        {
-                            orders.push(exit_order(position, quote, price, view.now));
+                        if price.0 > 0 {
+                            if let Some((order, _)) =
+                                profitable_exit(view, self.name(), position, quote, price)?
+                            {
+                                orders.push(order);
+                            }
                         }
                     }
                 }
             }
         }
         let quotes: Vec<_> = view.latest_quotes().cloned().collect();
+        let mut executable = Vec::new();
         for candidate in evaluate_spread(&quotes, view.fees, &self.config, view.now)? {
+            let order = candidate.buy_order(view.now);
+            let actual = view.preview_fill(self.name(), &order);
+            let candidate = if let Some((price, quantity)) = actual {
+                let Some(buy) = view.latest_quote(
+                    candidate.buy_platform,
+                    &candidate.item,
+                    candidate.float_bucket,
+                ) else {
+                    continue;
+                };
+                let Some(sell) = view.latest_quote(
+                    candidate.sell_platform,
+                    &candidate.item,
+                    candidate.float_bucket,
+                ) else {
+                    continue;
+                };
+                let config = SpreadConfig {
+                    quantity,
+                    ..self.config.clone()
+                };
+                cs2_arb_strategy::spread_breakdown(
+                    &PriceSnapshot {
+                        price,
+                        ..buy.clone()
+                    },
+                    sell,
+                    view.fees,
+                    &config,
+                )?
+            } else {
+                candidate
+            };
+            if candidate.expected_net_profit > self.config.min_net_profit.max(Money(0)) {
+                executable.push((actual.is_some(), candidate));
+            }
+        }
+        executable.sort_by_key(|(can_fill, candidate)| {
+            std::cmp::Reverse((*can_fill, candidate.expected_net_profit))
+        });
+        for (_, candidate) in executable {
             let key = (candidate.item.clone(), candidate.float_bucket);
             if occupied.insert(key) {
                 let order = candidate.buy_order(view.now);
@@ -380,12 +427,18 @@ impl StrategyAdapter for DipAdapter<'_> {
             .iter()
             .filter(|p| !p.is_trade_locked_at(view.now))
         {
-            if let Some((_, quote, proceeds)) =
-                view.best_exit(&position.item, position.float_bucket, position.quantity)?
-            {
-                if proceeds > position.cost_basis {
-                    orders.push(exit_order(position, quote, quote.price, view.now));
+            let mut best = None;
+            for quote in view.quotes_for(&position.item, position.float_bucket) {
+                if let Some((order, profit)) =
+                    profitable_exit(view, self.name(), position, quote, quote.price)?
+                {
+                    if best.as_ref().is_none_or(|(_, previous)| profit > *previous) {
+                        best = Some((order, profit));
+                    }
                 }
+            }
+            if let Some((order, _)) = best {
+                orders.push(order);
             }
         }
         for quote in view.batch {
@@ -394,11 +447,10 @@ impl StrategyAdapter for DipAdapter<'_> {
                 .verified_volume(quote, self.detector.config().liquidity_window_days);
             if let Some(signal) = self.detector.observe_with_liquidity(quote, depth)? {
                 let schedule = view.fees.get(quote.platform);
-                let quantity = signal.order.quantity;
-                let cost = quote
-                    .price
-                    .checked_mul(quantity)?
-                    .checked_add(schedule.buyer_order_fee(quote.price, quantity)?)?;
+                let (price, quantity) = view
+                    .preview_fill(self.name(), &signal.order)
+                    .unwrap_or((quote.price, signal.order.quantity));
+                let cost = schedule.buyer_order_total(price, quantity)?;
                 let mean = PriceSnapshot {
                     price: Money(signal.stats.mean.floor() as i64),
                     ..quote.clone()
@@ -407,12 +459,40 @@ impl StrategyAdapter for DipAdapter<'_> {
                     continue;
                 }
                 if occupied.insert((quote.item.clone(), quote.float_bucket)) {
-                    orders.push(signal.order);
+                    orders.push(Order {
+                        quantity,
+                        ..signal.order
+                    });
                 }
             }
         }
         Ok(orders)
     }
+}
+
+fn profitable_exit(
+    view: &MarketView<'_>,
+    strategy: &str,
+    position: &Position,
+    quote: &PriceSnapshot,
+    price: Money,
+) -> Result<Option<(Order, Money)>> {
+    if !view.quote_is_fresh(quote) || price.0 <= 0 {
+        return Ok(None);
+    }
+    let mut order = exit_order(position, quote, price, view.now);
+    let (_, quantity) = view
+        .preview_fill(strategy, &order)
+        .unwrap_or((price, order.quantity));
+    let released =
+        i128::from(position.cost_basis.0) * i128::from(quantity) / i128::from(position.quantity);
+    let proceeds = view
+        .fees
+        .get(quote.platform)
+        .seller_order_proceeds(price, quantity)?;
+    let profit = proceeds.checked_sub(Money(released as i64))?;
+    order.quantity = quantity;
+    Ok((profit.0 > 0).then_some((order, profit)))
 }
 
 fn occupied_keys(positions: &[Position]) -> HashSet<PositionKey> {

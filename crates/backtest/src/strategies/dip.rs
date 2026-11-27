@@ -76,9 +76,8 @@ impl StrategyAdapter for DipStrategy {
                 let fees = view.fees.get(snapshot.platform);
                 if (snapshot.price.0 as f64) <= threshold
                     && open < self.max_open_per_item
-                    && (!fees.funding.enabled()
-                        || fees.seller_proceeds(Money(mean.floor() as i64))?
-                            > fees.buyer_total(snapshot.price)?)
+                    && fees.seller_order_proceeds(Money(mean.floor() as i64), self.quantity)?
+                        > fees.buyer_order_total(snapshot.price, self.quantity)?
                 {
                     planned.push(item_key);
                     orders.push(buy_order(

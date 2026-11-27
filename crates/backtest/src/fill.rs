@@ -22,6 +22,10 @@ pub enum FillOutcome {
 /// Pluggable simulated execution. The real `cs2-arb-sim` can be adapted to this
 /// trait at integration time (for example by synthesizing a `Listing` from the quote).
 pub trait FillModel {
+    fn preview_fill(&self, _strategy: &str, order: &Order) -> Option<(Money, u32)> {
+        Some((order.limit_price, order.quantity))
+    }
+
     fn add_quote_update_times(&self, _times: &mut BTreeSet<DateTime<Utc>>) {}
 
     fn invalidate_quotes(
@@ -78,7 +82,7 @@ pub trait FillModel {
 }
 
 /// Fills the full order quantity at the quote price when the limit allows it.
-/// Buy fees use `buyer_fee`, sell fees use `seller_fee`, both on the order subtotal.
+/// Percentage fees round per unit; each fixed fee is charged once per order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SnapshotFillModel {
     pub trade_hold: Duration,
@@ -217,10 +221,10 @@ mod tests {
             panic!("expected sell");
         };
         assert_eq!(buy.fee, Money(25));
-        assert_eq!(sell.fee, Money(53));
+        assert_eq!(sell.fee, Money(50));
         assert_eq!(
             model.seller_proceeds(Money(1000), 2, fees).unwrap(),
-            Money(1947)
+            Money(1950)
         );
     }
 

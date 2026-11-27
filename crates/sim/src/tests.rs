@@ -189,7 +189,7 @@ fn assert_accounting_identity(portfolio: &Portfolio) {
 // ---------------------------------------------------------------- happy path
 
 #[test]
-fn replay_charges_platform_fees_per_order_and_funding_fees_per_unit() {
+fn replay_charges_all_fixed_fees_once_per_order() {
     let mut fees = test_fees();
     fees.csfloat.funding.crypto_deposit.fixed = Money(11);
     fees.skinport.seller_fixed_fee = Money(5);
@@ -206,13 +206,13 @@ fn replay_charges_platform_fees_per_order_and_funding_fees_per_unit() {
     h.exec = h.exec.with_order_fees(fees);
 
     let buy = buy("replay-buy", 2, 1000);
-    assert_eq!(h.exec.buy_cost_at_limit(&buy).unwrap(), Money(2074));
-    assert_eq!(h.exec.submit(buy).unwrap().fee, Money(74));
+    assert_eq!(h.exec.buy_cost_at_limit(&buy).unwrap(), Money(2063));
+    assert_eq!(h.exec.submit(buy).unwrap().fee, Money(63));
     h.clock.advance(TimeDelta::days(7));
     h.refresh_sales(Platform::Skinport, 140, Some(LOW_FLOAT), "sale");
     assert_eq!(
         h.exec.submit(sell("replay-sell", 2, 1000)).unwrap().fee,
-        Money(179)
+        Money(172)
     );
     assert_accounting_identity(h.exec.portfolio());
 }
@@ -459,8 +459,8 @@ fn liquidity_cap_is_floor_of_ten_percent_adv_and_zero_rejects() {
     ));
     let fill = h.exec.submit(buy("b", 5, 1000)).unwrap();
     assert_eq!(fill.quantity, 2);
-    assert_eq!(fill.fee, Money(54));
-    assert_eq!(h.exec.portfolio().positions()[0].cost_basis, Money(2054));
+    assert_eq!(fill.fee, Money(52));
+    assert_eq!(h.exec.portfolio().positions()[0].cost_basis, Money(2052));
 }
 
 #[test]
@@ -902,10 +902,10 @@ fn rejects_sell_when_fees_consume_all_proceeds() {
     assert_eq!(h.exec.submit(sell("s", 1, 51)).unwrap().fee, Money(50));
 }
 
-/// Worked FIFO example: lot A = 2 units at 1000 (+27 each) = 2054; lot B = 1
+/// Worked FIFO example: lot A = 2 units at 1000 (+25 each + 2 fixed) = 2052; lot B = 1
 /// unit at 1100 (+round(27.5)=28, +2 = 30) = 1130. After both unlock, selling 2
-/// on DMarket at 1200 (7% = 84 each) releases lot A's 2054 basis:
-/// proceeds 2 * (1200 - 84) = 2232; P&L = 2232 - 2054 = +178.
+/// on DMarket at 1200 (7% = 84 each) releases lot A's 2052 basis:
+/// proceeds 2 * (1200 - 84) = 2232; P&L = 2232 - 2052 = +180.
 /// Then selling the last unit at 1200 releases 1130: P&L 1116 - 1130 = -14.
 #[test]
 fn sells_fifo_with_exact_cost_basis_release() {
@@ -925,7 +925,7 @@ fn sells_fifo_with_exact_cost_basis_release() {
     b.observed_at = h.clock.now();
     h.exec.book_mut().upsert_listing(b);
     h.exec.submit(buy("B", 1, 1100)).unwrap();
-    assert_eq!(h.exec.portfolio().open_cost_basis(), Money(2054 + 1130));
+    assert_eq!(h.exec.portfolio().open_cost_basis(), Money(2052 + 1130));
 
     h.clock.set(t0() + TimeDelta::days(7) + TimeDelta::hours(1));
     let now = h.clock.now();
@@ -940,14 +940,14 @@ fn sells_fifo_with_exact_cost_basis_release() {
     let dm_sell = |id: &str, q| order(id, OrderSide::Sell, Platform::DMarket, q, 1200);
     let first = h.exec.submit_detailed(dm_sell("s1", 2)).unwrap();
     assert_eq!(first.fill.fee, Money(168));
-    assert_eq!(first.ledger_entry.cost_basis_released, Some(Money(2054)));
-    assert_eq!(first.ledger_entry.realized_pnl, Some(Money(178)));
+    assert_eq!(first.ledger_entry.cost_basis_released, Some(Money(2052)));
+    assert_eq!(first.ledger_entry.realized_pnl, Some(Money(180)));
     assert_eq!(first.ledger_entry.positions, vec![("A#pos".to_string(), 2)]);
     let second = h.exec.submit_detailed(dm_sell("s2", 1)).unwrap();
     assert_eq!(second.ledger_entry.realized_pnl, Some(Money(-14)));
     let p = h.exec.portfolio();
-    assert_eq!(p.realized_pnl(), Money(164));
-    assert_eq!(p.buyer_fees_paid(), Money(54 + 30));
+    assert_eq!(p.realized_pnl(), Money(166));
+    assert_eq!(p.buyer_fees_paid(), Money(52 + 30));
     assert_eq!(p.seller_fees_paid(), Money(252));
     assert!(p.positions().is_empty());
     assert_accounting_identity(p);
@@ -967,12 +967,12 @@ fn partial_sell_of_a_lot_releases_proportional_basis() {
     h.refresh_sales(Platform::CsFloat, 140, Some(LOW_FLOAT), "later");
     let s = order("s", OrderSide::Sell, Platform::CsFloat, 1, 1000);
     let report = h.exec.submit_detailed(s).unwrap();
-    // CSFloat seller 2% of 1000 = 20; proceeds 980; basis 2054/2 = 1027.
-    assert_eq!(report.ledger_entry.cost_basis_released, Some(Money(1027)));
-    assert_eq!(report.ledger_entry.realized_pnl, Some(Money(-47)));
+    // CSFloat seller 2% of 1000 = 20; proceeds 980; basis 2052/2 = 1026.
+    assert_eq!(report.ledger_entry.cost_basis_released, Some(Money(1026)));
+    assert_eq!(report.ledger_entry.realized_pnl, Some(Money(-46)));
     let p = h.exec.portfolio();
     assert_eq!(p.positions()[0].quantity, 1);
-    assert_eq!(p.positions()[0].cost_basis, Money(1027));
+    assert_eq!(p.positions()[0].cost_basis, Money(1026));
     assert_accounting_identity(p);
 }
 

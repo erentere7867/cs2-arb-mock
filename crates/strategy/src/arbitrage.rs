@@ -213,17 +213,13 @@ pub fn spread_breakdown(
 
     let buy_fees = fees.get(buy.platform);
     let sell_fees = fees.get(sell.platform);
-    let unit_cost = buy_fees.buyer_total(buy.price)?;
     let drifted_price = cents_floor(sell_price.0 as f64 * (1.0 - config.drift_fraction()))?;
-    let unit_proceeds_no_drift = sell_fees.seller_proceeds(sell_price)?;
-    let unit_proceeds = sell_fees.seller_proceeds(drifted_price)?;
-
     let qty = config.quantity;
-    let buy_cost = unit_cost.checked_mul(qty)?;
-    let sell_proceeds = unit_proceeds.checked_mul(qty)?;
-    let drift_haircut = unit_proceeds_no_drift
-        .checked_sub(unit_proceeds)?
-        .checked_mul(qty)?;
+    let buy_cost = buy_fees.buyer_order_total(buy.price, qty)?;
+    let sell_proceeds = sell_fees.seller_order_proceeds(drifted_price, qty)?;
+    let drift_haircut = sell_fees
+        .seller_order_proceeds(sell_price, qty)?
+        .checked_sub(sell_proceeds)?;
     let opportunity_cost = cents_ceil(buy_cost.0 as f64 * config.opportunity_cost_fraction())?;
     let expected_net_profit = sell_proceeds
         .checked_sub(buy_cost)?

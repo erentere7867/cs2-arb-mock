@@ -44,6 +44,10 @@ impl FundingCharge {
         fee(price, self.pct, self.fixed)
     }
 
+    pub fn order_fee(self, unit_price: Money, quantity: u32) -> Result<Money> {
+        fee_for_order(fee(unit_price, self.pct, Money(0))?, self.fixed, quantity)
+    }
+
     fn valid(self) -> bool {
         (0.0..=100.0).contains(&self.pct) && self.fixed.0 >= 0
     }
@@ -103,18 +107,12 @@ impl TradeFees {
         let crypto_deposit = entry
             .funding
             .crypto_deposit
-            .unit_fee(entry_unit)?
-            .checked_mul(quantity)?;
+            .order_fee(entry_unit, quantity)?;
         let crypto_withdrawal = exit
             .funding
             .crypto_withdrawal
-            .unit_fee(exit_unit)?
-            .checked_mul(quantity)?;
-        let bank_cashout = exit
-            .funding
-            .bank_cashout
-            .unit_fee(exit_unit)?
-            .checked_mul(quantity)?;
+            .order_fee(exit_unit, quantity)?;
+        let bank_cashout = exit.funding.bank_cashout.order_fee(exit_unit, quantity)?;
         Ok(Some(Self {
             platform_buy: entry_fee.checked_sub(crypto_deposit)?,
             platform_sell: exit_fee
@@ -174,38 +172,43 @@ impl FeeSchedule {
 
     pub fn buyer_order_fee(self, unit_price: Money, quantity: u32) -> Result<Money> {
         self.validate()?;
-        fee(
-            unit_price.checked_mul(quantity)?,
-            self.buyer_fee_pct,
+        fee_for_order(
+            fee(unit_price, self.buyer_fee_pct, Money(0))?,
             self.buyer_fixed_fee,
+            quantity,
         )?
         .checked_add(
             self.funding
                 .crypto_deposit
-                .unit_fee(unit_price)?
-                .checked_mul(quantity)?,
+                .order_fee(unit_price, quantity)?,
         )
     }
 
     pub fn seller_order_fee(self, unit_price: Money, quantity: u32) -> Result<Money> {
         self.validate()?;
-        fee(
-            unit_price.checked_mul(quantity)?,
-            self.seller_fee_pct,
+        fee_for_order(
+            fee(unit_price, self.seller_fee_pct, Money(0))?,
             self.seller_fixed_fee,
+            quantity,
         )?
         .checked_add(
             self.funding
                 .crypto_withdrawal
-                .unit_fee(unit_price)?
-                .checked_mul(quantity)?,
+                .order_fee(unit_price, quantity)?,
         )?
-        .checked_add(
-            self.funding
-                .bank_cashout
-                .unit_fee(unit_price)?
-                .checked_mul(quantity)?,
-        )
+        .checked_add(self.funding.bank_cashout.order_fee(unit_price, quantity)?)
+    }
+
+    pub fn buyer_order_total(self, unit_price: Money, quantity: u32) -> Result<Money> {
+        unit_price
+            .checked_mul(quantity)?
+            .checked_add(self.buyer_order_fee(unit_price, quantity)?)
+    }
+
+    pub fn seller_order_proceeds(self, unit_price: Money, quantity: u32) -> Result<Money> {
+        unit_price
+            .checked_mul(quantity)?
+            .checked_sub(self.seller_order_fee(unit_price, quantity)?)
     }
 
     pub fn buyer_total(self, subtotal: Money) -> Result<Money> {
@@ -215,6 +218,13 @@ impl FeeSchedule {
     pub fn seller_proceeds(self, subtotal: Money) -> Result<Money> {
         subtotal.checked_sub(self.seller_fee(subtotal)?)
     }
+}
+
+pub fn fee_for_order(unit_commission: Money, fixed: Money, quantity: u32) -> Result<Money> {
+    if quantity == 0 {
+        return Ok(Money(0));
+    }
+    unit_commission.checked_mul(quantity)?.checked_add(fixed)
 }
 
 fn fee(subtotal: Money, pct: f64, fixed: Money) -> Result<Money> {

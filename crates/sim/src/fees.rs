@@ -72,6 +72,15 @@ pub struct FeeRate {
 }
 
 impl FeeRate {
+    fn order_fee(self, unit_price: Money, quantity: u32, rounding: RoundingMode) -> Result<Money> {
+        let commission = Self {
+            fixed: Money(0),
+            ..self
+        }
+        .unit_fee(unit_price, rounding)?;
+        cs2_arb_core::fee_for_order(commission, self.fixed, quantity)
+    }
+
     /// Fee for a single unit at `unit_price`.
     pub fn unit_fee(self, unit_price: Money, rounding: RoundingMode) -> Result<Money> {
         if unit_price.0 < 0 {
@@ -152,13 +161,37 @@ impl ExactFeeSchedule {
 
     /// Cash paid by the buyer for `quantity` units, buyer marketplace fee included.
     pub fn buy(&self, unit_price: Money, quantity: u32) -> Result<FeeBreakdown> {
-        let unit_fee = self.buyer_unit_fee(unit_price)?;
+        self.buy_fill(unit_price, quantity, true)
+    }
+
+    pub(crate) fn buy_fill(
+        &self,
+        unit_price: Money,
+        quantity: u32,
+        first_fill: bool,
+    ) -> Result<FeeBreakdown> {
+        let rate = |rate: FeeRate| {
+            if first_fill {
+                rate
+            } else {
+                FeeRate {
+                    fixed: Money(0),
+                    ..rate
+                }
+            }
+        };
         let gross = unit_price.checked_mul(quantity)?;
-        let fee = unit_fee.checked_mul(quantity)?;
+        let fee = rate(self.buyer)
+            .order_fee(unit_price, quantity, self.rounding)?
+            .checked_add(rate(self.crypto_deposit).order_fee(
+                unit_price,
+                quantity,
+                self.rounding,
+            )?)?;
         Ok(FeeBreakdown {
             quantity,
             unit_price,
-            unit_fee,
+            unit_fee: Money(fee.0.checked_div(i64::from(quantity)).unwrap_or(0)),
             gross,
             fee,
             net: gross.checked_add(fee)?,
@@ -167,13 +200,22 @@ impl ExactFeeSchedule {
 
     /// Cash received by the seller for `quantity` units, seller fee deducted.
     pub fn sell(&self, unit_price: Money, quantity: u32) -> Result<FeeBreakdown> {
-        let unit_fee = self.seller_unit_fee(unit_price)?;
         let gross = unit_price.checked_mul(quantity)?;
-        let fee = unit_fee.checked_mul(quantity)?;
+        let fee = self
+            .seller
+            .order_fee(unit_price, quantity, self.rounding)?
+            .checked_add(
+                self.crypto_withdrawal
+                    .order_fee(unit_price, quantity, self.rounding)?,
+            )?
+            .checked_add(
+                self.bank_cashout
+                    .order_fee(unit_price, quantity, self.rounding)?,
+            )?;
         Ok(FeeBreakdown {
             quantity,
             unit_price,
-            unit_fee,
+            unit_fee: Money(fee.0.checked_div(i64::from(quantity)).unwrap_or(0)),
             gross,
             fee,
             net: gross.checked_sub(fee)?,

@@ -576,10 +576,10 @@ pub fn evaluate_bid_economics(
 ) -> Result<PegBidEconomics> {
     let raw_margin_ceiling =
         Money((rolling_median.0 as f64 * (1.0 - config.target_margin_fraction())).floor() as i64);
-    let unit_buy_cost = fees.buyer_total(unit_bid)?;
-    let buy_cost = unit_buy_cost.checked_mul(config.quantity)?;
-    let unit_sell_proceeds = fees.seller_proceeds(rolling_median)?;
-    let sell_proceeds = unit_sell_proceeds.checked_mul(config.quantity)?;
+    let buy_cost = fees.buyer_order_total(unit_bid, config.quantity)?;
+    let sell_proceeds = fees
+        .seller_order_proceeds(rolling_median, 1)?
+        .checked_mul(config.quantity)?;
     let opportunity_cost = cents_ceil(buy_cost.0 as f64 * config.opportunity_cost_fraction())?;
     let expected_net_profit = sell_proceeds
         .checked_sub(buy_cost)?

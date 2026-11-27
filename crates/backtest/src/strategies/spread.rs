@@ -65,10 +65,8 @@ impl StrategyAdapter for SpreadStrategy {
             let quotes = view.quotes_for(&snapshot.item, snapshot.float_bucket);
             let mut best_buy = None;
             for quote in &quotes {
-                let subtotal = quote.price.checked_mul(self.quantity)?;
                 let fees = view.fees.get(quote.platform);
-                let cost =
-                    subtotal.checked_add(fees.buyer_order_fee(quote.price, self.quantity)?)?;
+                let cost = fees.buyer_order_total(quote.price, self.quantity)?;
                 if best_buy.as_ref().is_none_or(|(_, c)| cost < *c) {
                     best_buy = Some((*quote, cost));
                 }

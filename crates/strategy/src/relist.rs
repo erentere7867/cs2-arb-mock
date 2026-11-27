@@ -296,8 +296,7 @@ impl RelistEngine {
                         }
                         let net = fees
                             .get(platform)
-                            .seller_proceeds(ask)?
-                            .checked_mul(pos.quantity)?;
+                            .seller_order_proceeds(ask, pos.quantity)?;
                         if net <= pos.cost_basis {
                             continue;
                         }
@@ -367,8 +366,7 @@ impl RelistEngine {
 
                     let schedule = fees.get(platform);
                     let gross_proceeds = ask_price.checked_mul(pos.quantity)?;
-                    let unit_seller_fee = schedule.seller_fee(ask_price)?;
-                    let seller_fee = unit_seller_fee.checked_mul(pos.quantity)?;
+                    let seller_fee = schedule.seller_order_fee(ask_price, pos.quantity)?;
                     let net_proceeds = gross_proceeds.checked_sub(seller_fee)?;
                     if net_proceeds.0 <= 0 {
                         continue;

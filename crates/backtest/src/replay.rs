@@ -195,6 +195,14 @@ impl<'a> MarketView<'a> {
         self.fill_model
             .seller_proceeds(quote.price, quantity, self.fees.get(quote.platform))
     }
+
+    pub(crate) fn preview_fill(&self, strategy: &str, order: &Order) -> Option<(Money, u32)> {
+        self.fill_model.preview_fill(strategy, order)
+    }
+
+    pub(crate) fn quote_is_fresh(&self, quote: &PriceSnapshot) -> bool {
+        quote_is_fresh(quote, self.now, self.max_quote_age)
+    }
 }
 
 /// A strategy that can be driven by the replay engine. Integration can wrap
@@ -220,6 +228,7 @@ struct Lot {
     entry_subtotal: Money,
     /// Remaining entry fees.
     entry_fee: Money,
+    entry_deposit: Money,
 }
 
 #[derive(Default)]
@@ -451,6 +460,10 @@ impl<F: FillModel> Backtester<F> {
                     position,
                     entry_subtotal: subtotal,
                     entry_fee: fill.fee,
+                    entry_deposit: fees
+                        .funding
+                        .crypto_deposit
+                        .order_fee(fill.unit_price, fill.quantity)?,
                 });
             }
             OrderSide::Sell => {
@@ -471,7 +484,17 @@ impl<F: FillModel> Backtester<F> {
         let now = fill.filled_at;
         let mut remaining = fill.quantity;
         let mut exit_left = exit_subtotal;
-        let mut exit_fee_left = fill.fee;
+        let funding = self.config.fees.get(order.platform).funding;
+        let mut withdrawal_left = funding
+            .crypto_withdrawal
+            .order_fee(fill.unit_price, fill.quantity)?;
+        let mut bank_left = funding
+            .bank_cashout
+            .order_fee(fill.unit_price, fill.quantity)?;
+        let mut platform_left = fill
+            .fee
+            .checked_sub(withdrawal_left)?
+            .checked_sub(bank_left)?;
         let mut units_left = fill.quantity;
         let mut index = 0;
         while remaining > 0 {
@@ -486,10 +509,16 @@ impl<F: FillModel> Backtester<F> {
             let take = remaining.min(lot.position.quantity);
             let entry_subtotal = prorate(lot.entry_subtotal, take, lot.position.quantity);
             let entry_fee = prorate(lot.entry_fee, take, lot.position.quantity);
+            let entry_deposit = prorate(lot.entry_deposit, take, lot.position.quantity);
             let exit_part = prorate(exit_left, take, units_left);
-            let exit_fee = prorate(exit_fee_left, take, units_left);
+            let withdrawal = prorate(withdrawal_left, take, units_left);
+            let bank = prorate(bank_left, take, units_left);
+            let platform = prorate(platform_left, take, units_left);
+            let exit_fee = withdrawal.checked_add(bank)?.checked_add(platform)?;
             exit_left = exit_left.checked_sub(exit_part)?;
-            exit_fee_left = exit_fee_left.checked_sub(exit_fee)?;
+            withdrawal_left = withdrawal_left.checked_sub(withdrawal)?;
+            bank_left = bank_left.checked_sub(bank)?;
+            platform_left = platform_left.checked_sub(platform)?;
             units_left -= take;
             remaining -= take;
 
@@ -509,15 +538,20 @@ impl<F: FillModel> Backtester<F> {
                 exit_fee,
                 gross_pnl: gross,
                 fees,
-                fee_breakdown: TradeFees::from_trade(
-                    self.config.fees.get(lot.position.acquired_on),
-                    self.config.fees.get(order.platform),
-                    entry_fee,
-                    exit_fee,
-                    Money(entry_subtotal.0 / i64::from(take)),
-                    fill.unit_price,
-                    take,
-                )?,
+                fee_breakdown: (funding.enabled()
+                    || self
+                        .config
+                        .fees
+                        .get(lot.position.acquired_on)
+                        .funding
+                        .enabled())
+                .then_some(TradeFees {
+                    platform_buy: entry_fee.checked_sub(entry_deposit)?,
+                    platform_sell: platform,
+                    crypto_deposit: entry_deposit,
+                    crypto_withdrawal: withdrawal,
+                    bank_cashout: bank,
+                }),
                 net_pnl: gross.checked_sub(fees)?,
                 opened_at: lot.position.acquired_at,
                 locked_until: lot.position.locked_until,
@@ -528,6 +562,7 @@ impl<F: FillModel> Backtester<F> {
             lot.position.quantity -= take;
             lot.entry_subtotal = lot.entry_subtotal.checked_sub(entry_subtotal)?;
             lot.entry_fee = lot.entry_fee.checked_sub(entry_fee)?;
+            lot.entry_deposit = lot.entry_deposit.checked_sub(entry_deposit)?;
             lot.position.cost_basis = lot.entry_subtotal.checked_add(lot.entry_fee)?;
             if lot.position.quantity == 0 {
                 book.lots.remove(index);
@@ -953,9 +988,9 @@ mod tests {
         assert_eq!(trades[0].position_id, "s-1");
         assert_eq!(trades[1].position_id, "s-2");
         assert_eq!(trades[2].position_id, "s-2");
-        // Sell of 4 @ 908 = 3632, 2% fee = 73 (72.64 rounded), split 3:1.
+        // Sell of 4 @ 908 = 3632, 2% fee = 18 each, split 3:1.
         assert_eq!(trades[0].exit_subtotal.0 + trades[1].exit_subtotal.0, 3632);
-        assert_eq!(trades[0].exit_fee.0 + trades[1].exit_fee.0, 73);
+        assert_eq!(trades[0].exit_fee.0 + trades[1].exit_fee.0, 72);
         assert_eq!(trades[1].entry_subtotal, Money(1000));
         assert_eq!(trades[1].entry_fee, Money(10));
         assert_eq!(trades[2].entry_fee, Money(10));
@@ -968,45 +1003,175 @@ mod tests {
         assert!(report.totals.max_drawdown.0 >= -report.totals.net_pnl.0);
     }
 
+    fn depth_with_snapshots(rows: &[(PriceSnapshot, u32, u32)]) -> crate::integrated::MarketDepth {
+        use cs2_arb_core::{Listing, Sale};
+        let mut depth = crate::integrated::MarketDepth::default();
+        for (index, (quote, stock, sales)) in rows.iter().enumerate() {
+            depth.replace_listings(
+                quote.observed_at,
+                quote.platform,
+                quote.item.clone(),
+                vec![Listing {
+                    id: format!("{index}"),
+                    platform: quote.platform,
+                    item: quote.item.clone(),
+                    price: quote.price,
+                    quantity: *stock,
+                    float_value: Some(0.18),
+                    observed_at: quote.observed_at,
+                    trade_locked_until: None,
+                }],
+            );
+            depth.add_sales((0..*sales).map(|n| Sale {
+                id: format!("{index}-{n}"),
+                platform: quote.platform,
+                item: quote.item.clone(),
+                price: quote.price,
+                float_value: Some(0.18),
+                sold_at: quote.observed_at - Duration::seconds(1),
+                verified: true,
+            }));
+        }
+        depth
+    }
+
     #[test]
     fn dip_only_buys_when_recovery_to_the_mean_covers_fees() {
-        use crate::integrated::{DipAdapter, MarketDepth};
-        use cs2_arb_core::Sale;
-        use cs2_arb_strategy::DipConfig;
+        use crate::integrated::{DipAdapter, SimFillModel};
+        use cs2_arb_strategy::{DipConfig, KillSwitch, RiskLimits};
 
-        let mut depth = MarketDepth::default();
-        depth.add_sales([Sale {
-            id: "baseline-sale".into(),
-            platform: Platform::CsFloat,
-            item: item(),
-            price: Money(1000),
-            float_value: Some(0.18),
-            sold_at: t(1),
-            verified: true,
-        }]);
-        for (dip_price, expected_fills) in [(990, 0), (900, 2)] {
+        let mut fees = fees();
+        fees.csfloat = FeeSchedule {
+            seller_fixed_fee: Money(75),
+            ..FeeSchedule::default()
+        };
+        // Two at 950 would be profitable at the 1000 mean, but only one can fill:
+        // one-unit recovery proceeds after the fixed charge are 925.
+        for (dip_price, expected_fills) in [(950, 0), (900, 2)] {
+            let snapshots = [(0, 999), (1, 1001), (2, dip_price), (9, 1000)]
+                .map(|(day, price)| snap(Platform::CsFloat, day, price));
+            // Restrict day 2 to one unit at the best ask even though verified sales allow more.
+            let mut rows = snapshots.clone().map(|quote| (quote, 2, 70));
+            rows[2].1 = 1;
+            let depth = depth_with_snapshots(&rows);
             let mut strategies: Vec<Box<dyn StrategyAdapter>> = vec![Box::new(
                 DipAdapter::new(
                     DipConfig {
                         min_samples: 2,
                         min_sales_in_window: 1,
+                        quantity: 2,
                         ..DipConfig::default()
                     },
                     &depth,
                 )
                 .unwrap(),
             )];
-            let snapshots = [(0, 999), (1, 1001), (2, dip_price), (9, 1000)]
-                .map(|(day, price)| snap(Platform::CsFloat, day, price));
             let events = [MarketEvent::PanicWindowOpened {
                 branch: "test".into(),
                 opened_at: t(2),
             }];
-            let report = Backtester::new(BacktestConfig::new(fees()))
+            let model = SimFillModel::new(
+                &depth,
+                fees.clone(),
+                RiskLimits::default(),
+                KillSwitch::new(),
+            );
+            let report = Backtester::with_fill_model(BacktestConfig::new(fees.clone()), model)
                 .run(SimulationMode, &snapshots, &events, &mut strategies)
                 .unwrap();
             assert_eq!(report.totals.orders_filled, expected_fills);
             assert_eq!(report.totals.open_positions, 0);
+            if expected_fills > 0 {
+                assert_eq!(report.trades[0].quantity, 1);
+                assert_eq!(report.trades[0].net_pnl, Money(25));
+            }
+        }
+    }
+
+    #[test]
+    fn spread_partial_exit_rejects_a_loss_after_the_liquidity_cap() {
+        use crate::integrated::{SimFillModel, SpreadAdapter};
+        use cs2_arb_strategy::{KillSwitch, RiskLimits, SpreadConfig};
+
+        let mut fees = fees();
+        fees.csfloat = FeeSchedule {
+            buyer_fixed_fee: Money(50),
+            ..FeeSchedule::default()
+        };
+        fees.dmarket = FeeSchedule {
+            seller_fixed_fee: Money(80),
+            ..FeeSchedule::default()
+        };
+        let rows = [
+            (snap(Platform::CsFloat, 0, 1000), 2, 140),
+            (snap(Platform::DMarket, 0, 1300), 2, 140),
+            (snap(Platform::DMarket, 7, 1080), 2, 70),
+            (snap(Platform::DMarket, 8, 1200), 2, 0),
+        ];
+        let snapshots = rows.clone().map(|(quote, _, _)| quote);
+        let depth = depth_with_snapshots(&rows);
+        let model = SimFillModel::new(
+            &depth,
+            fees.clone(),
+            RiskLimits::default(),
+            KillSwitch::new(),
+        );
+        let mut strategies: Vec<Box<dyn StrategyAdapter>> =
+            vec![Box::new(SpreadAdapter::new(SpreadConfig {
+                quantity: 2,
+                ..SpreadConfig::default()
+            }))];
+        let report = Backtester::with_fill_model(BacktestConfig::new(fees), model)
+            .run(SimulationMode, &snapshots, &[], &mut strategies)
+            .unwrap();
+        assert_eq!(report.trades.len(), 1);
+        assert_eq!(report.trades[0].closed_at, t(8));
+        assert_eq!(report.trades[0].quantity, 1);
+        assert_eq!(report.trades[0].net_pnl, Money(95));
+    }
+
+    #[test]
+    fn multi_unit_spread_has_the_same_fees_and_profit_in_both_replay_models() {
+        use crate::integrated::{SimFillModel, SpreadAdapter};
+        use cs2_arb_strategy::{KillSwitch, RiskLimits, SpreadConfig};
+
+        let mut fees = fees();
+        fees.csfloat = FeeSchedule {
+            buyer_fixed_fee: Money(100),
+            ..FeeSchedule::default()
+        };
+        fees.dmarket = FeeSchedule::default();
+        fees.dmarket.funding.crypto_withdrawal.fixed = Money(100);
+        let rows = [
+            (snap(Platform::CsFloat, 0, 1000), 2, 140),
+            (snap(Platform::DMarket, 0, 1130), 2, 140),
+            (snap(Platform::DMarket, 7, 1130), 2, 140),
+        ];
+        let snapshots = rows.clone().map(|(quote, _, _)| quote);
+        let depth = depth_with_snapshots(&rows);
+        let strategies = || -> Vec<Box<dyn StrategyAdapter>> {
+            vec![Box::new(SpreadAdapter::new(SpreadConfig {
+                annual_opportunity_rate_pct: 0.0,
+                quantity: 2,
+                ..SpreadConfig::default()
+            }))]
+        };
+        let snapshot = Backtester::new(BacktestConfig::new(fees.clone()))
+            .run(SimulationMode, &snapshots, &[], &mut strategies())
+            .unwrap();
+        let cli = Backtester::with_fill_model(
+            BacktestConfig::new(fees.clone()),
+            SimFillModel::new(&depth, fees, RiskLimits::default(), KillSwitch::new()),
+        )
+        .run(SimulationMode, &snapshots, &[], &mut strategies())
+        .unwrap();
+        for report in [snapshot, cli] {
+            assert_eq!(report.trades.len(), 1);
+            let trade = &report.trades[0];
+            assert_eq!(trade.quantity, 2);
+            assert_eq!(trade.entry_fee, Money(100));
+            assert_eq!(trade.exit_fee, Money(100));
+            assert_eq!(trade.net_pnl, Money(60));
         }
     }
 
@@ -1098,6 +1263,7 @@ mod tests {
             },
             entry_subtotal: Money(1800),
             entry_fee: Money(0),
+            entry_deposit: Money(0),
         };
         let replay = Backtester::with_fill_model(BacktestConfig::new(fees.clone()), model);
         assert_eq!(replay.mark(&lot, &latest, t(0)).unwrap(), Money(2030));

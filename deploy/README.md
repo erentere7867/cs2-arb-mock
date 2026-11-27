@@ -26,6 +26,10 @@ cs2-arb-mock@cs2\`. The CS2 and Rust jobs use their branch's default live venues
 Skinport reads are public; DMarket's existing offers adapter requires both
 credentials and opt-in, so these jobs do not use it by default.
 
+To block new simulated orders in both jobs, create
+/home/ubuntu/cs2-arb-mock-data/KILL_SWITCH (not a file in the checkout).
+To resume, remove the file and restart both mock units to clear the latched switch.
+
 ## Read results
 
 \`\`\`sh

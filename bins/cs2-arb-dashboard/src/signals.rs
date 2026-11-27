@@ -140,7 +140,9 @@ fn parse_health(output: &[u8]) -> MarketHealth {
             continue;
         }
         health.csfloat_skipped_reads += usize::from(skipped);
-        let explicit = message.contains("http 429 received; pausing market host requests");
+        let explicit = message
+            .contains("http 429 received; endpoint silenced for the full penalty window")
+            || message.contains("http 429 received; pausing market host requests");
         let throttle =
             message.contains("rate limited") || message.contains("429 too many requests");
         if explicit || throttle {
@@ -166,6 +168,7 @@ mod tests {
     #[test]
     fn distinguishes_explicit_429s_from_throttled_reads_and_other_venues() {
         let sample = br#"
+{"MESSAGE":"2026-11-27T12:00:00.000000Z  WARN cs2_arb_net::limiter: HTTP 429 received; endpoint silenced for the full penalty window endpoint=CsFloat:/api/v1/listings cooldown_secs=60.0","__REALTIME_TIMESTAMP":"1795779000000000"}
 {"MESSAGE":"HTTP 429 received; pausing market host requests endpoint=\"csfloat.listings\"","__REALTIME_TIMESTAMP":"1795780000000000"}
 {"MESSAGE":"read-only listing request skipped platform=CsFloat error=rate limited","__REALTIME_TIMESTAMP":"1795781000000000"}
 {"MESSAGE":"read-only listing request skipped platform=Skinport error=rate limited","__REALTIME_TIMESTAMP":"1795782000000000"}
@@ -173,10 +176,10 @@ mod tests {
 "#;
         let health = parse_health(sample);
         assert!(health.readable);
-        assert_eq!(health.sampled_entries, 4);
+        assert_eq!(health.sampled_entries, 5);
         assert_eq!(health.skipped_reads, 3);
         assert_eq!(health.csfloat_skipped_reads, 2);
-        assert_eq!(health.csfloat_http_429s, 1);
+        assert_eq!(health.csfloat_http_429s, 2);
         assert_eq!(health.csfloat_throttle_signals, 1);
         assert_eq!(health.last_csfloat_signal.unwrap().timestamp(), 1795781000);
         assert!(!parse_health(b"").readable);

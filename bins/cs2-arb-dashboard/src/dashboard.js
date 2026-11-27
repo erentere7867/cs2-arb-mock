@@ -157,14 +157,14 @@ function marketHealth(game) {
   if (game.id === "cs2") {
     metrics.append(
       metric("CSFloat reads skipped", signal.csfloat_skipped_reads),
-      metric("CSFloat HTTP 429s", signal.csfloat_http_429s, signal.csfloat_http_429s ? "warn" : ""),
+      metric("CSFloat HTTP 429 signals", signal.csfloat_http_429s, signal.csfloat_http_429s ? "warn" : ""),
       metric("Other throttle signals", signal.csfloat_throttle_signals, signal.csfloat_throttle_signals ? "warn" : "")
     );
   }
   node.append(metrics);
   const observed = signal.last_csfloat_signal ? "Last CSFloat throttle signal: " + stamp(signal.last_csfloat_signal) + ". " : "";
   const note = game.id === "cs2"
-    ? "A 429 or local cooldown does not establish an IP ban; zero observed signals do not establish API health."
+    ? "One response can log multiple signals. A 429 or local cooldown does not establish an IP ban; zero observed signals do not establish API health."
     : "Zero skipped reads does not establish API health.";
   node.append(el("p", observed + note, "hint"));
   return node;

@@ -114,9 +114,16 @@ pub struct MarketHealth {
 #[derive(Deserialize)]
 struct JournalEntry {
     #[serde(rename = "MESSAGE")]
-    message: String,
+    message: JournalMessage,
     #[serde(rename = "__REALTIME_TIMESTAMP")]
     timestamp: String,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum JournalMessage {
+    Text(String),
+    Bytes(Vec<u8>),
 }
 
 pub async fn health(game: &str) -> MarketHealth {
@@ -144,7 +151,11 @@ fn parse_health(output: &[u8]) -> MarketHealth {
         };
         health.readable = true;
         health.sampled_entries += 1;
-        let message = entry.message.to_ascii_lowercase();
+        let message = match &entry.message {
+            JournalMessage::Text(text) => text.as_str().into(),
+            JournalMessage::Bytes(bytes) => String::from_utf8_lossy(bytes),
+        }
+        .to_ascii_lowercase();
         let skipped = [
             "read-only listing request skipped",
             "read-only sales request skipped",
@@ -221,6 +232,23 @@ mod tests {
         assert_eq!(result.unwrap().observed_at.unwrap().timestamp(), 1795780000);
         assert!(!dir.path().join("events.db-wal").exists());
         assert!(!dir.path().join("events.db-shm").exists());
+    }
+
+    #[test]
+    fn counts_csfloat_429s_in_journal_byte_arrays() {
+        let message = b"\x1b[33m WARN\x1b[0m \x1b[2mcs2_arb_markets::http\x1b[0m\x1b[2m:\x1b[0m HTTP 429 received; pausing market host requests \x1b[3mendpoint\x1b[0m\x1b[2m=\x1b[0m\"csfloat.listings\" \x1b[3mretry_after\x1b[0m\x1b[2m=\x1b[0m60s";
+        let sample = serde_json::json!({
+            "MESSAGE": message.as_slice(),
+            "__REALTIME_TIMESTAMP": "1795790038819796",
+        });
+        let health = parse_health(sample.to_string().as_bytes());
+        assert_eq!(health.csfloat_http_429s, 1);
+        assert_eq!(
+            health.last_csfloat_signal,
+            DateTime::from_timestamp_micros(1795790038819796)
+        );
+        assert_eq!(health.sampled_entries, 1);
+        assert!(health.readable);
     }
 
     #[test]

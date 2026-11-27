@@ -171,7 +171,7 @@ async fn short_quota_reset_waits_without_dropping_dmarket_sales() {
         .respond_with(
             ResponseTemplate::new(200)
                 .insert_header("RateLimit-Remaining", "0")
-                .insert_header("RateLimit-Reset", "1")
+                .insert_header("RateLimit-Reset", "3")
                 .set_body_json(json!({"items": []})),
         )
         .expect(1)
@@ -195,9 +195,11 @@ async fn short_quota_reset_waits_without_dropping_dmarket_sales() {
     let item = redline();
     let sales = dm.recent_sales(&item, t0() - chrono::Duration::days(1));
     tokio::pin!(sales);
-    assert!(tokio::time::timeout(Duration::from_millis(999), &mut sales)
-        .await
-        .is_err());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(2_999), &mut sales)
+            .await
+            .is_err()
+    );
     assert_eq!(server.received_requests().await.unwrap().len(), 1);
     assert_eq!(sales.await.unwrap().len(), 1);
     assert_eq!(server.received_requests().await.unwrap().len(), 2);

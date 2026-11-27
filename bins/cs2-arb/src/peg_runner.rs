@@ -133,7 +133,7 @@ impl PegBidDashboard {
                     out,
                     "| {:?} | {} | {} | {} | {} | {:.2}% |",
                     bid.order.platform,
-                    bid.order.item.market_hash_name,
+                    escape_md_cell(&bid.order.item.market_hash_name),
                     format_money(bid.order.limit_price),
                     format_money(bid.rolling_median),
                     format_money(bid.effective_ceiling),
@@ -156,9 +156,9 @@ impl PegBidDashboard {
                 let _ = writeln!(
                     out,
                     "| {} | {:?} | {} | {} | {} | {} | {} |",
-                    row.position_id,
+                    escape_md_cell(&row.position_id),
                     row.platform,
-                    row.item,
+                    escape_md_cell(&row.item),
                     row.quantity,
                     format_money(row.cost_basis),
                     row.locked_until.format("%Y-%m-%d %H:%M UTC"),
@@ -395,6 +395,10 @@ fn format_money(money: Money) -> String {
     let sign = if money.0 < 0 { "-" } else { "" };
     let abs = money.0.unsigned_abs();
     format!("{sign}${}.{:02}", abs / 100, abs % 100)
+}
+
+fn escape_md_cell(value: &str) -> String {
+    value.replace('|', "\\|")
 }
 
 #[cfg(test)]

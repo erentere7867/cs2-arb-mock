@@ -136,9 +136,13 @@ impl MarketRegime {
                     .push((sale.sold_at, sale.price.0));
             }
         }
-        for points in prices.values_mut().flat_map(|sources| sources.values_mut()) {
-            points.sort_unstable();
-            points.dedup();
+        for sources in prices.values_mut() {
+            for (source, points) in sources {
+                points.sort_unstable();
+                if matches!(source, PriceSource::Snapshot(..)) {
+                    points.dedup();
+                }
+            }
         }
         Ok(Self { config, prices })
     }
@@ -349,6 +353,50 @@ mod tests {
         )
         .unwrap();
         assert!(wider.at(now()).allows(&item("Below margin")));
+    }
+
+    #[test]
+    fn distinct_sale_ids_keep_their_weight_at_identical_prices_and_times() {
+        let sale = Sale {
+            id: "yesterday".into(),
+            platform: Platform::CsFloat,
+            item: item("One"),
+            price: Money(100),
+            float_value: None,
+            sold_at: now() - Duration::days(1),
+            verified: true,
+        };
+        let current = Sale {
+            id: "current-high".into(),
+            price: Money(110),
+            sold_at: now(),
+            ..sale.clone()
+        };
+        let sales = [
+            sale,
+            current.clone(),
+            current.clone(),
+            Sale {
+                id: "current-low-1".into(),
+                price: Money(90),
+                ..current.clone()
+            },
+            Sale {
+                id: "current-low-2".into(),
+                price: Money(90),
+                ..current
+            },
+        ];
+        let regime = MarketRegime::new(
+            RegimeConfig {
+                min_index_items: 1,
+                ..RegimeConfig::default()
+            },
+            &[],
+            &sales,
+        )
+        .unwrap();
+        assert_eq!(regime.at(now()).state.market.short_pct, Some(-10.0));
     }
 
     #[test]

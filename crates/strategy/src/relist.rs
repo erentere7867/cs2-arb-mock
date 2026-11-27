@@ -270,7 +270,7 @@ impl RelistEngine {
                             .into_iter()
                             .filter(|p| self.config.cross_venue && *p != pos.acquired_on),
                     ) {
-                        if platform != pos.acquired_on
+                        if self.config.cross_venue
                             && self.trailing_volume(
                                 platform,
                                 &pos.item,
@@ -646,6 +646,35 @@ mod tests {
                 verified: true,
             })
             .collect()
+    }
+
+    #[test]
+    fn cross_venue_relist_does_not_prefer_an_illiquid_purchase_venue() {
+        let acquired = t(1, 12);
+        let now = t(8, 12);
+        let mut engine = RelistEngine::new(RelistConfig {
+            cross_venue: true,
+            ..RelistConfig::default()
+        })
+        .unwrap();
+        let position = make_position(acquired);
+        let snapshot = PriceSnapshot {
+            platform: position.acquired_on,
+            item: position.item.clone(),
+            float_bucket: None,
+            observed_at: now,
+            price: Money(15_000),
+        };
+        engine.track_position(position, acquired);
+        let sales: Vec<_> = make_sales(20, 12_000, now)
+            .into_iter()
+            .map(|s| Sale {
+                platform: Platform::Waxpeer,
+                ..s
+            })
+            .collect();
+        let step = engine.step(&sales, &[snapshot], &fees(), now).unwrap();
+        assert_eq!(step.listed_orders[0].platform, Platform::Waxpeer);
     }
 
     #[test]

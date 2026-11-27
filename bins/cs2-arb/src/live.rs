@@ -223,17 +223,17 @@ pub async fn collect(
                     }
                 }
                 if polls_bids(*platform, instant_sale, waxpeer_has_key) {
-                    match client.top_buy_orders(item).await {
-                        Ok(orders) if instant_sale => {
+                    match client.poll_buy_orders(item).await {
+                        Ok((orders, observed_at)) if instant_sale => {
                             record_bid_poll(
                                 &mut bid_refreshes,
                                 *platform,
                                 item,
                                 orders,
-                                Utc::now(),
+                                observed_at.unwrap_or_else(Utc::now),
                             );
                         }
-                        Ok(orders) => buy_orders.extend(orders),
+                        Ok((orders, _)) => buy_orders.extend(orders),
                         Err(Error::RateLimited { .. }) => {}
                         Err(error) => {
                             tracing::warn!(?platform, %error, "read-only buy-orders request skipped")
@@ -291,24 +291,14 @@ fn record_bid_poll(
     platform: Platform,
     item: &ItemId,
     bids: Vec<BuyOrder>,
-    completed_at: DateTime<Utc>,
+    at: DateTime<Utc>,
 ) {
-    let mut ticks = BTreeMap::<_, Vec<_>>::new();
-    for bid in bids {
-        ticks.entry(bid.observed_at).or_default().push(bid);
-    }
-    if ticks.is_empty() {
-        ticks.insert(completed_at, Vec::new());
-    }
-    for (index, (at, bids)) in ticks.into_iter().enumerate() {
-        refreshes.push(BidRefresh {
-            at,
-            platform,
-            item: item.clone(),
-            bids,
-            replace: index == 0,
-        });
-    }
+    refreshes.push(BidRefresh {
+        at,
+        platform,
+        item: item.clone(),
+        bids,
+    });
 }
 
 fn polls_bids(platform: Platform, instant_sale: bool, waxpeer_has_key: bool) -> bool {
@@ -330,7 +320,7 @@ fn quotable(listing: &Listing, at: DateTime<Utc>, max_age: TimeDelta) -> bool {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn live_bids_tick_when_observed_and_empty_polls_tick_when_completed() {
+    fn live_bid_poll_publishes_one_atomic_tick_and_empty_poll_clears() {
         let at = Utc::now();
         let later = at + TimeDelta::seconds(1);
         let completed_at = later + TimeDelta::milliseconds(1);
@@ -353,18 +343,18 @@ mod tests {
             platform,
             &item,
             vec![bid(later), bid(at)],
-            completed_at,
+            later,
         );
         record_bid_poll(&mut refreshes, platform, &item, Vec::new(), completed_at);
         assert_eq!(
             refreshes
                 .iter()
-                .map(|refresh| (refresh.at, refresh.bids.len(), refresh.replace))
+                .map(|refresh| (refresh.at, refresh.bids.len()))
                 .collect::<Vec<_>>(),
-            [(at, 1, true), (later, 1, false), (completed_at, 0, true)]
+            [(later, 2), (completed_at, 0)]
         );
         assert_eq!(refreshes[0].bids[0].observed_at, refreshes[0].at);
-        assert_eq!(refreshes[1].bids[0].observed_at, refreshes[1].at);
+        assert_eq!(refreshes[0].bids[1].observed_at, at);
     }
 
     #[test]

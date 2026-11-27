@@ -59,4 +59,11 @@ impl<M: MarketClient> MarketClient for ResilientMarket<M> {
     async fn top_buy_orders(&self, item: &ItemId) -> Result<Vec<BuyOrder>> {
         self.read(|| self.inner.top_buy_orders(item)).await
     }
+
+    async fn poll_buy_orders(
+        &self,
+        item: &ItemId,
+    ) -> Result<(Vec<BuyOrder>, Option<DateTime<Utc>>)> {
+        self.read(|| self.inner.poll_buy_orders(item)).await
+    }
 }

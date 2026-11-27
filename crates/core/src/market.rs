@@ -186,6 +186,16 @@ pub trait MarketClient: Send + Sync {
     async fn top_buy_orders(&self, _item: &ItemId) -> Result<Vec<BuyOrder>> {
         Ok(Vec::new())
     }
+
+    /// Return a complete poll and its observation time, if known.
+    async fn poll_buy_orders(
+        &self,
+        item: &ItemId,
+    ) -> Result<(Vec<BuyOrder>, Option<DateTime<Utc>>)> {
+        let orders = self.top_buy_orders(item).await?;
+        let observed_at = orders.iter().map(|order| order.observed_at).max();
+        Ok((orders, observed_at))
+    }
 }
 
 #[cfg(test)]

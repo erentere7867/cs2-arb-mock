@@ -351,13 +351,21 @@ impl MarketClient for WaxpeerClient {
     }
 
     async fn top_buy_orders(&self, item: &ItemId) -> Result<Vec<BuyOrder>> {
+        Ok(self.poll_buy_orders(item).await?.0)
+    }
+
+    async fn poll_buy_orders(
+        &self,
+        item: &ItemId,
+    ) -> Result<(Vec<BuyOrder>, Option<DateTime<Utc>>)> {
         validate_item_for_game(item, self.game)?;
         if let Some(api_key) = &self.detailed_buy_orders {
             let Some(api_key) = api_key else {
-                return Ok(Vec::new());
+                return Ok((Vec::new(), None));
             };
             let game = self.game_code();
             let mut orders = HashMap::new();
+            let mut last_response_at = None;
             for page in 0..MAX_BID_PAGES {
                 let skip = (page * BID_PAGE_SIZE).to_string();
                 let query = query_string(&[
@@ -371,22 +379,18 @@ impl MarketClient for WaxpeerClient {
                     .http
                     .get(&DETAILED_BUY_ORDERS, &path, HeaderMap::new())
                     .await?;
-                let rows = add_detailed_bid_page(
-                    &body,
-                    item,
-                    game,
-                    &mut orders,
-                    page,
-                    self.http.clock().now(),
-                )?;
+                let observed_at = self.http.clock().now();
+                last_response_at = Some(observed_at);
+                let rows =
+                    add_detailed_bid_page(&body, item, game, &mut orders, page, observed_at)?;
                 if rows < BID_PAGE_SIZE || orders.len() >= MAX_BID_ORDERS {
                     break;
                 }
             }
-            return Ok(detailed_depth(orders, item));
+            return Ok((detailed_depth(orders, item), last_response_at));
         }
         let bids = self.fetch(&BUY_ORDERS, &self.bids, parse_bids).await?;
-        Ok(bids
+        let orders: Vec<_> = bids
             .value
             .get(&item.market_hash_name)
             .map(|&price| BuyOrder {
@@ -398,7 +402,9 @@ impl MarketClient for WaxpeerClient {
                 observed_at: bids.fetched_at,
             })
             .into_iter()
-            .collect())
+            .collect();
+        let observed_at = orders.first().map(|order| order.observed_at);
+        Ok((orders, observed_at))
     }
 
     async fn fees(&self) -> Result<FeeSchedule> {

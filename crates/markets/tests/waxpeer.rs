@@ -18,16 +18,17 @@ async fn detailed_bids_page_past_filtered_depth_on_get() {
         json!({"id":1,"name":"Alien Red","game":"rust","price":13000,"amount":1,"filled":0,"by":"earlier"}),
         json!({"id":2,"name":"Alien Red","game":"rust","price":12900,"amount":1,"filled":0,"by":"owner"}),
         json!({"id":3,"name":"Alien Red","game":"rust","price":12800,"amount":1,"filled":0,"by":"owner"}),
-    ].into_iter().chain(std::iter::repeat_n(filtered, 97)).collect();
+    ].into_iter().chain(std::iter::repeat_n(filtered.clone(), 97)).collect();
     for (skip, rows) in [
         ("0", first_page),
         (
             "100",
-            vec![
+            [
                 json!({"name":"Alien Red","game":"rust","price":12500,"amount":5,"filled":0,"by":"owner"}),
                 json!({"id":3,"name":"Alien Red","game":"rust","price":12800,"amount":1,"filled":0,"by":"owner"}),
-            ],
+            ].into_iter().chain(std::iter::repeat_n(filtered.clone(), 98)).collect(),
         ),
+        ("200", vec![filtered]),
     ] {
         let reply = ResponseTemplate::new(200).set_body_json(json!({"success":true,"orders":rows}));
         let response_clock = Arc::clone(&clock);
@@ -52,7 +53,8 @@ async fn detailed_bids_page_past_filtered_depth_on_get() {
         market_hash_name: "Alien Red".into(),
         wear_tier: WearTier::NotApplicable,
     };
-    let bids = client.top_buy_orders(&item).await.unwrap();
+    let (bids, observed_at) = client.poll_buy_orders(&item).await.unwrap();
+    assert_eq!(observed_at, Some(t0() + chrono::TimeDelta::seconds(9)));
     assert_eq!(bids.len(), 4);
     assert_eq!(bids[0].price, Money(1300));
     assert_eq!(bids[0].observed_at, t0() + chrono::TimeDelta::seconds(3));

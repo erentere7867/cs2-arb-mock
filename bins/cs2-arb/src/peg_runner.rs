@@ -22,7 +22,6 @@ pub struct BidRefresh {
     pub platform: Platform,
     pub item: ItemId,
     pub bids: Vec<BuyOrder>,
-    pub replace: bool,
 }
 
 /// One trade-locked inventory entry displayed on the dashboard.
@@ -408,19 +407,8 @@ pub fn run_peg_bid_engine(
             .get(refresh_idx)
             .filter(|refresh| refresh.at == now)
         {
-            relist.refresh_bid_book(
-                refresh.platform,
-                &refresh.item,
-                &refresh.bids,
-                refresh.replace,
-            );
-            strategy.refresh_buy_orders(
-                refresh.platform,
-                &refresh.item,
-                &refresh.bids,
-                now,
-                refresh.replace,
-            );
+            relist.replace_bid_book(refresh.platform, &refresh.item, &refresh.bids);
+            strategy.replace_buy_orders(refresh.platform, &refresh.item, &refresh.bids, now);
             refresh_idx += 1;
         }
         let relist_step = relist.step(

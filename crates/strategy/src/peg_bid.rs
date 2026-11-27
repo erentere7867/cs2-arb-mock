@@ -240,18 +240,15 @@ impl PegBidStrategy {
         }
     }
 
-    pub fn refresh_buy_orders(
+    pub fn replace_buy_orders(
         &mut self,
         platform: Platform,
         item: &ItemId,
         orders: &[BuyOrder],
         now: DateTime<Utc>,
-        replace: bool,
     ) {
-        if replace {
-            self.top_bids
-                .retain(|(venue, bid_item, _), _| *venue != platform || bid_item != item);
-        }
+        self.top_bids
+            .retain(|(venue, bid_item, _), _| *venue != platform || bid_item != item);
         if !self.config.allowed_platforms.contains(&platform) {
             return;
         }
@@ -722,18 +719,17 @@ mod tests {
             quantity: 1,
             observed_at: now - Duration::seconds(age),
         };
-        strategy.refresh_buy_orders(
+        strategy.replace_buy_orders(
             venue,
             &item,
             &[bid(9000, 3), bid(8500, 1), bid(8400, 0)],
             now,
-            true,
         );
         assert_eq!(
             strategy.top_bids[&(venue, item.clone(), None)].price,
             Money(8500)
         );
-        strategy.refresh_buy_orders(venue, &item, &[], now, true);
+        strategy.replace_buy_orders(venue, &item, &[], now);
         assert!(strategy.top_bids.is_empty());
     }
 

@@ -223,20 +223,12 @@ impl RelistEngine {
         }
     }
 
-    pub fn refresh_bid_book(
-        &mut self,
-        platform: Platform,
-        item: &ItemId,
-        bids: &[BuyOrder],
-        replace: bool,
-    ) {
+    pub fn replace_bid_book(&mut self, platform: Platform, item: &ItemId, bids: &[BuyOrder]) {
         if !self.config.instant_sale || platform == Platform::Skinport {
             return;
         }
-        if replace {
-            self.bids
-                .retain(|(venue, bid_item, _), _| *venue != platform || bid_item != item);
-        }
+        self.bids
+            .retain(|(venue, bid_item, _), _| *venue != platform || bid_item != item);
         for bid in bids.iter().filter(|bid| {
             bid.platform == platform && &bid.item == item && bid.price.0 > 0 && bid.quantity > 0
         }) {
@@ -892,7 +884,7 @@ mod tests {
             quantity: 1,
             observed_at: now - Duration::seconds(1),
         }]);
-        engine.refresh_bid_book(Platform::CsFloat, &item(), &[], true);
+        engine.replace_bid_book(Platform::CsFloat, &item(), &[]);
         let step = engine
             .step(&make_sales(20, 10_000, now), &[], &fees(), now)
             .unwrap();
@@ -916,7 +908,7 @@ mod tests {
             })
             .unwrap();
             engine.track_position(make_position(acquired), acquired);
-            engine.refresh_bid_book(
+            engine.replace_bid_book(
                 Platform::CsFloat,
                 &item(),
                 &[
@@ -937,7 +929,6 @@ mod tests {
                         observed_at: now,
                     },
                 ],
-                true,
             );
             let step = engine
                 .step(&make_sales(20, 10_000, now), &[], &fees(), now)

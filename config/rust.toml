@@ -67,3 +67,9 @@ quota_group = "catalogue"
 [rate_limits.dmarket.default]
 max_requests = 1
 window_seconds = 1
+
+# Days of live quotes, verified sales and buy-book polls kept in events.db for
+# the regime gate and `backtest --history-db`; 30 covers a 7-day hold plus the
+# 21-day dip max hold.
+[market_history]
+retention_days = 30

@@ -23,8 +23,6 @@ use crate::{bundled_snapshots, watch, Inputs, Market};
 
 type MarketClients = Vec<(Platform, Box<dyn MarketClient>)>;
 
-const MARKET_HISTORY_RETENTION: TimeDelta = TimeDelta::days(10);
-
 pub struct MarketSources<'a> {
     pub secrets: &'a Secrets,
     pub base_url_override: Option<&'a str>,
@@ -188,6 +186,7 @@ pub async fn collect(
     instant_sale: bool,
     sales_lookback_days: i64,
     max_listing_age: TimeDelta,
+    history_retention: TimeDelta,
     sources: &MarketSources<'_>,
 ) -> Result<(Inputs, MarketHistory)> {
     let sales_lookback = TimeDelta::try_days(sales_lookback_days)
@@ -310,9 +309,15 @@ pub async fn collect(
             watch::drain(&queue, &mut events).await?;
         }
     }
-    let retain_since = started_at - MARKET_HISTORY_RETENTION;
+    let retain_since = started_at - history_retention;
     queue
-        .record_market_history(game, &regime_quotes, depth.sales(), retain_since)
+        .record_market_history(
+            game,
+            &regime_quotes,
+            depth.sales(),
+            &bid_refreshes,
+            retain_since,
+        )
         .await?;
     if snapshots.is_empty() {
         return Err(Error::InvalidData(

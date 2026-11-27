@@ -17,6 +17,6 @@ pub use fees::{
 };
 pub use game::{Game, RUST_APP_ID};
 pub use market::{
-    comparable_wear, BuyOrder, FloatBucket, ItemId, Listing, MarketClient, Platform, PriceSnapshot,
-    Sale, WearTier,
+    comparable_wear, BuyOrder, BuyOrderPoll, FloatBucket, ItemId, Listing, MarketClient, Platform,
+    PriceSnapshot, Sale, WearTier,
 };

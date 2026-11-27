@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, TimeDelta, Utc};
-use cs2_arb_core::{Error, Game, MarketEvent, PriceSnapshot, Result, Sale};
+use cs2_arb_core::{BuyOrderPoll, Error, Game, MarketEvent, PriceSnapshot, Result, Sale};
 use serde::{Deserialize, Serialize};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteRow};
 use sqlx::{Row, SqliteConnection, SqlitePool};
@@ -271,6 +271,7 @@ pub struct EventQueue {
 pub struct MarketHistory {
     pub snapshots: Vec<PriceSnapshot>,
     pub sales: Vec<Sale>,
+    pub bid_polls: Vec<BuyOrderPoll>,
 }
 
 const QUEUE_COLUMNS: &str = "id, kind, payload, dedupe_key, status, attempts, enqueued_at, \
@@ -335,6 +336,25 @@ impl EventQueue {
         })
     }
 
+    /// Open an existing database for reading recorded history without migrating
+    /// or writing it, so a live store can be replayed while batches keep running.
+    pub async fn open_read_only(path: &str) -> Result<Self> {
+        let options = SqliteConnectOptions::new()
+            .filename(path)
+            .read_only(true)
+            .busy_timeout(Duration::from_secs(5));
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .map_err(storage)?;
+        Ok(Self {
+            pool,
+            config: QueueConfig::default(),
+            clock: Arc::new(SystemClock),
+        })
+    }
+
     /// A private in-memory queue (lost on drop).
     pub async fn open_in_memory(config: QueueConfig, clock: Arc<dyn Clock>) -> Result<Self> {
         Self::open_with("sqlite::memory:", config, clock).await
@@ -358,6 +378,7 @@ impl EventQueue {
         game: Game,
         snapshots: &[PriceSnapshot],
         sales: &[Sale],
+        bid_polls: &[BuyOrderPoll],
         retain_since: DateTime<Utc>,
     ) -> Result<()> {
         let app_id = i64::from(game.app_id());
@@ -389,6 +410,21 @@ impl EventQueue {
                 .await
                 .map_err(storage)?;
         }
+        for poll in bid_polls.iter().filter(|poll| poll.at >= retain_since) {
+            sqlx::query("INSERT INTO market_bid_polls (app_id, observed_at, payload) VALUES (?, ?, ?) ON CONFLICT DO NOTHING")
+                .bind(app_id)
+                .bind(to_millis(poll.at))
+                .bind(serde_json::to_string(poll).map_err(storage)?)
+                .execute(&mut *tx)
+                .await
+                .map_err(storage)?;
+        }
+        sqlx::query("DELETE FROM market_bid_polls WHERE app_id = ? AND observed_at < ?")
+            .bind(app_id)
+            .bind(cutoff)
+            .execute(&mut *tx)
+            .await
+            .map_err(storage)?;
         sqlx::query("DELETE FROM market_snapshots WHERE app_id = ? AND observed_at < ?")
             .bind(app_id)
             .bind(cutoff)
@@ -437,9 +473,38 @@ impl EventQueue {
             .iter()
             .map(|payload| serde_json::from_str(payload).map_err(storage))
             .collect::<Result<_>>()?;
+        let has_bid_polls = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'market_bid_polls'",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(storage)?
+            > 0;
+        let bid_polls = if has_bid_polls {
+            sqlx::query_scalar::<_, String>(
+                "SELECT payload FROM market_bid_polls WHERE app_id = ? AND observed_at BETWEEN ? AND ? ORDER BY observed_at, payload",
+            )
+            .bind(app_id)
+            .bind(to_millis(from))
+            .bind(to_millis(through))
+            .fetch_all(&self.pool)
+            .await
+            .map_err(storage)?
+        } else {
+            Vec::new()
+        };
+        let mut bid_polls: Vec<BuyOrderPoll> = bid_polls
+            .iter()
+            .map(|payload| serde_json::from_str(payload).map_err(storage))
+            .collect::<Result<_>>()?;
         snapshots.retain(|quote| (from..=through).contains(&quote.observed_at));
         sales.retain(|sale| (from..=through).contains(&sale.sold_at));
-        Ok(MarketHistory { snapshots, sales })
+        bid_polls.retain(|poll| (from..=through).contains(&poll.at));
+        Ok(MarketHistory {
+            snapshots,
+            sales,
+            bid_polls,
+        })
     }
 
     // ----------------------------------------------------------------- queue

@@ -155,6 +155,17 @@ pub struct PriceSnapshot {
     pub observed_at: DateTime<Utc>,
 }
 
+/// Read-only top-of-book buy order observed on a marketplace.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BuyOrder {
+    pub platform: Platform,
+    pub item: ItemId,
+    pub float_bucket: Option<FloatBucket>,
+    pub price: Money,
+    pub quantity: u32,
+    pub observed_at: DateTime<Utc>,
+}
+
 /// Read-only API. There are intentionally no methods to place or execute real orders.
 #[async_trait]
 pub trait MarketClient: Send + Sync {
@@ -162,6 +173,11 @@ pub trait MarketClient: Send + Sync {
     async fn recent_sales(&self, item: &ItemId, since: DateTime<Utc>) -> Result<Vec<Sale>>;
     async fn price_snapshot(&self, item: &ItemId) -> Result<PriceSnapshot>;
     async fn fees(&self) -> Result<FeeSchedule>;
+
+    /// Read-only top-of-book buy orders, highest bid first when supported by the marketplace.
+    async fn top_buy_orders(&self, _item: &ItemId) -> Result<Vec<BuyOrder>> {
+        Ok(Vec::new())
+    }
 }
 
 #[cfg(test)]

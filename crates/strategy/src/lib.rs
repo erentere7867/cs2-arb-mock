@@ -14,6 +14,8 @@ pub mod arbitrage;
 pub mod dip;
 pub mod executor;
 pub mod kill_switch;
+pub mod peg_bid;
+pub mod relist;
 pub mod risk;
 
 pub use arbitrage::{evaluate_spread, spread_breakdown, SpreadBreakdown, SpreadConfig};
@@ -23,6 +25,14 @@ pub use dip::{
 };
 pub use executor::{submit_with_risk, SimExecutor, SubmitError};
 pub use kill_switch::KillSwitch;
+pub use peg_bid::{
+    compute_effective_ceiling, evaluate_bid_economics, median_cents, meets_net_margin,
+    ActivePegBid, PegBidConfig, PegBidDecision, PegBidEconomics, PegBidSkipReason, PegBidStrategy,
+};
+pub use relist::{
+    InventoryStatus, RealizedRelistSale, RelistConfig, RelistEngine, RelistStepResult,
+    TrackedInventoryItem,
+};
 pub use risk::{RiskLimits, RiskManager, RiskRejection};
 
 use chrono::{DateTime, Utc};

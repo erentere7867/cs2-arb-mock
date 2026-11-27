@@ -32,7 +32,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use cs2_arb_core::{
-    Error, FeeSchedule, ItemId, Listing, MarketClient, Platform, PriceSnapshot, Result, Sale,
+    BuyOrder, Error, FeeSchedule, ItemId, Listing, MarketClient, Platform, PriceSnapshot, Result,
+    Sale,
 };
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION};
 use serde::Deserialize;
@@ -57,6 +58,12 @@ pub const SALES_HISTORY_ENDPOINT: Endpoint = Endpoint {
     platform: Platform::CsFloat,
     name: "csfloat.sales_history",
     path: "/api/v1/history/{market_hash_name}/sales",
+};
+
+pub const BUY_ORDERS_ENDPOINT: Endpoint = Endpoint {
+    platform: Platform::CsFloat,
+    name: "csfloat.buy_orders",
+    path: "/api/v1/buy-orders",
 };
 
 /// CSFloat API key. Never printed: `Debug` is redacted and there is no `Serialize`.
@@ -145,6 +152,61 @@ struct RawSale {
     price: i64,
     item: RawItem,
     sold_at: DateTime<Utc>,
+}
+
+#[derive(Deserialize)]
+struct RawBuyOrder {
+    #[serde(default)]
+    market_hash_name: Option<String>,
+    price: i64,
+    #[serde(default = "default_buy_order_qty")]
+    qty: u32,
+}
+
+fn default_buy_order_qty() -> u32 {
+    1
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum RawBuyOrders {
+    Wrapped { data: Vec<RawBuyOrder> },
+    Bare(Vec<RawBuyOrder>),
+}
+
+/// Parses a read-only buy-orders response into [`BuyOrder`] rows sorted highest bid first.
+pub fn parse_buy_orders(
+    body: &[u8],
+    item: &ItemId,
+    observed_at: DateTime<Utc>,
+) -> Result<Vec<BuyOrder>> {
+    let raw = match parse_json::<RawBuyOrders>("csfloat buy orders", body)? {
+        RawBuyOrders::Wrapped { data } => data,
+        RawBuyOrders::Bare(data) => data,
+    };
+    let mut out = Vec::new();
+    for row in raw {
+        if row
+            .market_hash_name
+            .as_deref()
+            .is_some_and(|name| name != item.market_hash_name)
+        {
+            continue;
+        }
+        if row.qty == 0 || row.price <= 0 {
+            continue;
+        }
+        out.push(BuyOrder {
+            platform: Platform::CsFloat,
+            item: item.clone(),
+            float_bucket: None,
+            price: cents_from_i64(row.price)?,
+            quantity: row.qty,
+            observed_at,
+        });
+    }
+    out.sort_by_key(|a| std::cmp::Reverse(a.price));
+    Ok(out)
 }
 
 fn id_string(value: &serde_json::Value) -> String {
@@ -356,5 +418,16 @@ impl MarketClient for CsFloatClient {
 
     async fn fees(&self) -> Result<FeeSchedule> {
         Ok(self.fees)
+    }
+
+    async fn top_buy_orders(&self, item: &ItemId) -> Result<Vec<BuyOrder>> {
+        validate_item(item)?;
+        let query = query_string(&[("market_hash_name", item.market_hash_name.as_str())]);
+        let path = format!("{}?{query}", BUY_ORDERS_ENDPOINT.path);
+        let body = self
+            .http
+            .get(&BUY_ORDERS_ENDPOINT, &path, self.headers()?)
+            .await?;
+        parse_buy_orders(&body, item, self.http.clock().now())
     }
 }

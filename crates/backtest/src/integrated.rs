@@ -50,6 +50,10 @@ impl MarketDepth {
         self.sales.extend(sales);
     }
 
+    pub fn sales(&self) -> &[Sale] {
+        &self.sales
+    }
+
     /// Convert historical quotes into one-unit mock listings. A quote is not a sale.
     pub fn from_snapshots(snapshots: &[PriceSnapshot]) -> Self {
         let mut depth = Self::default();

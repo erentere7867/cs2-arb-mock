@@ -5,12 +5,15 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use cs2_arb_backtest::integrated::{DipAdapter, MarketDepth, SimFillModel, SpreadAdapter};
 use cs2_arb_backtest::{fixtures, BacktestConfig, Backtester, PerformanceReport, StrategyAdapter};
 use cs2_arb_core::{
-    Error, FeeSchedules, MarketEvent, Platform, PriceSnapshot, Result, SimulationMode,
+    BuyOrder, Error, FeeSchedules, MarketEvent, Platform, PriceSnapshot, Result, SimulationMode,
 };
-use cs2_arb_strategy::{DipConfig, KillSwitch, RiskLimits, SpreadConfig};
+use cs2_arb_strategy::{
+    DipConfig, KillSwitch, PegBidConfig, RelistConfig, RiskLimits, SpreadConfig,
+};
 use serde::Deserialize;
 
 mod live;
+mod peg_runner;
 mod watch;
 
 const DEFAULT_SNAPSHOTS: &str = "data/fixtures/price_snapshots.json";
@@ -33,7 +36,7 @@ enum Command {
     RunMock {
         #[command(flatten)]
         history: HistoricalArgs,
-        #[arg(long, conflicts_with_all = ["snapshots", "events", "sales"])]
+        #[arg(long, conflicts_with_all = ["snapshots", "events", "sales", "buy_orders"])]
         live_market_data: bool,
         #[arg(long, value_enum, requires = "live_market_data")]
         platform: Vec<Market>,
@@ -71,6 +74,9 @@ struct HistoricalArgs {
     /// Individual sales JSON for historical liquidity; custom snapshots never invent sales.
     #[arg(long)]
     sales: Option<PathBuf>,
+    /// Optional top-of-book buy orders JSON for custom peg-bidding replays.
+    #[arg(long)]
+    buy_orders: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -96,6 +102,8 @@ struct Settings {
     spread: SpreadConfig,
     dip: DipConfig,
     risk: RiskLimits,
+    peg_bid: PegBidConfig,
+    relist: RelistConfig,
 }
 
 #[tokio::main]
@@ -156,11 +164,27 @@ async fn run(cli: Cli) -> Result<()> {
         } => (historical(history)?, Some(output_dir)),
         Command::Watch { .. } => unreachable!("handled before loading market configuration"),
     };
-    let report = simulate(&inputs, fees, settings, KillSwitch::with_defaults())?;
+    let kill_switch = KillSwitch::with_defaults();
+    let peg_config = settings.peg_bid.clone();
+    let relist_config = settings.relist.clone();
+    let risk_limits = settings.risk.clone();
+    let report = simulate(&inputs, fees.clone(), settings, kill_switch.clone())?;
+    let peg_dashboard = peg_runner::run_peg_bid_engine(
+        &inputs.snapshots,
+        inputs.depth.sales(),
+        &inputs.buy_orders,
+        &fees,
+        peg_config,
+        relist_config,
+        risk_limits,
+        &kill_switch,
+        None,
+    )?;
+    peg_dashboard.log_summary();
     if let Some(directory) = output {
-        write_reports(&directory, &report)?;
+        write_reports(&directory, &report, &peg_dashboard)?;
     } else {
-        print!("{}", report.to_markdown());
+        print!("{}{}", report.to_markdown(), peg_dashboard.to_markdown());
     }
     Ok(())
 }
@@ -169,6 +193,7 @@ struct Inputs {
     snapshots: Vec<PriceSnapshot>,
     events: Vec<MarketEvent>,
     depth: MarketDepth,
+    buy_orders: Vec<BuyOrder>,
 }
 
 fn historical(args: HistoricalArgs) -> Result<Inputs> {
@@ -193,10 +218,19 @@ fn historical(args: HistoricalArgs) -> Result<Inputs> {
     } else if bundled {
         depth.add_bundled_mock_sales(&snapshots);
     }
+    let buy_orders = if let Some(path) = args.buy_orders {
+        serde_json::from_str(&read(&path)?)
+            .map_err(|err| Error::InvalidData(format!("invalid buy orders JSON: {err}")))?
+    } else if bundled {
+        peg_runner::derive_offline_buy_orders(&snapshots)
+    } else {
+        Vec::new()
+    };
     Ok(Inputs {
         snapshots,
         events,
         depth,
+        buy_orders,
     })
 }
 
@@ -224,14 +258,28 @@ fn read(path: &Path) -> Result<String> {
         .map_err(|err| Error::Storage(format!("{}: {err}", path.display())))
 }
 
-fn write_reports(directory: &Path, report: &PerformanceReport) -> Result<()> {
+fn write_reports(
+    directory: &Path,
+    report: &PerformanceReport,
+    peg_dashboard: &peg_runner::PegBidDashboard,
+) -> Result<()> {
     std::fs::create_dir_all(directory).map_err(|err| Error::Storage(err.to_string()))?;
     let json = directory.join("backtest.json");
+    let peg_json = directory.join("peg_dashboard.json");
     let markdown = directory.join("backtest.md");
     std::fs::write(&json, report.to_json()?).map_err(|err| Error::Storage(err.to_string()))?;
-    std::fs::write(&markdown, report.to_markdown())
+    let peg_body = serde_json::to_string_pretty(peg_dashboard)
         .map_err(|err| Error::Storage(err.to_string()))?;
-    println!("Wrote {} and {}", json.display(), markdown.display());
+    std::fs::write(&peg_json, peg_body).map_err(|err| Error::Storage(err.to_string()))?;
+    let mut full_md = report.to_markdown();
+    full_md.push_str(&peg_dashboard.to_markdown());
+    std::fs::write(&markdown, full_md).map_err(|err| Error::Storage(err.to_string()))?;
+    println!(
+        "Wrote {}, {}, and {}",
+        json.display(),
+        peg_json.display(),
+        markdown.display()
+    );
     Ok(())
 }
 
@@ -281,6 +329,7 @@ mod tests {
                 .unwrap();
         let mut inputs = Inputs {
             depth: MarketDepth::from_snapshots(&snapshots),
+            buy_orders: peg_runner::derive_offline_buy_orders(&snapshots),
             snapshots,
             events,
         };

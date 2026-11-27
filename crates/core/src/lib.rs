@@ -13,6 +13,6 @@ pub use event::{MarketEvent, CS2_APP_ID};
 pub use execution::{Fill, Order, OrderSide, Position, SimulationMode};
 pub use fees::{FeeSchedule, FeeSchedules, Money};
 pub use market::{
-    comparable_wear, FloatBucket, ItemId, Listing, MarketClient, Platform, PriceSnapshot, Sale,
-    WearTier,
+    comparable_wear, BuyOrder, FloatBucket, ItemId, Listing, MarketClient, Platform, PriceSnapshot,
+    Sale, WearTier,
 };

@@ -17,6 +17,7 @@
 //!   Fees are integer cents, per unit, with an explicit [`RoundingMode`].
 
 pub mod book;
+pub mod buy_order_fill;
 pub mod clock {
     pub use cs2_arb_core::{Clock, ManualClock, SystemClock};
 }
@@ -31,6 +32,9 @@ pub mod rng;
 pub mod wear;
 
 pub use book::MarketBook;
+pub use buy_order_fill::{
+    BuyOrderFillConfig, BuyOrderFillSimulator, BuyOrderStatus, RestingBuyOrder,
+};
 pub use clock::{Clock, ManualClock, SystemClock};
 pub use config::{
     valve_trade_hold, FillLatency, LiquidityConfig, LiquidityScope, SimConfig,

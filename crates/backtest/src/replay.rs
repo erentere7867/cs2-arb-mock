@@ -728,6 +728,13 @@ impl<F: FillModel> Backtester<F> {
             strategies: per_strategy,
             trades: all_trades,
             unverified_platform_assumptions: Vec::new(),
+            transfer_fees_paid: strategies
+                .iter()
+                .filter_map(|strategy| {
+                    let fees = self.fill_model.transfer_fees_paid(strategy.name());
+                    (fees.0 != 0).then(|| (strategy.name().to_owned(), fees))
+                })
+                .collect(),
             venue_balances: strategies
                 .iter()
                 .map(|strategy| {

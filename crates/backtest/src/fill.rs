@@ -44,6 +44,10 @@ pub trait FillModel {
         Ok(Vec::new())
     }
 
+    fn transfer_fees_paid(&self, _strategy: &str) -> Money {
+        Money(0)
+    }
+
     fn available_cash(&self, _strategy: &str, _platform: cs2_arb_core::Platform) -> Option<Money> {
         None
     }

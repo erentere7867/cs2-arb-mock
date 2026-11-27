@@ -100,6 +100,7 @@ pub struct VenueAccounts {
     available: HashMap<Platform, Money>,
     pending: Vec<(DateTime<Utc>, Platform, Money)>,
     next_transfer: usize,
+    transfer_fees_paid: Money,
 }
 
 impl VenueAccounts {
@@ -115,11 +116,16 @@ impl VenueAccounts {
             rules,
             fees,
             next_transfer: 0,
+            transfer_fees_paid: Money(0),
         }
     }
 
     pub fn current(&self, platform: Platform) -> Money {
         self.available.get(&platform).copied().unwrap_or_default()
+    }
+
+    pub fn transfer_fees_paid(&self) -> Money {
+        self.transfer_fees_paid
     }
 
     pub fn sale_balance_hold(&self, platform: Platform) -> Option<i64> {
@@ -212,7 +218,11 @@ impl VenueAccounts {
                     "mock transfer fees consume the transfer amount".into(),
                 ));
             }
+            let transfer_fees_paid = self
+                .transfer_fees_paid
+                .checked_add(transfer.amount.checked_sub(credited)?)?;
             self.debit(transfer.from, transfer.amount)?;
+            self.transfer_fees_paid = transfer_fees_paid;
             self.pending.push((at, transfer.to, credited));
             self.next_transfer += 1;
         }
@@ -300,6 +310,16 @@ mod tests {
         rules.validate(&[from, to]).unwrap();
         let mut accounts = VenueAccounts::new(rules, fees);
         accounts.advance(start).unwrap();
+        assert_eq!(accounts.transfer_fees_paid(), Money(30));
+        let balances = accounts.balances().unwrap();
+        assert_eq!(
+            balances
+                .iter()
+                .map(|b| b.available.0 + b.pending.0)
+                .sum::<i64>()
+                + accounts.transfer_fees_paid().0,
+            5000
+        );
         assert_eq!(accounts.current(from), Money(4000));
         assert_eq!(accounts.current(to), Money(0));
         accounts.credit_sale(to, Money(500), start).unwrap();

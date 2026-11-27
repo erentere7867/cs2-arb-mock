@@ -46,6 +46,8 @@ pub struct PegBidDashboard {
     #[serde(skip_serializing_if = "money_is_zero")]
     pub prepaid_open_bid_fees: Money,
     pub total_seller_fees: Money,
+    #[serde(skip_serializing_if = "money_is_zero")]
+    pub transfer_fees_paid: Money,
     pub cash_balance: Option<Money>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub venue_balances: Vec<VenueBalance>,
@@ -192,6 +194,10 @@ impl PegBidDashboard {
         cs2_arb_backtest::report::write_venue_balances(
             &mut out,
             std::iter::once(("peg-bid", self.venue_balances.as_slice())),
+        );
+        cs2_arb_backtest::report::write_transfer_fees(
+            &mut out,
+            std::iter::once(("peg-bid", self.transfer_fees_paid)),
         );
         out
     }
@@ -530,6 +536,7 @@ pub fn run_peg_bid_engine(
             .checked_sub(simulator.realized_bid_fee_losses())?,
         prepaid_open_bid_fees: simulator.unallocated_buy_fees(),
         total_seller_fees: relist.total_seller_fees(),
+        transfer_fees_paid: simulator.portfolio().transfer_fees_paid(),
         cash_balance: simulator.cash(),
         venue_balances: simulator.portfolio().venue_balances()?,
     })

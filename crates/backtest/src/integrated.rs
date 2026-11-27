@@ -213,6 +213,18 @@ impl FillModel for SimFillModel<'_> {
             .and_then(|session| session.executor.portfolio().available_on(platform))
     }
 
+    fn transfer_fees_paid(&self, strategy: &str) -> Money {
+        self.sessions.borrow().get(strategy).map_or_else(
+            || {
+                self.venue_accounts.as_ref().map_or(
+                    Money(0),
+                    cs2_arb_sim::venues::VenueAccounts::transfer_fees_paid,
+                )
+            },
+            |session| session.executor.portfolio().transfer_fees_paid(),
+        )
+    }
+
     fn add_quote_update_times(&self, times: &mut BTreeSet<DateTime<Utc>>) {
         times.extend(self.depth.replaced_books.keys().copied());
     }

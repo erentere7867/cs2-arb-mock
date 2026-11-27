@@ -112,6 +112,8 @@ pub struct PerformanceReport {
     pub trades: Vec<TradeRecord>,
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub venue_balances: std::collections::BTreeMap<String, Vec<cs2_arb_sim::venues::VenueBalance>>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub transfer_fees_paid: std::collections::BTreeMap<String, Money>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unverified_platform_assumptions: Vec<String>,
 }
@@ -278,7 +280,26 @@ impl PerformanceReport {
                 .iter()
                 .map(|(name, rows)| (name.as_str(), rows.as_slice())),
         );
+        write_transfer_fees(
+            &mut out,
+            self.transfer_fees_paid
+                .iter()
+                .map(|(name, amount)| (name.as_str(), *amount)),
+        );
         out
+    }
+}
+
+pub fn write_transfer_fees<'a>(out: &mut String, fees: impl Iterator<Item = (&'a str, Money)>) {
+    let mut fees = fees.filter(|(_, amount)| amount.0 != 0).peekable();
+    if fees.peek().is_some() {
+        let _ = writeln!(
+            out,
+            "\n| Simulation | Total transfer fees |\n| --- | ---: |"
+        );
+        for (simulation, amount) in fees {
+            let _ = writeln!(out, "| {simulation} | {} |", fmt_money(amount));
+        }
     }
 }
 

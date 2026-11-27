@@ -148,6 +148,12 @@ impl Portfolio {
             .map_or_else(|| Ok(Vec::new()), VenueAccounts::balances)
     }
 
+    pub fn transfer_fees_paid(&self) -> Money {
+        self.venue_accounts
+            .as_ref()
+            .map_or(Money(0), VenueAccounts::transfer_fees_paid)
+    }
+
     pub fn available_on(&self, platform: Platform) -> Option<Money> {
         self.venue_accounts
             .as_ref()

@@ -328,8 +328,8 @@ impl MarketClient for WaxpeerClient {
                 return Ok(Vec::new());
             };
             let game = self.game_code();
-            let observed_at = self.http.clock().now();
             let mut owners = HashMap::new();
+            let mut observed_at = None;
             for page in 0..MAX_BID_PAGES {
                 let skip = (page * BID_PAGE_SIZE).to_string();
                 let query = query_string(&[
@@ -343,12 +343,13 @@ impl MarketClient for WaxpeerClient {
                     .http
                     .get(&DETAILED_BUY_ORDERS, &path, HeaderMap::new())
                     .await?;
+                observed_at = Some(self.http.clock().now());
                 let rows = add_detailed_bid_page(&body, item, game, &mut owners)?;
                 if rows < BID_PAGE_SIZE || owners.len() >= BID_PAGE_SIZE {
                     break;
                 }
             }
-            return Ok(detailed_depth(owners, item, observed_at));
+            return Ok(observed_at.map_or_else(Vec::new, |at| detailed_depth(owners, item, at)));
         }
         let bids = self.fetch(&BUY_ORDERS, &self.bids, parse_bids).await?;
         Ok(bids

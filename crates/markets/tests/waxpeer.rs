@@ -12,6 +12,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 #[tokio::test]
 async fn detailed_bids_page_past_filtered_depth_on_get() {
     let server = MockServer::start().await;
+    let clock = clock();
     let filtered = json!({"name":"Alien Red","game":"rust","price":14000,"amount":1,"filled":0,"filters":{"float_min":0.1},"by":"filtered"});
     let first_page: Vec<_> = std::iter::repeat_n(filtered, 100).collect();
     for (skip, rows) in [
@@ -23,27 +24,25 @@ async fn detailed_bids_page_past_filtered_depth_on_get() {
             ],
         ),
     ] {
+        let reply = ResponseTemplate::new(200).set_body_json(json!({"success":true,"orders":rows}));
+        let response_clock = Arc::clone(&clock);
         Mock::given(method("GET"))
             .and(path("/v2/buy-orders"))
             .and(query_param("name", "Alien Red"))
             .and(query_param("game", "rust"))
             .and(query_param("skip", skip))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(json!({"success":true,"orders":rows})),
-            )
+            .respond_with(move |_: &wiremock::Request| {
+                response_clock.advance(chrono::TimeDelta::seconds(3));
+                reply.clone()
+            })
             .expect(1)
             .mount(&server)
             .await;
     }
-    let client = WaxpeerClient::with_base_url(
-        fees(),
-        Game::Rust,
-        &server.uri(),
-        Arc::new(NoopGate),
-        clock(),
-    )
-    .unwrap()
-    .with_detailed_buy_orders(Some("fixture-api-key".into()));
+    let client =
+        WaxpeerClient::with_base_url(fees(), Game::Rust, &server.uri(), Arc::new(NoopGate), clock)
+            .unwrap()
+            .with_detailed_buy_orders(Some("fixture-api-key".into()));
     let item = ItemId {
         market_hash_name: "Alien Red".into(),
         wear_tier: WearTier::NotApplicable,
@@ -52,6 +51,7 @@ async fn detailed_bids_page_past_filtered_depth_on_get() {
     assert_eq!(bids.len(), 1);
     assert_eq!(bids[0].price, Money(1250));
     assert_eq!(bids[0].quantity, 1);
+    assert_eq!(bids[0].observed_at, t0() + chrono::TimeDelta::seconds(6));
 }
 
 #[tokio::test]

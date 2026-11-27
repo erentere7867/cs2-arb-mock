@@ -17,7 +17,13 @@ use cs2_arb_strategy::{
 };
 use serde::Serialize;
 
-pub type BidRefresh = (DateTime<Utc>, Platform, ItemId, Vec<BuyOrder>);
+pub struct BidRefresh {
+    pub at: DateTime<Utc>,
+    pub platform: Platform,
+    pub item: ItemId,
+    pub bids: Vec<BuyOrder>,
+    pub replace: bool,
+}
 
 /// One trade-locked inventory entry displayed on the dashboard.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -280,13 +286,13 @@ pub fn run_peg_bid_engine(
     let mut sorted_bids = buy_orders.to_vec();
     sorted_bids.sort_by_key(|b| b.observed_at);
     let mut bid_refreshes: Vec<_> = bid_refreshes.iter().collect();
-    bid_refreshes.sort_by_key(|(at, ..)| *at);
+    bid_refreshes.sort_by_key(|refresh| refresh.at);
 
     let mut times: BTreeSet<DateTime<Utc>> = BTreeSet::new();
     times.extend(sorted_snapshots.iter().map(|s| s.observed_at));
     times.extend(sorted_sales.iter().map(|s| s.sold_at));
     times.extend(sorted_bids.iter().map(|b| b.observed_at));
-    times.extend(bid_refreshes.iter().map(|(at, ..)| *at));
+    times.extend(bid_refreshes.iter().map(|refresh| refresh.at));
     let replay_end = times.last().copied();
 
     let mut snap_idx = 0usize;
@@ -309,7 +315,7 @@ pub fn run_peg_bid_engine(
                 .is_some_and(|b| b.observed_at == now)
             || bid_refreshes
                 .get(refresh_idx)
-                .is_some_and(|(at, ..)| *at == now);
+                .is_some_and(|refresh| refresh.at == now);
         if !market_tick
             && !resting_ttl.is_some_and(|ttl| {
                 simulator
@@ -398,11 +404,23 @@ pub fn run_peg_bid_engine(
         }
         relist.observe_bids(&sorted_bids[bid_start..bid_idx]);
         let refresh_start = refresh_idx;
-        while let Some((_, platform, item, bids)) =
-            bid_refreshes.get(refresh_idx).filter(|(at, ..)| *at == now)
+        while let Some(refresh) = bid_refreshes
+            .get(refresh_idx)
+            .filter(|refresh| refresh.at == now)
         {
-            relist.replace_bid_book(*platform, item, bids);
-            strategy.replace_buy_orders(*platform, item, bids, now);
+            relist.refresh_bid_book(
+                refresh.platform,
+                &refresh.item,
+                &refresh.bids,
+                refresh.replace,
+            );
+            strategy.refresh_buy_orders(
+                refresh.platform,
+                &refresh.item,
+                &refresh.bids,
+                now,
+                refresh.replace,
+            );
             refresh_idx += 1;
         }
         let relist_step = relist.step(
@@ -440,7 +458,7 @@ pub fn run_peg_bid_engine(
         let historical_bids = &sorted_bids[bid_start..bid_idx];
         let refreshed_bids = bid_refreshes[refresh_start..refresh_idx]
             .iter()
-            .flat_map(|(_, _, _, bids)| bids);
+            .flat_map(|refresh| &refresh.bids);
         if !kill_switch.is_engaged()
             && (!historical_bids.is_empty() || refreshed_bids.clone().next().is_some())
         {

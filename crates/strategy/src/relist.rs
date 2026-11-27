@@ -223,12 +223,20 @@ impl RelistEngine {
         }
     }
 
-    pub fn replace_bid_book(&mut self, platform: Platform, item: &ItemId, bids: &[BuyOrder]) {
+    pub fn refresh_bid_book(
+        &mut self,
+        platform: Platform,
+        item: &ItemId,
+        bids: &[BuyOrder],
+        replace: bool,
+    ) {
         if !self.config.instant_sale || platform == Platform::Skinport {
             return;
         }
-        self.bids
-            .retain(|(venue, bid_item, _), _| *venue != platform || bid_item != item);
+        if replace {
+            self.bids
+                .retain(|(venue, bid_item, _), _| *venue != platform || bid_item != item);
+        }
         for bid in bids.iter().filter(|bid| {
             bid.platform == platform && &bid.item == item && bid.price.0 > 0 && bid.quantity > 0
         }) {
@@ -884,7 +892,7 @@ mod tests {
             quantity: 1,
             observed_at: now - Duration::seconds(1),
         }]);
-        engine.replace_bid_book(Platform::CsFloat, &item(), &[]);
+        engine.refresh_bid_book(Platform::CsFloat, &item(), &[], true);
         let step = engine
             .step(&make_sales(20, 10_000, now), &[], &fees(), now)
             .unwrap();
@@ -896,15 +904,19 @@ mod tests {
     fn bid_refresh_preserves_distinct_page_ages() {
         let acquired = t(1, 12);
         let now = t(8, 12);
-        for (first_page_age, expected) in [(1, Money(13_000)), (3, Money(12_000))] {
+        for (max_age, first_page_age, expected) in [
+            (2, 1, Money(13_000)),
+            (2, 3, Money(12_000)),
+            (0, 1, Money(12_000)),
+        ] {
             let mut engine = RelistEngine::new(RelistConfig {
                 instant_sale: true,
-                maximum_bid_age_seconds: 2,
+                maximum_bid_age_seconds: max_age,
                 ..RelistConfig::default()
             })
             .unwrap();
             engine.track_position(make_position(acquired), acquired);
-            engine.replace_bid_book(
+            engine.refresh_bid_book(
                 Platform::CsFloat,
                 &item(),
                 &[
@@ -925,6 +937,7 @@ mod tests {
                         observed_at: now,
                     },
                 ],
+                true,
             );
             let step = engine
                 .step(&make_sales(20, 10_000, now), &[], &fees(), now)

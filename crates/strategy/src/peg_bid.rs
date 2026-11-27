@@ -240,33 +240,38 @@ impl PegBidStrategy {
         }
     }
 
-    pub fn replace_buy_orders(
+    pub fn refresh_buy_orders(
         &mut self,
         platform: Platform,
         item: &ItemId,
         orders: &[BuyOrder],
         now: DateTime<Utc>,
+        replace: bool,
     ) {
-        self.top_bids
-            .retain(|(venue, bid_item, _), _| *venue != platform || bid_item != item);
+        if replace {
+            self.top_bids
+                .retain(|(venue, bid_item, _), _| *venue != platform || bid_item != item);
+        }
         if !self.config.allowed_platforms.contains(&platform) {
             return;
         }
+        let max_age = self.config.max_order_age_secs;
+        let fresh = |observed_at: DateTime<Utc>| {
+            observed_at <= now && max_age.is_none_or(|age| (now - observed_at).num_seconds() <= age)
+        };
         for order in orders.iter().filter(|order| {
             order.platform == platform
                 && &order.item == item
                 && order.price.0 > 0
                 && order.quantity > 0
-                && order.observed_at <= now
-                && self
-                    .config
-                    .max_order_age_secs
-                    .is_none_or(|age| (now - order.observed_at).num_seconds() <= age)
+                && fresh(order.observed_at)
         }) {
             self.top_bids
                 .entry((platform, item.clone(), order.float_bucket))
                 .and_modify(|best| {
-                    if (order.price, order.observed_at) > (best.price, best.observed_at) {
+                    if !fresh(best.observed_at)
+                        || (order.price, order.observed_at) > (best.price, best.observed_at)
+                    {
                         *best = order.clone();
                     }
                 })
@@ -717,17 +722,18 @@ mod tests {
             quantity: 1,
             observed_at: now - Duration::seconds(age),
         };
-        strategy.replace_buy_orders(
+        strategy.refresh_buy_orders(
             venue,
             &item,
             &[bid(9000, 3), bid(8500, 1), bid(8400, 0)],
             now,
+            true,
         );
         assert_eq!(
             strategy.top_bids[&(venue, item.clone(), None)].price,
             Money(8500)
         );
-        strategy.replace_buy_orders(venue, &item, &[], now);
+        strategy.refresh_buy_orders(venue, &item, &[], now, true);
         assert!(strategy.top_bids.is_empty());
     }
 

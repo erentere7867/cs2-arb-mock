@@ -5,8 +5,8 @@ use std::time::Duration;
 use chrono::{DateTime, TimeDelta, Utc};
 use cs2_arb_backtest::{integrated::MarketDepth, Secrets};
 use cs2_arb_core::{
-    Error, FeeSchedules, Game, ItemId, Listing, MarketClient, MarketEvent, Platform, PriceSnapshot,
-    Result, SystemClock,
+    BuyOrder, Error, FeeSchedules, Game, ItemId, Listing, MarketClient, MarketEvent, Platform,
+    PriceSnapshot, Result, SystemClock,
 };
 use cs2_arb_events::EventQueue;
 use cs2_arb_markets::{
@@ -17,6 +17,7 @@ use cs2_arb_markets::{
 use cs2_arb_net::{NetConfig, RateLimit, RateLimiter, TokioClock, DEFAULT_ENDPOINT};
 use cs2_arb_sim::wear::quote_bucket;
 
+use crate::peg_runner::BidRefresh;
 use crate::{bundled_snapshots, watch, Inputs, Market};
 
 type MarketClients = Vec<(Platform, Box<dyn MarketClient>)>;
@@ -224,7 +225,13 @@ pub async fn collect(
                 if polls_bids(*platform, instant_sale, waxpeer_has_key) {
                     match client.top_buy_orders(item).await {
                         Ok(orders) if instant_sale => {
-                            bid_refreshes.push((Utc::now(), *platform, item.clone(), orders));
+                            record_bid_poll(
+                                &mut bid_refreshes,
+                                *platform,
+                                item,
+                                orders,
+                                Utc::now(),
+                            );
                         }
                         Ok(orders) => buy_orders.extend(orders),
                         Err(Error::RateLimited { .. }) => {}
@@ -279,6 +286,31 @@ pub async fn collect(
     })
 }
 
+fn record_bid_poll(
+    refreshes: &mut Vec<BidRefresh>,
+    platform: Platform,
+    item: &ItemId,
+    bids: Vec<BuyOrder>,
+    completed_at: DateTime<Utc>,
+) {
+    let mut ticks = BTreeMap::<_, Vec<_>>::new();
+    for bid in bids {
+        ticks.entry(bid.observed_at).or_default().push(bid);
+    }
+    if ticks.is_empty() {
+        ticks.insert(completed_at, Vec::new());
+    }
+    for (index, (at, bids)) in ticks.into_iter().enumerate() {
+        refreshes.push(BidRefresh {
+            at,
+            platform,
+            item: item.clone(),
+            bids,
+            replace: index == 0,
+        });
+    }
+}
+
 fn polls_bids(platform: Platform, instant_sale: bool, waxpeer_has_key: bool) -> bool {
     match platform {
         Platform::CsFloat => true,
@@ -297,6 +329,44 @@ fn quotable(listing: &Listing, at: DateTime<Utc>, max_age: TimeDelta) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn live_bids_tick_when_observed_and_empty_polls_tick_when_completed() {
+        let at = Utc::now();
+        let later = at + TimeDelta::seconds(1);
+        let completed_at = later + TimeDelta::milliseconds(1);
+        let platform = Platform::Waxpeer;
+        let item = ItemId {
+            market_hash_name: "Alien Red".into(),
+            wear_tier: cs2_arb_core::WearTier::NotApplicable,
+        };
+        let bid = |observed_at| BuyOrder {
+            platform,
+            item: item.clone(),
+            float_bucket: None,
+            price: cs2_arb_core::Money(100),
+            quantity: 1,
+            observed_at,
+        };
+        let mut refreshes = Vec::new();
+        record_bid_poll(
+            &mut refreshes,
+            platform,
+            &item,
+            vec![bid(later), bid(at)],
+            completed_at,
+        );
+        record_bid_poll(&mut refreshes, platform, &item, Vec::new(), completed_at);
+        assert_eq!(
+            refreshes
+                .iter()
+                .map(|refresh| (refresh.at, refresh.bids.len(), refresh.replace))
+                .collect::<Vec<_>>(),
+            [(at, 1, true), (later, 1, false), (completed_at, 0, true)]
+        );
+        assert_eq!(refreshes[0].bids[0].observed_at, refreshes[0].at);
+        assert_eq!(refreshes[1].bids[0].observed_at, refreshes[1].at);
+    }
+
     #[test]
     fn unsupported_bid_polls_do_not_create_refreshes() {
         assert!(!polls_bids(Platform::Skinport, true, true));

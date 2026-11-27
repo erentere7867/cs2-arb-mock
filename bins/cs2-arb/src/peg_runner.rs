@@ -271,37 +271,32 @@ pub fn run_peg_bid_engine(
     let mut accounted_fee_losses = Money(0);
 
     while let Some(now) = times.pop_first() {
+        let market_tick = sorted_snapshots
+            .get(snap_idx)
+            .is_some_and(|s| s.observed_at == now)
+            || sorted_sales.get(sale_idx).is_some_and(|s| s.sold_at == now)
+            || sorted_bids
+                .get(bid_idx)
+                .is_some_and(|b| b.observed_at == now);
+        if !market_tick
+            && !resting_ttl.is_some_and(|ttl| {
+                simulator
+                    .active_bids()
+                    .iter()
+                    .any(|bid| now - bid.placed_at >= ttl)
+            })
+        {
+            continue;
+        }
         // Transition any lots whose 7-day lock expired before `now` so they are
         // listed at `locked_until` before crossing prints at `now` are evaluated.
         for unlock_at in relist.pending_unlocks_before(now) {
-            let unlock_step = relist.step(
+            relist.list_at_unlock(
                 &sorted_sales[..sale_idx],
                 &sorted_snapshots[..snap_idx],
                 fees,
                 unlock_at,
             )?;
-            for settled in &unlock_step.realized_sales {
-                match simulator.settle_relist_sale(
-                    &settled.position_id,
-                    settled.platform,
-                    settled.ask_price,
-                    settled.sold_at,
-                ) {
-                    Ok(report) => {
-                        let unrealized = compute_unrealized_pnl(&simulator, &latest_prices);
-                        let _ = risk.record_marked_fill(
-                            &report.fill,
-                            unrealized,
-                            report.ledger_entry.cost_basis_released.unwrap_or(Money(0)),
-                        )?;
-                    }
-                    Err(reason) => tracing::warn!(
-                        position_id = %settled.position_id,
-                        ?reason,
-                        "relist settlement rejected by simulator"
-                    ),
-                }
-            }
         }
 
         last_now = Some(now);
@@ -437,7 +432,12 @@ pub fn run_peg_bid_engine(
             for obs in batch {
                 let key = (obs.platform, obs.item.clone(), obs.float_bucket);
                 if !active_keys.contains(&key) {
-                    simulator.cancel_bids_for_item(obs.platform, &obs.item, obs.float_bucket)?;
+                    simulator.cancel_bids_for_item(
+                        obs.platform,
+                        &obs.item,
+                        obs.float_bucket,
+                        now,
+                    )?;
                 }
             }
             account_bid_fee_losses(
@@ -625,11 +625,74 @@ mod tests {
         assert_eq!(risk.day_drawdown(), Money(100));
         assert!(risk.entries_halted(fill_at));
         let cancel_at = fill_at + Duration::minutes(1);
-        sim.cancel_bids_for_item(order.platform, &order.item, None)
+        sim.cancel_bids_for_item(order.platform, &order.item, None, cancel_at)
             .unwrap();
         account_bid_fee_losses(&mut risk, &sim, &prices, cancel_at, &mut Money(0)).unwrap();
         assert_eq!(risk.day_drawdown(), Money(100));
         assert_eq!(sim.portfolio().realized_pnl(), Money(-100));
+    }
+
+    #[test]
+    fn filled_bid_expiry_does_not_fill_a_relist_between_market_ticks() {
+        let snapshots: Vec<_> = (1..=11)
+            .map(|day| t(day, 12))
+            .chain([t(11, 15), t(11, 17)])
+            .map(|observed_at| PriceSnapshot {
+                platform: Platform::CsFloat,
+                item: item(),
+                float_bucket: Some(FloatBucket::FieldTestedLow),
+                price: Money(10_000),
+                observed_at,
+            })
+            .collect();
+        let mut sales: Vec<_> = (1..=10)
+            .flat_map(|day| (16..=20).map(move |hour| (day, hour)))
+            .map(|(day, hour)| Sale {
+                id: format!("{day}-{hour}"),
+                platform: Platform::CsFloat,
+                item: item(),
+                price: Money(10_000),
+                float_value: Some(0.20),
+                sold_at: t(day, hour),
+                verified: true,
+            })
+            .collect();
+        sales.push(Sale {
+            id: "trigger".into(),
+            price: Money(8_450),
+            sold_at: t(4, 14),
+            ..sales[0].clone()
+        });
+        let bids = [BuyOrder {
+            platform: Platform::CsFloat,
+            item: item(),
+            float_bucket: Some(FloatBucket::FieldTestedLow),
+            price: Money(8_500),
+            quantity: 1,
+            observed_at: t(4, 12),
+        }];
+        let dashboard = run_peg_bid_engine(
+            &snapshots,
+            &sales,
+            &bids,
+            &fees(),
+            PegBidConfig {
+                resting_bid_ttl_secs: Some(7 * 86_400 + 4 * 3_600),
+                ..PegBidConfig::default()
+            },
+            RelistConfig {
+                min_listing_age_secs: 2 * 3_600,
+                ..RelistConfig::default()
+            },
+            RiskLimits::default(),
+            &KillSwitch::new(),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(dashboard.bids_filled, 1);
+        assert_eq!(dashboard.realized_sales.len(), 1);
+        assert_eq!(dashboard.realized_sales[0].sold_at, t(11, 17));
     }
 
     #[test]

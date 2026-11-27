@@ -138,6 +138,7 @@ pub struct BuyOrderFillSimulator {
     seen_sale_ids: HashSet<String>,
     filled_order_ids: HashSet<String>,
     rejections: Vec<RejectionRecord>,
+    unallocated_buy_fees: Money,
     realized_bid_fee_losses: Money,
 }
 
@@ -161,6 +162,7 @@ impl BuyOrderFillSimulator {
             seen_sale_ids: HashSet::new(),
             filled_order_ids: HashSet::new(),
             rejections: Vec::new(),
+            unallocated_buy_fees: Money(0),
             realized_bid_fee_losses: Money(0),
         })
     }
@@ -195,12 +197,7 @@ impl BuyOrderFillSimulator {
     }
 
     pub fn unallocated_buy_fees(&self) -> Money {
-        Money(
-            self.resting_bids
-                .iter()
-                .map(|bid| bid.prepaid_fixed_fee.0)
-                .sum(),
-        )
+        self.unallocated_buy_fees
     }
 
     pub fn realized_bid_fee_losses(&self) -> Money {
@@ -229,8 +226,9 @@ impl BuyOrderFillSimulator {
         platform: Platform,
         item: &ItemId,
         float_bucket: Option<FloatBucket>,
+        now: DateTime<Utc>,
     ) -> Result<usize> {
-        self.finish_bids(BuyOrderStatus::Cancelled, |existing| {
+        self.finish_bids(BuyOrderStatus::Cancelled, now, |existing| {
             existing.order.platform == platform
                 && &existing.order.item == item
                 && existing.order.float_bucket == float_bucket
@@ -239,7 +237,7 @@ impl BuyOrderFillSimulator {
     }
 
     pub fn expire_bids(&mut self, now: DateTime<Utc>, max_age: TimeDelta) -> Result<Vec<String>> {
-        self.finish_bids(BuyOrderStatus::Expired, |bid| {
+        self.finish_bids(BuyOrderStatus::Expired, now, |bid| {
             now - bid.placed_at >= max_age
         })
     }
@@ -247,6 +245,7 @@ impl BuyOrderFillSimulator {
     fn finish_bids(
         &mut self,
         status: BuyOrderStatus,
+        now: DateTime<Utc>,
         matches: impl Fn(&RestingBuyOrder) -> bool,
     ) -> Result<Vec<String>> {
         let indices: Vec<_> = self
@@ -260,8 +259,16 @@ impl BuyOrderFillSimulator {
             sum.checked_add(self.resting_bids[idx].prepaid_fixed_fee)
         })?;
         let losses = self.realized_bid_fee_losses.checked_add(prepaid)?;
-        self.portfolio.realize_prepaid_fee_loss(prepaid)?;
+        let unallocated = self.unallocated_buy_fees.checked_sub(prepaid)?;
+        self.portfolio.realize_prepaid_fee_losses(
+            indices.iter().map(|&idx| {
+                let bid = &self.resting_bids[idx];
+                (&bid.order, bid.prepaid_fixed_fee)
+            }),
+            now,
+        )?;
         self.realized_bid_fee_losses = losses;
+        self.unallocated_buy_fees = unallocated;
         let mut ids = Vec::new();
         for idx in indices {
             let existing = &mut self.resting_bids[idx];
@@ -305,7 +312,7 @@ impl BuyOrderFillSimulator {
 
         // Cancel any previous resting bid on the same (platform, item, float_bucket);
         // repricing resets queue priority.
-        self.cancel_bids_for_item(order.platform, &order.item, order.float_bucket)?;
+        self.cancel_bids_for_item(order.platform, &order.item, order.float_bucket, now)?;
 
         let tie_ready_at = now + self.draw_tie_latency();
         let resting = RestingBuyOrder {
@@ -434,6 +441,10 @@ impl BuyOrderFillSimulator {
             else {
                 continue;
             };
+            let Ok(total_unallocated) = self.unallocated_buy_fees.checked_add(unallocated_change)
+            else {
+                continue;
+            };
 
             if let Some(cash) = self.portfolio.cash() {
                 if paid > cash {
@@ -485,6 +496,7 @@ impl BuyOrderFillSimulator {
                 cash_delta,
                 cost_basis_released: None,
                 realized_pnl: None,
+                prepaid_fee_loss: None,
                 filled_at,
                 listings: vec![(sale.id.clone(), fill_qty)],
                 positions: vec![(position.id.clone(), fill_qty)],
@@ -496,6 +508,7 @@ impl BuyOrderFillSimulator {
                 .is_ok()
             {
                 self.resting_bids[idx].prepaid_fixed_fee = unallocated;
+                self.unallocated_buy_fees = total_unallocated;
                 let new_remaining = remaining_quantity - fill_qty;
                 self.resting_bids[idx].remaining_quantity = new_remaining;
                 if new_remaining == 0 {
@@ -611,6 +624,7 @@ impl BuyOrderFillSimulator {
             cash_delta: fees.net,
             cost_basis_released: Some(released),
             realized_pnl: Some(realized_pnl),
+            prepaid_fee_loss: None,
             filled_at: now,
             listings: Vec::new(),
             positions: vec![(position.id.clone(), position.quantity)],
@@ -910,6 +924,22 @@ mod tests {
             assert_eq!(sim.portfolio().realized_pnl(), Money(-100));
             assert_eq!(sim.portfolio().net_cash_flow(), Money(-8700));
             assert_eq!(sim.portfolio().buyer_fees_paid(), Money(200));
+            let ledger = sim.portfolio().ledger();
+            assert_eq!(ledger.len(), 2);
+            let writeoff = &ledger[1];
+            assert_eq!(writeoff.seq, 1);
+            assert_eq!(writeoff.order_id, "initial");
+            assert_eq!(writeoff.filled_at, end);
+            assert_eq!(writeoff.prepaid_fee_loss, Some(Money(100)));
+            assert_eq!(writeoff.cash_delta, Money(0));
+            assert_eq!(writeoff.fee, Money(0));
+            assert_eq!(sim.portfolio().summary().fills, 1);
+            let ledger_pnl: i64 = ledger
+                .iter()
+                .filter_map(|e| e.realized_pnl)
+                .map(|pnl| pnl.0)
+                .sum();
+            assert_eq!(Money(ledger_pnl), sim.portfolio().realized_pnl());
         }
     }
 

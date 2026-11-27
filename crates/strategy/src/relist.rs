@@ -257,6 +257,29 @@ impl RelistEngine {
         fees: &FeeSchedules,
         now: DateTime<Utc>,
     ) -> Result<RelistStepResult> {
+        self.advance(sales, snapshots, fees, now, true)
+    }
+
+    /// Post asks at an inventory unlock between observations without simulating a sale.
+    pub fn list_at_unlock(
+        &mut self,
+        sales: &[Sale],
+        snapshots: &[PriceSnapshot],
+        fees: &FeeSchedules,
+        now: DateTime<Utc>,
+    ) -> Result<()> {
+        self.advance(sales, snapshots, fees, now, false)?;
+        Ok(())
+    }
+
+    fn advance(
+        &mut self,
+        sales: &[Sale],
+        snapshots: &[PriceSnapshot],
+        fees: &FeeSchedules,
+        now: DateTime<Utc>,
+        allow_fills: bool,
+    ) -> Result<RelistStepResult> {
         let mut result = RelistStepResult {
             unlocked: self.transition_expired_locks(now),
             ..RelistStepResult::default()
@@ -348,6 +371,9 @@ impl RelistEngine {
                     listed_at,
                     sell_platform,
                 } => {
+                    if !allow_fills {
+                        continue;
+                    }
                     let pos = self.items[&id].position.clone();
                     if pos.is_trade_locked_at(now) {
                         continue;

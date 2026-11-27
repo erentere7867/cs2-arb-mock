@@ -83,6 +83,9 @@ impl PegBidConfig {
         if self.bid_increment.0 <= 0 {
             return bad("bid_increment must be > 0");
         }
+        if self.hold_days < 7 {
+            return bad("hold_days must be >= 7 to match the mandatory 7-day CS2 trade hold");
+        }
         if !self.annual_opportunity_rate_pct.is_finite() || self.annual_opportunity_rate_pct < 0.0 {
             return bad("annual_opportunity_rate_pct must be finite and >= 0");
         }

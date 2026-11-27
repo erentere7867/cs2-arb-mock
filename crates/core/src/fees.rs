@@ -97,6 +97,24 @@ impl TradeFees {
         exit: FeeSchedule,
         entry_fee: Money,
         exit_fee: Money,
+        entry_unit: Money,
+        exit_unit: Money,
+        quantity: u32,
+    ) -> Result<Option<Self>> {
+        let deposit = entry
+            .funding
+            .crypto_deposit
+            .order_fee(entry_unit, quantity)?;
+        Self::from_allocated_trade(
+            entry, exit, entry_fee, exit_fee, deposit, exit_unit, quantity,
+        )
+    }
+
+    pub fn from_allocated_trade(
+        entry: FeeSchedule,
+        exit: FeeSchedule,
+        entry_fee: Money,
+        exit_fee: Money,
         crypto_deposit: Money,
         exit_unit: Money,
         quantity: u32,

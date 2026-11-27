@@ -811,16 +811,18 @@ mod tests {
         let mut bid = bid_order("allocated", 8500, now);
         bid.quantity = 2;
         sim.place_bid(bid, now).unwrap();
+        let first_at = now + TimeDelta::seconds(1);
         let first = sim
-            .process_transaction(&make_sale("first", 8400, now, true), now)
+            .process_transaction(&make_sale("first", 8400, first_at, true), first_at)
             .pop()
             .unwrap();
         assert_eq!(first.position.unwrap().cost_basis, Money(8601));
         assert_eq!(first.ledger_entry.fee, Money(202));
         assert_eq!(first.allocated_deposit, Some(Money(50)));
         assert_eq!(sim.unallocated_buy_fees(), Money(101));
+        let second_at = now + TimeDelta::seconds(2);
         let second = sim
-            .process_transaction(&make_sale("second", 8400, now, true), now)
+            .process_transaction(&make_sale("second", 8400, second_at, true), second_at)
             .pop()
             .unwrap();
         assert_eq!(second.position.unwrap().cost_basis, Money(8601));

@@ -557,7 +557,7 @@ pub fn meets_net_margin(
     fees: FeeSchedule,
     config: &PegBidConfig,
 ) -> Result<bool> {
-    if unit_bid.0 <= 0 || rolling_median.0 <= 0 {
+    if unit_bid.0 <= 0 || rolling_median.0 <= 0 || config.quantity == 0 {
         return Ok(false);
     }
     let econ = evaluate_bid_economics(unit_bid, rolling_median, unit_bid, fees, config)?;

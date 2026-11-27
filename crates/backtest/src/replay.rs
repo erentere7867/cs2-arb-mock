@@ -1123,7 +1123,11 @@ mod tests {
             branch: "test".into(),
             opened_at: t(2),
         }];
-        let fees = FeeSchedules::default();
+        let fees = FeeSchedules {
+            csfloat: FeeSchedule::default(),
+            skinport: FeeSchedule::default(),
+            ..fees()
+        };
         let model = SimFillModel::new(
             &depth,
             fees.clone(),

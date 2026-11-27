@@ -388,7 +388,7 @@ impl RelistEngine {
                         (Default::default(), Money(0), Money(0)),
                         |(deposit, fee)| (fees.get(pos.acquired_on), deposit, fee),
                     );
-                    let fee_breakdown = TradeFees::from_trade(
+                    let fee_breakdown = TradeFees::from_allocated_trade(
                         entry_schedule,
                         schedule,
                         entry_fee,

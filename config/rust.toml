@@ -3,7 +3,7 @@ markets = ["skinport", "waxpeer", "dmarket"]
 dmarket_if_configured = true
 
 [market_regime]
-min_index_items = 3
+min_index_items = 1
 min_case_items = 2
 max_price_age_hours = 24
 short_loss_pct = 3.0

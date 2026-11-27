@@ -896,6 +896,16 @@ amount = 100
             snapshot.item.wear_tier == cs2_arb_core::WearTier::NotApplicable
                 && snapshot.float_bucket.is_none()
         }));
+        let regime = MarketRegime::new(
+            settings.market_regime.clone(),
+            &inputs.snapshots,
+            inputs.depth.sales(),
+        )
+        .unwrap();
+        assert!(inputs
+            .snapshots
+            .iter()
+            .any(|quote| regime.at(quote.observed_at).allows(&quote.item)));
         let report = simulate(
             &inputs,
             FeeSchedules::from_toml(config).unwrap(),

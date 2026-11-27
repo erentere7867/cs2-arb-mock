@@ -263,7 +263,15 @@ pub fn run_peg_bid_engine(
                     settled.sold_at,
                 ) {
                     Ok(report) => {
-                        let _ = risk.record_fill(&report.fill)?;
+                        let unrealized = compute_unrealized_pnl(
+                            simulator.portfolio().positions(),
+                            &latest_prices,
+                        );
+                        let _ = risk.record_marked_fill(
+                            &report.fill,
+                            unrealized,
+                            report.cost_basis_released.unwrap_or(Money(0)),
+                        )?;
                     }
                     Err(reason) => tracing::warn!(
                         position_id = %settled.position_id,
@@ -297,7 +305,9 @@ pub fn run_peg_bid_engine(
             strategy.observe_sale(sale);
             for report in simulator.process_transaction(sale, now) {
                 bids_filled += 1;
-                let _ = risk.record_fill(&report.fill)?;
+                let unrealized =
+                    compute_unrealized_pnl(simulator.portfolio().positions(), &latest_prices);
+                let _ = risk.record_marked_fill(&report.fill, unrealized, Money(0))?;
                 if simulator.is_order_filled(&report.fill.order.id) {
                     strategy.mark_filled(&report.fill.order.id);
                 }
@@ -322,7 +332,13 @@ pub fn run_peg_bid_engine(
                 settled.sold_at,
             ) {
                 Ok(report) => {
-                    let _ = risk.record_fill(&report.fill)?;
+                    let unrealized =
+                        compute_unrealized_pnl(simulator.portfolio().positions(), &latest_prices);
+                    let _ = risk.record_marked_fill(
+                        &report.fill,
+                        unrealized,
+                        report.cost_basis_released.unwrap_or(Money(0)),
+                    )?;
                 }
                 Err(reason) => tracing::warn!(
                     position_id = %settled.position_id,

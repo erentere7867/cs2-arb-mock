@@ -26,11 +26,13 @@ fi
 git fetch --prune origin
 revision=$(git rev-parse --verify "refs/remotes/origin/$branch^{commit}")
 git switch --detach "$revision"
-"$HOME/.cargo/bin/cargo" build --locked --release --bin cs2-arb
+cargo="$HOME/.cargo/bin/cargo"
+target_dir=$("$cargo" metadata --locked --format-version 1 --no-deps | jq -er '.target_directory')
+"$cargo" build --locked --release --bin cs2-arb
 
 stage=$(mktemp -d "$data/releases/.stage.XXXXXXXX")
 trap 'rm -rf -- "$stage"' EXIT
-install -m 700 target/release/cs2-arb "$stage/cs2-arb"
+install -m 700 "$target_dir/release/cs2-arb" "$stage/cs2-arb"
 install -D -m 600 config/default.toml "$stage/config/default.toml"
 install -m 600 config/rust.toml "$stage/config/rust.toml"
 printf '%s %s\n' "$branch" "$revision" > "$stage/revision"

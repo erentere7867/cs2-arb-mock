@@ -1,7 +1,7 @@
 # VPS operations
 
 The jobs run as \`ubuntu\` from the existing checkout at \`/home/ubuntu/cs2-arb-mock\`.
-The VPS needs systemd, Rust/Cargo (installed for \`ubuntu\`), the workspace's build
+The VPS needs systemd, jq, Rust/Cargo (installed for \`ubuntu\`), the workspace's build
 prerequisites and GitHub access. From that checkout, install or refresh the VPS files:
 
 \`\`\`sh

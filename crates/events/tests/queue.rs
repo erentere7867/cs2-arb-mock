@@ -31,6 +31,29 @@ fn config() -> QueueConfig {
     }
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_opens_of_a_fresh_database_do_not_race_on_migrations() {
+    for _ in 0..5 {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.db");
+        let opens = (0..6).map(|_| {
+            let path = path.to_str().unwrap().to_owned();
+            tokio::spawn(async move { EventQueue::open(&path).await })
+        });
+        for queue in futures_join(opens).await {
+            queue.unwrap().close().await;
+        }
+    }
+}
+
+async fn futures_join<T>(handles: impl Iterator<Item = tokio::task::JoinHandle<T>>) -> Vec<T> {
+    let mut results = Vec::new();
+    for handle in handles.collect::<Vec<_>>() {
+        results.push(handle.await.unwrap());
+    }
+    results
+}
+
 #[tokio::test]
 async fn queue_creates_missing_database_directories() {
     let dir = tempfile::tempdir().unwrap();

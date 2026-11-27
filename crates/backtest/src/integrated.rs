@@ -11,7 +11,7 @@ use cs2_arb_sim::{wear::quote_bucket, MockExecutor, SimConfig};
 use cs2_arb_strategy::executor::execute_with_risk;
 use cs2_arb_strategy::{
     evaluate_spread, evaluate_spread_with_holds, spread_breakdown_with_hold, DipConfig,
-    DipDetector, KillSwitch, RiskLimits, RiskManager, SpreadConfig, SubmitError,
+    DipDetector, KillSwitch, RiskLimits, RiskManager, SpreadBreakdown, SpreadConfig, SubmitError,
 };
 
 use crate::{FillModel, FillOutcome, MarketView, QuoteKey, StrategyAdapter};
@@ -365,7 +365,7 @@ fn marked_unrealized(view: &MarketView<'_>, positions: &[Position]) -> Result<Mo
 pub struct SpreadAdapter {
     config: SpreadConfig,
     targets: HashMap<PositionKey, (Platform, DateTime<Utc>)>,
-    pending: HashMap<String, (Platform, DateTime<Utc>)>,
+    pending: HashMap<String, SpreadBreakdown>,
 }
 
 impl SpreadAdapter {
@@ -390,9 +390,7 @@ impl StrategyAdapter for SpreadAdapter {
         for position in view.positions {
             let key = (position.item.clone(), position.float_bucket);
             if let Some(&(platform, not_before)) = self.targets.get(&key) {
-                if (view.uses_venue_holds() || view.now >= not_before)
-                    && !position.is_trade_locked_at(view.now)
-                {
+                if view.now >= not_before && !position.is_trade_locked_at(view.now) {
                     if let Some(quote) =
                         view.latest_quote(platform, &position.item, position.float_bucket)
                     {
@@ -456,7 +454,7 @@ impl StrategyAdapter for SpreadAdapter {
                     sell,
                     view.fees,
                     &config,
-                    hold(candidate.buy_platform),
+                    Some(candidate.hold),
                 )?
             } else {
                 candidate
@@ -478,10 +476,7 @@ impl StrategyAdapter for SpreadAdapter {
             let key = (candidate.item.clone(), candidate.float_bucket);
             if occupied.insert(key) {
                 let order = candidate.buy_order(view.now);
-                self.pending.insert(
-                    order.id.clone(),
-                    (candidate.sell_platform, candidate.sell_not_before(view.now)),
-                );
+                self.pending.insert(order.id.clone(), candidate);
                 orders.push(order);
             }
         }
@@ -489,9 +484,14 @@ impl StrategyAdapter for SpreadAdapter {
     }
 
     fn on_fill(&mut self, fill: &Fill) {
-        if let Some(target) = self.pending.remove(&fill.order.id) {
-            self.targets
-                .insert((fill.order.item.clone(), fill.order.float_bucket), target);
+        if let Some(candidate) = self.pending.remove(&fill.order.id) {
+            self.targets.insert(
+                (fill.order.item.clone(), fill.order.float_bucket),
+                (
+                    candidate.sell_platform,
+                    candidate.sell_not_before(fill.filled_at),
+                ),
+            );
         }
     }
 

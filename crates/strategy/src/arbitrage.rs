@@ -58,6 +58,10 @@ impl Default for SpreadConfig {
 }
 
 impl SpreadConfig {
+    pub fn effective_hold(&self, venue_hold: Option<Duration>) -> Duration {
+        venue_hold.unwrap_or_else(|| Duration::days(i64::from(self.hold_days)))
+    }
+
     pub fn validate(&self) -> Result<()> {
         self.validate_for_hold(f64::from(self.hold_days))
     }
@@ -119,11 +123,11 @@ pub struct SpreadBreakdown {
     pub sell_proceeds: Money,
     /// Reduction of seller proceeds caused by the drift haircut.
     pub drift_haircut: Money,
-    /// Opportunity cost of `buy_cost` locked for `hold_days`.
+    /// Opportunity cost of `buy_cost` locked for `hold`.
     pub opportunity_cost: Money,
     /// `sell_proceeds - buy_cost - opportunity_cost`.
     pub expected_net_profit: Money,
-    pub hold_days: u32,
+    pub hold: Duration,
 }
 
 impl SpreadBreakdown {
@@ -166,7 +170,7 @@ impl SpreadBreakdown {
 
     /// Earliest time the planned sell can be submitted if bought at `bought_at`.
     pub fn sell_not_before(&self, bought_at: DateTime<Utc>) -> DateTime<Utc> {
-        bought_at + Duration::days(i64::from(self.hold_days))
+        bought_at + self.hold
     }
 
     fn order_id(&self, prefix: &str, at: DateTime<Utc>) -> String {
@@ -201,9 +205,8 @@ pub fn spread_breakdown_with_hold(
     config: &SpreadConfig,
     hold: Option<Duration>,
 ) -> Result<SpreadBreakdown> {
-    let hold_days = hold.map_or(f64::from(config.hold_days), |hold| {
-        hold.num_seconds() as f64 / 86_400.0
-    });
+    let hold = config.effective_hold(hold);
+    let hold_days = hold.num_seconds() as f64 / 86_400.0;
     config.validate_for_hold(hold_days)?;
     if buy.item != sell.item
         || !comparable_wear(
@@ -261,7 +264,7 @@ pub fn spread_breakdown_with_hold(
         drift_haircut,
         opportunity_cost,
         expected_net_profit,
-        hold_days: config.hold_days,
+        hold,
     })
 }
 
@@ -645,6 +648,20 @@ mod tests {
         assert_eq!(sell.side, OrderSide::Sell);
         assert_eq!(sell.platform, Platform::DMarket);
         assert_eq!(sell.limit_price, Money(13_000));
+    }
+
+    #[test]
+    fn venue_hold_sets_both_drift_and_earliest_sale() {
+        let buy = quote(Platform::CsFloat, 10_000);
+        let sell = quote(Platform::DMarket, 13_000);
+        let mut config = cfg();
+        config.price_drift_pct_per_day = 10.0;
+        let baseline = spread_breakdown(&buy, &sell, &fees(), &config).unwrap();
+        let hold = Duration::hours(12);
+        let venue = spread_breakdown_with_hold(&buy, &sell, &fees(), &config, Some(hold)).unwrap();
+        assert_eq!(venue.sell_not_before(t0()), t0() + hold);
+        assert!(venue.drift_haircut < baseline.drift_haircut);
+        assert!(venue.opportunity_cost < baseline.opportunity_cost);
     }
 
     #[test]

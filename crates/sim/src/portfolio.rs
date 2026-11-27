@@ -176,6 +176,11 @@ impl Portfolio {
         self.ledger.len() as u64
     }
 
+    pub(crate) fn realize_prepaid_fee_loss(&mut self, fee: Money) -> cs2_arb_core::Result<()> {
+        self.realized_pnl = self.realized_pnl.checked_sub(fee)?;
+        Ok(())
+    }
+
     /// Apply a buy whose totals have been validated by the caller.
     pub(crate) fn record_buy(
         &mut self,

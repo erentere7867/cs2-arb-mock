@@ -23,10 +23,14 @@ use crate::wear::{order_matches, order_matches_float};
 /// Everything produced by an accepted order.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ExecutionReport {
+    /// Cash debited on a buy, including any prepayment for unfilled units.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cash_paid: Option<Money>,
     pub allocated_deposit: Option<Money>,
     /// `fill.fee` is the **total** marketplace fee for the fill (buyer fee on a
     /// buy, seller fee on a sell), not a per-unit fee.
     pub fill: Fill,
+    /// Fees allocated to the filled units. Buy-side net is the inventory cost basis.
     pub fees: FeeBreakdown,
     pub liquidity: LiquidityStats,
     pub ledger_entry: LedgerEntry,
@@ -472,6 +476,7 @@ impl MockExecutor {
             self.book.consume(order.platform, id, *take);
         }
         Ok(ExecutionReport {
+            cash_paid: Some(fees.net),
             allocated_deposit: None,
             fill: Fill {
                 order: order.clone(),
@@ -632,6 +637,7 @@ impl MockExecutor {
         };
         self.portfolio.record_sell(entry.clone(), &draws)?;
         Ok(ExecutionReport {
+            cash_paid: None,
             allocated_deposit: None,
             fill: Fill {
                 order: order.clone(),

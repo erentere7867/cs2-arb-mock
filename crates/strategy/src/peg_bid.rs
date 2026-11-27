@@ -42,6 +42,8 @@ pub struct PegBidConfig {
     pub min_reprice_delta: Money,
     /// Maximum age of top-of-book buy orders in seconds (`None` disables age check).
     pub max_order_age_secs: Option<i64>,
+    /// Optional simulated lifetime of a resting bid. Expiration cancels remaining units.
+    pub resting_bid_ttl_secs: Option<u32>,
     /// When `target_bid` exceeds the strict margin ceiling:
     /// - `false` (default): discard the bid;
     /// - `true`: clamp the bid down to the exact margin ceiling.
@@ -64,6 +66,7 @@ impl Default for PegBidConfig {
             cooldown_secs: 300,
             min_reprice_delta: Money(2),
             max_order_age_secs: Some(3600),
+            resting_bid_ttl_secs: None,
             lower_to_ceiling: false,
             quantity: 1,
             allowed_platforms: vec![Platform::CsFloat, Platform::Skinport, Platform::Waxpeer],
@@ -103,6 +106,9 @@ impl PegBidConfig {
         }
         if matches!(self.max_order_age_secs, Some(age) if age < 0) {
             return bad("max_order_age_secs must be >= 0");
+        }
+        if self.resting_bid_ttl_secs == Some(0) {
+            return bad("resting_bid_ttl_secs must be positive");
         }
         if self.quantity == 0 {
             return bad("quantity must be >= 1");

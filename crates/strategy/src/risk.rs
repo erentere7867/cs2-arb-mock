@@ -334,8 +334,13 @@ impl RiskManager {
 
     /// Records an arbitrary realized P&L adjustment (e.g. fees outside fills) at `at`.
     pub fn record_realized_pnl(&mut self, delta: Money, at: DateTime<Utc>) {
+        self.record_marked_pnl_adjustment(delta, Money(self.unrealized), at);
+    }
+
+    pub fn record_marked_pnl_adjustment(&mut self, delta: Money, mark: Money, at: DateTime<Utc>) {
         self.roll_day(at);
         self.day_realized += delta.0;
+        self.unrealized = mark.0;
         self.refresh_drawdown(at);
     }
 

@@ -114,7 +114,7 @@ impl HttpCore {
                 .await
                 .ok()
                 .flatten()
-                .or(reset),
+                .max(reset),
             };
             let retry_after = hint
                 .unwrap_or(DEFAULT_429_RETRY)

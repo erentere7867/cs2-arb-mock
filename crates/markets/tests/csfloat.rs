@@ -235,14 +235,24 @@ async fn retry_after_silences_all_csfloat_routes_until_expiry() {
 
 #[tokio::test(start_paused = true)]
 async fn missing_retry_after_uses_body_then_default() {
-    for (body, secs) in [
-        (r#"{"message":"Too many requests, retry after 75s"}"#, 75),
-        ("no hint", 60),
+    for (body, reset, secs) in [
+        (
+            r#"{"message":"Too many requests, retry after 75s"}"#,
+            None,
+            75,
+        ),
+        ("retry after 30s", Some("90"), 90),
+        ("retry after 75s", Some("30"), 75),
+        ("no hint", None, 60),
     ] {
         let server = MockServer::start().await;
+        let mut response = ResponseTemplate::new(429).set_body_string(body);
+        if let Some(reset) = reset {
+            response = response.insert_header("X-RateLimit-Reset", reset);
+        }
         Mock::given(method("GET"))
             .and(path("/api/v1/listings"))
-            .respond_with(ResponseTemplate::new(429).set_body_string(body))
+            .respond_with(response)
             .expect(1)
             .mount(&server)
             .await;

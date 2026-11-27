@@ -1359,9 +1359,13 @@ async fn read_payloads<T: serde::de::DeserializeOwned>(
 }
 
 async fn lock_migrations(database: &std::path::Path) -> Result<std::fs::File> {
-    let mut path = database.as_os_str().to_owned();
-    path.push(".migrate.lock");
+    let database = database.to_owned();
     tokio::task::spawn_blocking(move || {
+        // Lock next to the file SQLite opens, so a symlinked path shares the target's lock.
+        let mut path = std::fs::canonicalize(&database)
+            .unwrap_or(database)
+            .into_os_string();
+        path.push(".migrate.lock");
         let file = std::fs::OpenOptions::new()
             .create(true)
             .truncate(false)

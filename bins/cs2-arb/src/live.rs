@@ -225,6 +225,7 @@ pub async fn collect(
         }
     }
     let mut snapshots = Vec::new();
+    let mut regime_quotes = Vec::new();
     let mut bid_refreshes = Vec::new();
     let mut depth = MarketDepth::default();
     let started_at = Utc::now();
@@ -290,11 +291,19 @@ pub async fn collect(
                             item: item.clone(),
                             float_bucket: bucket,
                             price: listing.price,
-                            observed_at: at,
+                            observed_at: if platform == Platform::Skinport {
+                                listing.observed_at
+                            } else {
+                                at
+                            },
                         });
                 }
             }
-            snapshots.extend(best.into_values());
+            for mut quote in best.into_values() {
+                regime_quotes.push(quote.clone());
+                quote.observed_at = at;
+                snapshots.push(quote);
+            }
             depth.replace_listings(at, platform, item, listings);
         }
         if game == Game::Cs2 {
@@ -303,7 +312,7 @@ pub async fn collect(
     }
     let retain_since = started_at - MARKET_HISTORY_RETENTION;
     queue
-        .record_market_history(game, &snapshots, depth.sales(), retain_since)
+        .record_market_history(game, &regime_quotes, depth.sales(), retain_since)
         .await?;
     if snapshots.is_empty() {
         return Err(Error::InvalidData(

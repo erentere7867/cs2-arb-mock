@@ -688,6 +688,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn skinport_cache_hits_do_not_add_regime_observations() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/items"))
+            .and(query_param("app_id", "252490"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([{
+                "market_hash_name": "Alien Red",
+                "min_price": 29.00,
+                "quantity": 1,
+            }])))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/sales/history"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let config = concat!(env!("CARGO_MANIFEST_DIR"), "/../../config/rust.toml");
+        let cli = Cli::try_parse_from([
+            "cs2-arb",
+            "--config",
+            config,
+            "run-mock",
+            "--live-market-data",
+            "--platform",
+            "skinport",
+            "--samples",
+            "2",
+            "--interval-seconds",
+            "1",
+            "--database",
+            ":memory:",
+        ])
+        .unwrap();
+        let sources = live::MarketSources {
+            secrets: &Secrets::default(),
+            base_url_override: Some(&server.uri()),
+        };
+        let mut report = Vec::new();
+        run(cli, &sources, &mut report).await.unwrap();
+        let markdown = String::from_utf8(report).unwrap();
+        assert!(markdown.contains("· 2 snapshots ·"));
+        assert!(markdown.contains("| Regime History Quotes | 1 |"));
+    }
+
+    #[tokio::test]
     async fn rust_batches_reopen_regime_history_and_stay_closed_until_both_anchors_exist() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))

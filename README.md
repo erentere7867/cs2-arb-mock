@@ -74,7 +74,16 @@ Spread candidates are ranked by expected net P&L after fees, hold cost and confi
 
 `watch` and its SQLite event queue remain CS2-only. Rust live reads do not consume CS2 events; a Rust historical replay can supply its own `--events` file if needed. Explicit panic-window records do not carry an app ID, so supply records for the selected game.
 
-`[rate_limits]` configures quotas and optional sharing between paths. Skinport also has a local 8-request/300-second cap and five-minute cache per endpoint (optional on-disk cache in `SkinportConfig`). A 429 suppresses further admissions for at least the full configured window or the server's longer retry hint. 5xx and network failures use exponential backoff with full jitter (1 s base, 300 s cap), and every attempt is gated. `[events]`, `[spread]`, `[dip]`, and `[risk]` configure polling and panic windows, the strategies, and risk limits.
+`[rate_limits]` configures quotas and sharing between paths. The bundled profiles use these limits for read-only data:
+
+| Market | Local pacing | Published guidance |
+| --- | --- | --- |
+| CSFloat | 1 request per 10 seconds, shared across routes | [API reference](https://docs.csfloat.com/) does not publish a numeric quota. |
+| DMarket | 1 request per second, shared across routes | [Signed requests](https://support.dmarket.com/hc/en-us/articles/25269064897297-What-are-the-rate-limits-for-requests): 10/s for market items and 6/s for last sales. |
+| Skinport | 6 requests per 330 seconds, shared across both routes; five-minute cache per route | [8 per five minutes](https://docs.skinport.com/introduction/rate-limits) shared by items and sales history; 1,000/hour globally. |
+| Waxpeer | 1 request per 6 seconds across both routes; ten-second cache per route | [Prices](https://docs.waxpeer.com/api/buy-items/prices-snapshot) and [buy orders](https://docs.waxpeer.com/api/buy-order/buy-orders-snapshot) snapshots refresh about every ten seconds; no numeric JSON snapshot quota is published. |
+
+On HTTP 429 the client stops sending to that market for the server's `Retry-After` or the longer of the available body and reset hints, defaulting to 60 seconds without a usable hint. Skinport always gets at least five minutes of silence. Configured per-route penalties can last longer. When a successful response reports zero remaining quota, the next read waits for a reset of up to three seconds; for a longer reset or a 429, reads are skipped during the cooldown. Pacing and cooldowns are per running client; other processes or hosts sharing a provider quota can still consume it. 5xx and network failures use exponential backoff with full jitter (1 s base, 300 s cap), and every attempt is gated. `[events]`, `[spread]`, `[dip]`, and `[risk]` configure polling and panic windows, the strategies, and risk limits.
 
 The application loads credentials from the process environment only. It does not log them, serialize them, load a dotenv file, or pass them to mock strategy/report code.
 

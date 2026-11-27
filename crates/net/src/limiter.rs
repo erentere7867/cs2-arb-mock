@@ -292,7 +292,7 @@ impl EndpointLimiter {
     /// Returns the instant the cooldown ends.
     pub fn record_429(&self, retry_after: Option<Duration>) -> Instant {
         let until = lock(&self.bucket).penalize(self.clock.now(), retry_after);
-        tracing::warn!(
+        tracing::debug!(
             endpoint = %self.label,
             cooldown_secs = until
                 .saturating_duration_since(self.clock.now())

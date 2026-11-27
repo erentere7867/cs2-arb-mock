@@ -81,8 +81,7 @@ impl HttpCore {
             .await
             .map_err(|e| Error::Network(format!("{}: {}", endpoint.name, e.without_url())))?;
         let status = response.status().as_u16();
-        let retry_after = retry_after_from_headers(response.headers(), self.clock.now())
-            .or_else(|| (status == 429).then_some(DEFAULT_429_RETRY));
+        let retry_after = retry_after_from_headers(response.headers(), self.clock.now());
         self.gate.on_response(endpoint, status, retry_after);
         tracing::debug!(endpoint = endpoint.name, status, "market request completed");
 

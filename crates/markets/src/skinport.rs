@@ -490,7 +490,7 @@ impl SkinportClient {
     ) -> Result<Cached<T>> {
         if self.config.serve_stale_on_limit {
             if let Some(stale) = state.cache.get_any(key) {
-                tracing::warn!(
+                tracing::debug!(
                     endpoint = state.endpoint.name,
                     fetched_at = %stale.fetched_at,
                     "rate limited; serving stale cached response"

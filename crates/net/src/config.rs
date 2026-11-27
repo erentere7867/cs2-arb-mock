@@ -176,7 +176,7 @@ mod tests {
         assert_eq!(items.path.as_deref(), Some("/v1/items"));
         assert_eq!(
             items.limit,
-            RateLimit::new(8, Duration::from_secs(300)).unwrap()
+            RateLimit::new(6, Duration::from_secs(330)).unwrap()
         );
 
         let limiter = config.build_limiter(Arc::new(TokioClock)).unwrap();

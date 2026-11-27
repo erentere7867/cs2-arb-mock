@@ -34,27 +34,30 @@ crypto_deposit = { pct = 1.0, fixed = 0 } # Most coins: https://faq.waxpeer.com/
 crypto_withdrawal = { pct = 1.5, fixed = 0 } # Standard crypto rate excluding network: https://faq.waxpeer.com/faq/fees-withdraw
 bank_cashout = { pct = 0.0, fixed = 0 }
 
+# Both snapshots refresh about every 10s: https://docs.waxpeer.com/api/buy-items/prices-snapshot
 [rate_limits.waxpeer.default]
-max_requests = 2
-window_seconds = 10
+max_requests = 1
+window_seconds = 6
 
+# Shared 8/300s budget; leave headroom: https://docs.skinport.com/introduction/rate-limits
 [rate_limits.skinport.items]
 path = "/v1/items"
-quota_group = "public_catalogue"
-max_requests = 8
-window_seconds = 300
+max_requests = 6
+window_seconds = 330
+quota_group = "catalogue"
 
 [rate_limits.skinport.sales_history]
 path = "/v1/sales/history"
-quota_group = "public_catalogue"
-max_requests = 8
-window_seconds = 300
+max_requests = 6
+window_seconds = 330
+quota_group = "catalogue"
 
-# Conservative mock defaults, not verified server policies.
+# Conservative local pacing; https://docs.csfloat.com/ does not publish a numeric quota.
 [rate_limits.csfloat.default]
 max_requests = 1
-window_seconds = 1
+window_seconds = 10
 
+# Signed reads: 10/s market items, 6/s last sales. https://dmarket.com/faq#startUsingTradingAPI
 [rate_limits.dmarket.default]
 max_requests = 1
 window_seconds = 1

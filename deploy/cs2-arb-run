@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+data=/home/ubuntu/cs2-arb-mock-data
+cd "$data"
+release=$(readlink -f -- current)
+database="$data/events.db"
+case "${1:-}" in
+    watch) exec "$release/cs2-arb" --config "$release/config/default.toml" watch --database "$database" ;;
+    cs2) config=config/default.toml ;;
+    rust) config=config/rust.toml ;;
+    *) echo "Usage: cs2-arb-run {cs2|rust|watch}" >&2; exit 2 ;;
+esac
+
+reports="$data/reports/$1"
+mkdir -p -- "$reports"
+pending="$reports/.in-progress"
+trap 'rm -f -- "$pending"' EXIT
+"$release/cs2-arb" --config "$release/$config" run-mock --live-market-data \
+    --samples 2 --interval-seconds 120 --database "$database" > "$pending"
+report="$reports/$(date -u +%Y%m%dT%H%M%S.%NZ).md"
+mv -- "$pending" "$report"
+printf 'Saved live mock report: %s\n' "$report"

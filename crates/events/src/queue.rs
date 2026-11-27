@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, TimeDelta, Utc};
-use cs2_arb_core::{Error, MarketEvent, Result};
+use cs2_arb_core::{Error, Game, MarketEvent, PriceSnapshot, Result, Sale};
 use serde::{Deserialize, Serialize};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteRow};
 use sqlx::{Row, SqliteConnection, SqlitePool};
@@ -269,6 +269,12 @@ pub struct EventQueue {
     clock: Arc<dyn Clock>,
 }
 
+#[derive(Debug, Default)]
+pub struct MarketHistory {
+    pub snapshots: Vec<PriceSnapshot>,
+    pub sales: Vec<Sale>,
+}
+
 const QUEUE_COLUMNS: &str = "id, kind, payload, dedupe_key, status, attempts, enqueued_at, \
      available_at, claimed_by, lease_expires_at, acked_at, last_error";
 
@@ -336,6 +342,95 @@ impl EventQueue {
     /// Close the pool, flushing WAL state. Further calls fail.
     pub async fn close(&self) {
         self.pool.close().await;
+    }
+
+    pub async fn record_market_history(
+        &self,
+        game: Game,
+        snapshots: &[PriceSnapshot],
+        sales: &[Sale],
+        retain_since: DateTime<Utc>,
+    ) -> Result<()> {
+        let app_id = i64::from(game.app_id());
+        let cutoff = to_millis(retain_since);
+        let mut tx = self.pool.begin().await.map_err(storage)?;
+        for quote in snapshots
+            .iter()
+            .filter(|quote| quote.price.0 > 0 && quote.observed_at >= retain_since)
+        {
+            sqlx::query("INSERT INTO market_snapshots (app_id, observed_at, payload) VALUES (?, ?, ?) ON CONFLICT DO NOTHING")
+                .bind(app_id)
+                .bind(to_millis(quote.observed_at))
+                .bind(serde_json::to_string(quote).map_err(storage)?)
+                .execute(&mut *tx)
+                .await
+                .map_err(storage)?;
+        }
+        for sale in sales
+            .iter()
+            .filter(|sale| sale.verified && sale.price.0 > 0 && sale.sold_at >= retain_since)
+        {
+            sqlx::query("INSERT INTO market_sales (app_id, platform, sale_id, sold_at, payload) VALUES (?, ?, ?, ?, ?) ON CONFLICT DO NOTHING")
+                .bind(app_id)
+                .bind(serde_json::to_string(&sale.platform).map_err(storage)?)
+                .bind(&sale.id)
+                .bind(to_millis(sale.sold_at))
+                .bind(serde_json::to_string(sale).map_err(storage)?)
+                .execute(&mut *tx)
+                .await
+                .map_err(storage)?;
+        }
+        sqlx::query("DELETE FROM market_snapshots WHERE app_id = ? AND observed_at < ?")
+            .bind(app_id)
+            .bind(cutoff)
+            .execute(&mut *tx)
+            .await
+            .map_err(storage)?;
+        sqlx::query("DELETE FROM market_sales WHERE app_id = ? AND sold_at < ?")
+            .bind(app_id)
+            .bind(cutoff)
+            .execute(&mut *tx)
+            .await
+            .map_err(storage)?;
+        tx.commit().await.map_err(storage)
+    }
+
+    pub async fn load_market_history(
+        &self,
+        game: Game,
+        from: DateTime<Utc>,
+        through: DateTime<Utc>,
+    ) -> Result<MarketHistory> {
+        let app_id = i64::from(game.app_id());
+        let snapshots = sqlx::query_scalar::<_, String>(
+            "SELECT payload FROM market_snapshots WHERE app_id = ? AND observed_at BETWEEN ? AND ? ORDER BY observed_at, payload",
+        )
+        .bind(app_id)
+        .bind(to_millis(from))
+        .bind(to_millis(through))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(storage)?;
+        let sales = sqlx::query_scalar::<_, String>(
+            "SELECT payload FROM market_sales WHERE app_id = ? AND sold_at BETWEEN ? AND ? ORDER BY sold_at, platform, sale_id",
+        )
+        .bind(app_id)
+        .bind(to_millis(from))
+        .bind(to_millis(through))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(storage)?;
+        let mut snapshots: Vec<PriceSnapshot> = snapshots
+            .iter()
+            .map(|payload| serde_json::from_str(payload).map_err(storage))
+            .collect::<Result<_>>()?;
+        let mut sales: Vec<Sale> = sales
+            .iter()
+            .map(|payload| serde_json::from_str(payload).map_err(storage))
+            .collect::<Result<_>>()?;
+        snapshots.retain(|quote| (from..=through).contains(&quote.observed_at));
+        sales.retain(|sale| (from..=through).contains(&sale.sold_at));
+        Ok(MarketHistory { snapshots, sales })
     }
 
     // ----------------------------------------------------------------- queue

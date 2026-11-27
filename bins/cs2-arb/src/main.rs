@@ -302,7 +302,7 @@ async fn run(
             &accounts.trade_holds_for(&audited_markets),
         )?;
     }
-    let (inputs, output) = match cli.command {
+    let (inputs, output, history) = match cli.command {
         Command::RunMock {
             history,
             samples,
@@ -310,26 +310,26 @@ async fn run(
             database,
             ..
         } => {
-            let inputs = if let Some(platforms) = &live_platforms {
-                live::collect(
+            if let Some(platforms) = &live_platforms {
+                let (inputs, history) = live::collect(
                     &config,
                     &fees,
                     platforms.clone(),
                     samples,
                     interval_seconds,
-                    (game == Game::Cs2)
-                        .then_some((database.as_str(), settings.dip.branch_update_window_hours)),
+                    &database,
+                    settings.dip.branch_update_window_hours,
                     game,
                     settings.relist.instant_sale,
                     settings.live_sales_lookback_days(),
                     settings.simulation.build()?.max_listing_age,
                     market_sources,
                 )
-                .await?
+                .await?;
+                (inputs, None, Some(history))
             } else {
-                historical(game, markets, history)?
-            };
-            (inputs, None)
+                (historical(game, markets, history)?, None, None)
+            }
         }
         Command::Backtest {
             history,
@@ -337,12 +337,21 @@ async fn run(
         } => (
             historical(game, markets, history)?,
             Some(backtest_output_dir(game, output_dir)),
+            None,
         ),
         Command::Watch { .. } => unreachable!("handled before loading market configuration"),
     };
     let kill_switch = KillSwitch::with_defaults();
     let peg_config = settings.peg_bid.clone();
-    let regime_config = settings.market_regime.clone();
+    let regime = Arc::new(MarketRegime::new(
+        settings.market_regime.clone(),
+        history
+            .as_ref()
+            .map_or(&inputs.snapshots, |tape| &tape.snapshots),
+        history
+            .as_ref()
+            .map_or(inputs.depth.sales(), |tape| &tape.sales),
+    )?);
     let mut relist_config = settings.relist.clone();
     relist_config.instant_sale &= inputs.has_observed_bids;
     let risk_limits = settings.risk.clone();
@@ -351,14 +360,14 @@ async fn run(
         fees.clone(),
         settings,
         kill_switch.clone(),
-        accounts.clone(),
-        &audited_markets,
+        (accounts.clone(), &audited_markets),
         live_platforms.is_some(),
+        Arc::clone(&regime),
     )?;
     if audit_enabled || live_platforms.is_some() {
         report.unverified_platform_assumptions = platform_audit::unverified(&audited_markets);
     }
-    let peg_dashboard = peg_runner::run_peg_bid_engine(
+    let mut peg_dashboard = peg_runner::run_peg_bid_engine(
         &inputs.snapshots,
         inputs.depth.sales(),
         &inputs.buy_orders,
@@ -370,12 +379,9 @@ async fn run(
         &kill_switch,
         None,
         accounts,
-        Some(&MarketRegime::new(
-            regime_config,
-            &inputs.snapshots,
-            inputs.depth.sales(),
-        )?),
+        Some(&regime),
     )?;
+    peg_dashboard.history_coverage = history.as_ref().map(peg_runner::HistoryCoverage::from);
     peg_dashboard.log_summary();
     if let Some(directory) = output {
         write_reports(&directory, &report, &peg_dashboard)?;
@@ -508,14 +514,19 @@ fn simulate(
     settings: Settings,
     kill_switch: KillSwitch,
 ) -> Result<PerformanceReport> {
+    let regime = Arc::new(MarketRegime::new(
+        settings.market_regime.clone(),
+        &inputs.snapshots,
+        inputs.depth.sales(),
+    )?);
     simulate_with_accounts(
         inputs,
         fees,
         settings,
         kill_switch,
-        None,
-        &Platform::ALL,
+        (None, &Platform::ALL),
         false,
+        regime,
     )
 }
 
@@ -524,15 +535,10 @@ fn simulate_with_accounts(
     fees: FeeSchedules,
     settings: Settings,
     kill_switch: KillSwitch,
-    accounts: Option<VenueAccounts>,
-    active_platforms: &[Platform],
+    (accounts, active_platforms): (Option<VenueAccounts>, &[Platform]),
     live_batch: bool,
+    regime: Arc<MarketRegime>,
 ) -> Result<PerformanceReport> {
-    let regime = Arc::new(MarketRegime::new(
-        settings.market_regime,
-        &inputs.snapshots,
-        inputs.depth.sales(),
-    )?);
     let mut dip = DipAdapter::new(settings.dip, &inputs.depth)?.with_market_regime(regime);
     if live_batch {
         if let Some(first_quote) = inputs.snapshots.iter().map(|q| q.observed_at).min() {
@@ -597,7 +603,10 @@ fn write_reports(
 
 #[cfg(test)]
 mod tests {
+    use chrono::Utc;
     use cs2_arb_backtest::ops::secrets::vars::{DMARKET_PUBLIC_KEY, DMARKET_SECRET_KEY};
+    use cs2_arb_core::{Money, WearTier};
+    use cs2_arb_events::EventQueue;
     use serde_json::json;
     use wiremock::matchers::{method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -675,6 +684,97 @@ mod tests {
         assert!(markdown.starts_with("# Backtest performance report"));
         assert!(markdown.contains("· 1 snapshots ·"));
         assert!(markdown.contains("Total P&L"));
+        assert!(markdown.contains("| Regime History Quotes | 1 |"));
+    }
+
+    #[tokio::test]
+    async fn rust_batches_reopen_regime_history_and_stay_closed_until_both_anchors_exist() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/prices/snapshot"))
+            .and(query_param("game", "rust"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "success": true,
+                "items": [{"name": "Alien Red", "item_id": "ask-1", "price": 29000}],
+            })))
+            .expect(3)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/buy-orders/snapshot"))
+            .and(query_param("game", "rust"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "success": true,
+                "offers": [],
+            })))
+            .expect(3)
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("events.db");
+        let db = db.to_str().unwrap();
+        let config = concat!(env!("CARGO_MANIFEST_DIR"), "/../../config/rust.toml");
+        let sources = live::MarketSources {
+            secrets: &Secrets::default(),
+            base_url_override: Some(&server.uri()),
+        };
+        let now = Utc::now();
+        for (prior_day, label, quotes) in [
+            (None, "Risk-off: insufficient history", 1),
+            (Some(7), "Risk-off: insufficient history", 3),
+            (Some(1), "Risk-on", 5),
+        ] {
+            if let Some(days) = prior_day {
+                let at = now - TimeDelta::days(days) - TimeDelta::hours(1);
+                let queue = EventQueue::open(db).await.unwrap();
+                queue
+                    .record_market_history(
+                        Game::Rust,
+                        &[PriceSnapshot {
+                            item: ItemId {
+                                market_hash_name: "Alien Red".into(),
+                                wear_tier: WearTier::NotApplicable,
+                            },
+                            platform: Platform::Waxpeer,
+                            float_bucket: None,
+                            price: Money(2900),
+                            observed_at: at,
+                        }],
+                        &[],
+                        at - TimeDelta::days(10),
+                    )
+                    .await
+                    .unwrap();
+                queue.close().await;
+            }
+            let cli = Cli::try_parse_from([
+                "cs2-arb",
+                "--config",
+                config,
+                "run-mock",
+                "--live-market-data",
+                "--platform",
+                "waxpeer",
+                "--samples",
+                "1",
+                "--database",
+                db,
+            ])
+            .unwrap();
+            let mut report = Vec::new();
+            run(cli, &sources, &mut report).await.unwrap();
+            let markdown = String::from_utf8(report).unwrap();
+            assert!(
+                markdown.contains(&format!("| Market Regime | {label} |")),
+                "{markdown}"
+            );
+            assert!(markdown.contains(&format!("| Regime History Quotes | {quotes} |")));
+            assert!(
+                markdown.contains("· 1 snapshots ·"),
+                "prior quotes must not be replayed"
+            );
+        }
     }
 
     #[test]
@@ -755,9 +855,9 @@ transfer_out_seconds = 0
             fees,
             settings,
             KillSwitch::new(),
-            Some(accounts),
-            &selected,
+            (Some(accounts), &selected),
             true,
+            Arc::new(MarketRegime::new(RegimeConfig::default(), &[], &[]).unwrap()),
         )
         .unwrap();
         assert_eq!(report.venue_trade_holds.len(), 1);

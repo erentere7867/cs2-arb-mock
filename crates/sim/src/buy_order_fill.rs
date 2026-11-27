@@ -292,9 +292,13 @@ impl BuyOrderFillSimulator {
         }
 
         let mut reports = Vec::new();
-        let bid_count = self.resting_bids.len();
+        let mut candidate_indices: Vec<usize> = (0..self.resting_bids.len()).collect();
+        candidate_indices.sort_by_key(|&idx| {
+            let bid = &self.resting_bids[idx];
+            (std::cmp::Reverse(bid.order.limit_price), bid.placed_at, idx)
+        });
 
-        for idx in 0..bid_count {
+        for idx in candidate_indices {
             let (order, placed_at, tie_ready_at, remaining_quantity) = {
                 let bid = &self.resting_bids[idx];
                 if bid.status != BuyOrderStatus::Resting || bid.remaining_quantity == 0 {

@@ -295,6 +295,30 @@ pub fn run_peg_bid_engine(
             sale_idx += 1;
         }
 
+        let relist_step = relist.step(
+            &sorted_sales[..sale_idx],
+            &sorted_snapshots[..snap_idx],
+            fees,
+            now,
+        )?;
+        for settled in &relist_step.realized_sales {
+            match simulator.settle_relist_sale(
+                &settled.position_id,
+                settled.platform,
+                settled.ask_price,
+                settled.sold_at,
+            ) {
+                Ok(report) => {
+                    let _ = risk.record_fill(&report.fill)?;
+                }
+                Err(reason) => tracing::warn!(
+                    position_id = %settled.position_id,
+                    ?reason,
+                    "relist settlement rejected by simulator"
+                ),
+            }
+        }
+
         let bid_start = bid_idx;
         while bid_idx < sorted_bids.len() && sorted_bids[bid_idx].observed_at <= now {
             bid_idx += 1;
@@ -326,30 +350,6 @@ pub fn run_peg_bid_engine(
                 if !active_keys.contains(&key) {
                     simulator.cancel_bids_for_item(obs.platform, &obs.item, obs.float_bucket);
                 }
-            }
-        }
-
-        let relist_step = relist.step(
-            &sorted_sales[..sale_idx],
-            &sorted_snapshots[..snap_idx],
-            fees,
-            now,
-        )?;
-        for settled in &relist_step.realized_sales {
-            match simulator.settle_relist_sale(
-                &settled.position_id,
-                settled.platform,
-                settled.ask_price,
-                settled.sold_at,
-            ) {
-                Ok(report) => {
-                    let _ = risk.record_fill(&report.fill)?;
-                }
-                Err(reason) => tracing::warn!(
-                    position_id = %settled.position_id,
-                    ?reason,
-                    "relist settlement rejected by simulator"
-                ),
             }
         }
     }

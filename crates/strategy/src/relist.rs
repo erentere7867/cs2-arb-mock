@@ -298,10 +298,7 @@ impl RelistEngine {
                             .get(platform)
                             .seller_proceeds(ask)?
                             .checked_mul(pos.quantity)?;
-                        if (fees.get(pos.acquired_on).funding.enabled()
-                            || fees.get(platform).funding.enabled())
-                            && net <= pos.cost_basis
-                        {
+                        if net <= pos.cost_basis {
                             continue;
                         }
                         if best.is_none_or(|(_, _, best_net)| net > best_net) {
@@ -377,9 +374,7 @@ impl RelistEngine {
                         continue;
                     }
                     let realized_net_pnl = net_proceeds.checked_sub(pos.cost_basis)?;
-                    if (fees.get(pos.acquired_on).funding.enabled() || schedule.funding.enabled())
-                        && realized_net_pnl.0 <= 0
-                    {
+                    if realized_net_pnl.0 <= 0 {
                         continue;
                     }
                     let (entry_schedule, entry_unit, entry_fee) = self.items[&id]
@@ -646,6 +641,17 @@ mod tests {
                 verified: true,
             })
             .collect()
+    }
+
+    #[test]
+    fn relist_rejects_a_net_loss_without_funding_costs() {
+        let acquired = t(1, 12);
+        let now = t(8, 12);
+        let mut engine = RelistEngine::new(RelistConfig::default()).unwrap();
+        engine.track_position(make_position(acquired), acquired);
+        let sales = make_sales(20, 8_600, now);
+        let step = engine.step(&sales, &[], &fees(), now).unwrap();
+        assert!(step.listed_orders.is_empty());
     }
 
     #[test]

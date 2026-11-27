@@ -325,14 +325,13 @@ impl StrategyAdapter for SpreadAdapter {
                     {
                         let price = quote.price.checked_sub(self.config.sell_undercut)?;
                         if price.0 > 0
-                            && (!(view.fees.get(position.acquired_on).funding.enabled()
-                                || view.fees.get(platform).funding.enabled())
-                                || view
-                                    .fees
-                                    .get(platform)
-                                    .seller_proceeds(price)?
-                                    .checked_mul(position.quantity)?
-                                    > position.cost_basis)
+                            && view.seller_proceeds(
+                                &PriceSnapshot {
+                                    price,
+                                    ..quote.clone()
+                                },
+                                position.quantity,
+                            )? > position.cost_basis
                         {
                             orders.push(exit_order(position, quote, price, view.now));
                         }
@@ -393,13 +392,10 @@ impl StrategyAdapter for DipAdapter<'_> {
             .iter()
             .filter(|p| !p.is_trade_locked_at(view.now))
         {
-            if let Some((platform, quote, proceeds)) =
+            if let Some((_, quote, proceeds)) =
                 view.best_exit(&position.item, position.float_bucket, position.quantity)?
             {
-                if !(view.fees.get(position.acquired_on).funding.enabled()
-                    || view.fees.get(platform).funding.enabled())
-                    || proceeds > position.cost_basis
-                {
+                if proceeds > position.cost_basis {
                     orders.push(exit_order(position, quote, quote.price, view.now));
                 }
             }

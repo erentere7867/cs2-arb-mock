@@ -14,9 +14,10 @@ async fn detailed_bids_page_past_filtered_depth_on_get() {
     let server = MockServer::start().await;
     let clock = clock();
     let filtered = json!({"name":"Alien Red","game":"rust","price":14000,"amount":1,"filled":0,"filters":{"float_min":0.1},"by":"filtered"});
-    let first_page: Vec<_> = std::iter::once(
+    let first_page: Vec<_> = [
         json!({"name":"Alien Red","game":"rust","price":13000,"amount":1,"filled":0,"by":"earlier"}),
-    ).chain(std::iter::repeat_n(filtered, 99)).collect();
+        json!({"name":"Alien Red","game":"rust","price":12900,"amount":1,"filled":0,"by":"owner"}),
+    ].into_iter().chain(std::iter::repeat_n(filtered, 98)).collect();
     for (skip, rows) in [
         ("0", first_page),
         (

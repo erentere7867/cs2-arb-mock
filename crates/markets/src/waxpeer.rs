@@ -82,7 +82,7 @@ fn add_detailed_bid_page(
             owners
                 .entry(bid.by)
                 .and_modify(|old| {
-                    if price > old.0 {
+                    if (observed_at, price) > (old.1, old.0) {
                         *old = (price, observed_at);
                     }
                 })

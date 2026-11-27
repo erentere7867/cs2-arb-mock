@@ -306,10 +306,13 @@ pub fn run_peg_bid_engine(
             for order in orders {
                 if let Err(reason) = risk.check(&order, now) {
                     tracing::debug!(order_id = %order.id, %reason, "peg bid blocked by risk limits");
+                    strategy.mark_filled(&order.id);
                     continue;
                 }
-                if simulator.place_bid(order, now).is_ok() {
+                if simulator.place_bid(order.clone(), now).is_ok() {
                     bids_placed += 1;
+                } else {
+                    strategy.mark_filled(&order.id);
                 }
             }
             // Cancel any resting simulator bids that the strategy discarded (e.g., ceiling exceeded).

@@ -68,6 +68,8 @@ The Rust profile allowlists Skinport (`app_id=252490`) and Waxpeer (`game=rust`)
 
 Spread candidates are ranked by expected net P&L after fees, hold cost and configured price drift; verification and depth checks are separate. The planned spread exit is not a guaranteed fill. With `[relist] cross_venue = true` (default in the Rust config), mock relisting considers other venues with sufficient observed sales and picks the highest net median-price proceeds. Without it, relisting stays on the venue of purchase. Peg bids still use a same-venue median to estimate their margin.
 
+Opt in to per-venue mock balances, sale holds, explicit transfers and finite-depth instant relisting in the config. See the [platform audit and example configuration](docs/platform-audit.md) for verified API contracts, UNVERIFIED assumptions, fee treatment and simulation limits.
+
 `backtest` writes to `reports/` for CS2 and `reports/rust/` for Rust by default. Use `--output-dir` to override either.
 
 `watch` and its SQLite event queue remain CS2-only. Rust live reads do not consume CS2 events; a Rust historical replay can supply its own `--events` file if needed. Explicit panic-window records do not carry an app ID, so supply records for the selected game.

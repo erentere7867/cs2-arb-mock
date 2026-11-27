@@ -135,6 +135,10 @@ pub struct MarketView<'a> {
 }
 
 impl<'a> MarketView<'a> {
+    pub fn available_cash(&self, strategy: &str, platform: Platform) -> Option<Money> {
+        self.fill_model.available_cash(strategy, platform)
+    }
+
     pub fn latest_quotes(&self) -> impl Iterator<Item = &'a PriceSnapshot> + '_ {
         self.latest.values()
     }
@@ -682,6 +686,18 @@ impl<F: FillModel> Backtester<F> {
             totals,
             strategies: per_strategy,
             trades: all_trades,
+            unverified_platform_assumptions: Vec::new(),
+            venue_balances: strategies
+                .iter()
+                .map(|strategy| {
+                    self.fill_model
+                        .venue_balances(strategy.name())
+                        .map(|b| (strategy.name().to_owned(), b))
+                })
+                .collect::<Result<std::collections::BTreeMap<_, _>>>()?
+                .into_iter()
+                .filter(|(_, b)| !b.is_empty())
+                .collect(),
         })
     }
 }

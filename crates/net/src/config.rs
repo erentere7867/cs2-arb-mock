@@ -186,7 +186,7 @@ mod tests {
         let history = limiter
             .resolve(Platform::Skinport, "/v1/sales/history")
             .unwrap();
-        assert!(!Arc::ptr_eq(&by_path, &history));
+        assert!(Arc::ptr_eq(&by_path, &history));
         assert_eq!(
             limiter
                 .resolve(Platform::DMarket, "/exchange/v1/market/items")

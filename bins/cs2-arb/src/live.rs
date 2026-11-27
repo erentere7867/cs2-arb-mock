@@ -59,6 +59,7 @@ fn make_clients(
     fees: &FeeSchedules,
     platforms: Vec<Platform>,
     game: Game,
+    instant_sale: bool,
 ) -> Result<MarketClients> {
     let net = NetConfig::from_toml(source)?;
     let gate: Arc<dyn RequestGate> = Arc::new(NetGate(Arc::new(build_limiter(&net, &platforms)?)));
@@ -74,6 +75,7 @@ fn make_clients(
                     schedule,
                     SkinportConfig {
                         game,
+                        tradable_only: true,
                         ..SkinportConfig::default()
                     },
                     gate.clone(),
@@ -81,10 +83,13 @@ fn make_clients(
                 )?,
                 net.retry,
             )),
-            Platform::Waxpeer => Box::new(ResilientMarket::new(
-                WaxpeerClient::new(schedule, game, gate.clone(), clock.clone())?,
-                net.retry,
-            )),
+            Platform::Waxpeer => {
+                let mut client = WaxpeerClient::new(schedule, game, gate.clone(), clock.clone())?;
+                if instant_sale {
+                    client = client.with_detailed_buy_orders(std::env::var("WAXPEER_API_KEY").ok());
+                }
+                Box::new(ResilientMarket::new(client, net.retry))
+            }
             Platform::CsFloat => {
                 let credentials = secrets
                     .csfloat_api_key
@@ -141,6 +146,7 @@ fn build_limiter(net: &NetConfig, platforms: &[Platform]) -> Result<RateLimiter>
     Ok(limiter)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn collect(
     config: &str,
     fees: &FeeSchedules,
@@ -149,6 +155,7 @@ pub async fn collect(
     interval_seconds: u64,
     branch_updates: Option<(&str, Option<i64>)>,
     game: Game,
+    instant_sale: bool,
 ) -> Result<Inputs> {
     let assets = bundled_snapshots(game)?;
     let mut seen = HashSet::new();
@@ -157,7 +164,7 @@ pub async fn collect(
         .map(|quote| quote.item)
         .filter(|item| seen.insert(item.clone()))
         .collect();
-    let clients = make_clients(config, fees, platforms, game)?;
+    let clients = make_clients(config, fees, platforms, game, instant_sale)?;
     let mut events = Vec::new();
     let queue = if let Some((database, hours)) = branch_updates {
         let queue = EventQueue::open(database).await?;
@@ -200,7 +207,8 @@ pub async fn collect(
                 if matches!(
                     platform,
                     Platform::CsFloat | Platform::Skinport | Platform::Waxpeer
-                ) {
+                ) || (instant_sale && *platform == Platform::DMarket)
+                {
                     match client.top_buy_orders(item).await {
                         Ok(orders) => buy_orders.extend(orders),
                         Err(error) => {
@@ -254,6 +262,7 @@ pub async fn collect(
         events,
         depth,
         buy_orders,
+        has_observed_bids: true,
     })
 }
 

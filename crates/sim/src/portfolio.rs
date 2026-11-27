@@ -4,6 +4,8 @@ use chrono::{DateTime, Utc};
 use cs2_arb_core::{FloatBucket, ItemId, Money, Order, OrderSide, Platform, Position};
 use serde::Serialize;
 
+use crate::venues::{VenueAccounts, VenueBalance};
+
 /// One order fill or a write-off of an already-paid bid fee.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct LedgerEntry {
@@ -57,6 +59,7 @@ pub struct Portfolio {
     positions: Vec<Position>,
     ledger: Vec<LedgerEntry>,
     starting_cash: Option<Money>,
+    venue_accounts: Option<VenueAccounts>,
     net_cash_flow: Money,
     realized_pnl: Money,
     buyer_fees_paid: Money,
@@ -71,6 +74,7 @@ impl Portfolio {
             positions: Vec::new(),
             ledger: Vec::new(),
             starting_cash,
+            venue_accounts: None,
             net_cash_flow: Money(0),
             realized_pnl: Money(0),
             buyer_fees_paid: Money(0),
@@ -125,6 +129,41 @@ impl Portfolio {
     pub fn cash(&self) -> Option<Money> {
         self.starting_cash
             .map(|start| Money(start.0.saturating_add(self.net_cash_flow.0)))
+    }
+
+    pub fn set_venue_accounts(&mut self, accounts: VenueAccounts) {
+        self.venue_accounts = Some(accounts);
+    }
+
+    pub fn advance_venue_accounts(&mut self, now: DateTime<Utc>) -> cs2_arb_core::Result<()> {
+        if let Some(accounts) = &mut self.venue_accounts {
+            accounts.advance(now)?;
+        }
+        Ok(())
+    }
+
+    pub fn venue_balances(&self) -> cs2_arb_core::Result<Vec<VenueBalance>> {
+        self.venue_accounts
+            .as_ref()
+            .map_or_else(|| Ok(Vec::new()), VenueAccounts::balances)
+    }
+
+    pub fn available_on(&self, platform: Platform) -> Option<Money> {
+        self.venue_accounts
+            .as_ref()
+            .map(|a| a.current(platform))
+            .or_else(|| self.cash())
+    }
+
+    pub(crate) fn trade_unlock(
+        &self,
+        platform: Platform,
+        at: DateTime<Utc>,
+    ) -> cs2_arb_core::Result<DateTime<Utc>> {
+        self.venue_accounts.as_ref().map_or_else(
+            || Ok(at + crate::config::valve_trade_hold()),
+            |accounts| accounts.trade_unlock(platform, at),
+        )
     }
 
     pub fn open_cost_basis(&self) -> Money {
@@ -227,6 +266,9 @@ impl Portfolio {
         let net_cash_flow = self.net_cash_flow.checked_add(entry.cash_delta)?;
         let buyer_fees_paid = self.buyer_fees_paid.checked_add(entry.fee)?;
         let gross_bought = self.gross_bought.checked_add(entry.gross)?;
+        if let Some(accounts) = &mut self.venue_accounts {
+            accounts.debit(entry.platform, Money(0).checked_sub(entry.cash_delta)?)?;
+        }
         self.net_cash_flow = net_cash_flow;
         self.buyer_fees_paid = buyer_fees_paid;
         self.gross_bought = gross_bought;
@@ -247,6 +289,9 @@ impl Portfolio {
         let seller_fees_paid = self.seller_fees_paid.checked_add(entry.fee)?;
         let gross_sold = self.gross_sold.checked_add(entry.gross)?;
         let realized_pnl = self.realized_pnl.checked_add(pnl)?;
+        if let Some(accounts) = &mut self.venue_accounts {
+            accounts.credit_sale(entry.platform, entry.cash_delta, entry.filled_at)?;
+        }
         self.net_cash_flow = net_cash_flow;
         self.seller_fees_paid = seller_fees_paid;
         self.gross_sold = gross_sold;

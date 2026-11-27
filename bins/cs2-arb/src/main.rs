@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use chrono::TimeDelta;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use cs2_arb_backtest::integrated::{DipAdapter, MarketDepth, SimFillModel, SpreadAdapter};
 use cs2_arb_backtest::{fixtures, BacktestConfig, Backtester, PerformanceReport, StrategyAdapter};
@@ -8,6 +9,8 @@ use cs2_arb_core::{
     BuyOrder, Error, FeeSchedules, Game, ItemId, MarketEvent, Platform, PriceSnapshot, Result,
     SimulationMode,
 };
+use cs2_arb_sim::venues::{VenueAccounts, VenueAccountsConfig};
+use cs2_arb_sim::{FillLatency, LiquidityConfig, SimConfig};
 use cs2_arb_strategy::{
     DipConfig, KillSwitch, PegBidConfig, RelistConfig, RiskLimits, SpreadConfig,
 };
@@ -15,6 +18,7 @@ use serde::Deserialize;
 
 mod live;
 mod peg_runner;
+mod platform_audit;
 mod watch;
 
 const DEFAULT_DB: &str = "data/events.db";
@@ -106,11 +110,56 @@ impl From<Market> for Platform {
 struct Settings {
     game: Game,
     markets: Option<Vec<Platform>>,
+    venue_accounts: Option<VenueAccountsConfig>,
+    platform_audit: bool,
+    simulation: SimulationSettings,
     spread: SpreadConfig,
     dip: DipConfig,
     risk: RiskLimits,
     peg_bid: PegBidConfig,
     relist: RelistConfig,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct SimulationSettings {
+    maximum_listing_age_seconds: Option<u32>,
+    fill_latency_min_milliseconds: u32,
+    fill_latency_max_milliseconds: u32,
+    minimum_verified_sales: Option<u32>,
+    liquidity_window_days: Option<u32>,
+    maximum_adv_fraction_bps: Option<u32>,
+}
+
+impl SimulationSettings {
+    fn build(&self) -> Result<SimConfig> {
+        let defaults = SimConfig::default();
+        let liquidity = defaults.liquidity;
+        let config = SimConfig {
+            max_listing_age: self
+                .maximum_listing_age_seconds
+                .map_or(defaults.max_listing_age, |secs| {
+                    TimeDelta::seconds(i64::from(secs))
+                }),
+            liquidity: LiquidityConfig {
+                min_verified_sales: self
+                    .minimum_verified_sales
+                    .unwrap_or(liquidity.min_verified_sales),
+                window_days: self.liquidity_window_days.unwrap_or(liquidity.window_days),
+                max_adv_fraction_bps: self
+                    .maximum_adv_fraction_bps
+                    .unwrap_or(liquidity.max_adv_fraction_bps),
+                ..liquidity
+            },
+            fill_latency: FillLatency {
+                min: TimeDelta::milliseconds(i64::from(self.fill_latency_min_milliseconds)),
+                max: TimeDelta::milliseconds(i64::from(self.fill_latency_max_milliseconds)),
+            },
+            ..defaults
+        };
+        config.validate()?;
+        Ok(config)
+    }
 }
 
 impl Settings {
@@ -165,11 +214,33 @@ async fn run(cli: Cli) -> Result<()> {
         }
         return watch::run(&config, &database, once).await;
     }
-    let fees = FeeSchedules::from_toml(&config)?;
+    let mut fees = FeeSchedules::from_toml(&config)?;
     let settings: Settings =
         toml::from_str(&config).map_err(|err| Error::InvalidConfig(err.message().to_owned()))?;
     let game = settings.game;
     let markets = settings.market_allowlist()?;
+    let audit_enabled = settings.platform_audit
+        || settings.venue_accounts.is_some()
+        || settings.relist.instant_sale;
+    let mut audited_markets = markets.to_vec();
+    let accounts = if let Some(rules) = &settings.venue_accounts {
+        rules.validate(markets)?;
+        let accounts = VenueAccounts::new(rules.clone(), fees.clone());
+        for schedule in [
+            &mut fees.skinport,
+            &mut fees.csfloat,
+            &mut fees.dmarket,
+            &mut fees.waxpeer,
+        ] {
+            schedule.funding.crypto_deposit = Default::default();
+            schedule.funding.crypto_withdrawal = Default::default();
+            schedule.funding.bank_cashout = Default::default();
+        }
+        Some(accounts)
+    } else {
+        None
+    };
+    let mut live_data = false;
     let (inputs, output) = match cli.command {
         Command::RunMock {
             history,
@@ -180,15 +251,19 @@ async fn run(cli: Cli) -> Result<()> {
             database,
         } => {
             let inputs = if live_market_data {
+                live_data = true;
+                audited_markets =
+                    live::select_platforms(game, platform, markets, settings.markets.is_some())?;
                 live::collect(
                     &config,
                     &fees,
-                    live::select_platforms(game, platform, markets, settings.markets.is_some())?,
+                    audited_markets.clone(),
                     samples,
                     interval_seconds,
                     (game == Game::Cs2)
                         .then_some((database.as_str(), settings.dip.branch_update_window_hours)),
                     game,
+                    settings.relist.instant_sale,
                 )
                 .await?
             } else {
@@ -207,9 +282,19 @@ async fn run(cli: Cli) -> Result<()> {
     };
     let kill_switch = KillSwitch::with_defaults();
     let peg_config = settings.peg_bid.clone();
-    let relist_config = settings.relist.clone();
+    let mut relist_config = settings.relist.clone();
+    relist_config.instant_sale &= inputs.has_observed_bids;
     let risk_limits = settings.risk.clone();
-    let report = simulate(&inputs, fees.clone(), settings, kill_switch.clone())?;
+    let mut report = simulate_with_accounts(
+        &inputs,
+        fees.clone(),
+        settings,
+        kill_switch.clone(),
+        accounts.clone(),
+    )?;
+    if audit_enabled || live_data {
+        report.unverified_platform_assumptions = platform_audit::unverified(&audited_markets);
+    }
     let peg_dashboard = peg_runner::run_peg_bid_engine(
         &inputs.snapshots,
         inputs.depth.sales(),
@@ -220,6 +305,7 @@ async fn run(cli: Cli) -> Result<()> {
         risk_limits,
         &kill_switch,
         None,
+        accounts,
     )?;
     peg_dashboard.log_summary();
     if let Some(directory) = output {
@@ -235,6 +321,7 @@ struct Inputs {
     events: Vec<MarketEvent>,
     depth: MarketDepth,
     buy_orders: Vec<BuyOrder>,
+    has_observed_bids: bool,
 }
 
 fn bundled_snapshots(game: Game) -> Result<Vec<PriceSnapshot>> {
@@ -310,6 +397,7 @@ fn historical(game: Game, markets: &[Platform], args: HistoricalArgs) -> Result<
     } else if bundled {
         depth.add_bundled_mock_sales(&snapshots);
     }
+    let has_observed_bids = args.buy_orders.is_some();
     let mut buy_orders: Vec<BuyOrder> = if let Some(path) = args.buy_orders {
         serde_json::from_str(&read(&path)?)
             .map_err(|err| Error::InvalidData(format!("invalid buy orders JSON: {err}")))?
@@ -332,20 +420,36 @@ fn historical(game: Game, markets: &[Platform], args: HistoricalArgs) -> Result<
         events,
         depth,
         buy_orders,
+        has_observed_bids,
     })
 }
 
+#[cfg(test)]
 fn simulate(
     inputs: &Inputs,
     fees: FeeSchedules,
     settings: Settings,
     kill_switch: KillSwitch,
 ) -> Result<PerformanceReport> {
+    simulate_with_accounts(inputs, fees, settings, kill_switch, None)
+}
+
+fn simulate_with_accounts(
+    inputs: &Inputs,
+    fees: FeeSchedules,
+    settings: Settings,
+    kill_switch: KillSwitch,
+    accounts: Option<VenueAccounts>,
+) -> Result<PerformanceReport> {
     let mut strategies: Vec<Box<dyn StrategyAdapter>> = vec![
         Box::new(SpreadAdapter::new(settings.spread)),
         Box::new(DipAdapter::new(settings.dip, &inputs.depth)?),
     ];
-    let model = SimFillModel::new(&inputs.depth, fees.clone(), settings.risk, kill_switch);
+    let mut model = SimFillModel::new(&inputs.depth, fees.clone(), settings.risk, kill_switch)
+        .with_sim_config(settings.simulation.build()?);
+    if let Some(accounts) = accounts {
+        model = model.with_venue_accounts(accounts);
+    }
     Backtester::with_fill_model(BacktestConfig::new(fees), model).run(
         SimulationMode,
         &inputs.snapshots,
@@ -461,6 +565,7 @@ mod tests {
         let mut inputs = Inputs {
             depth: MarketDepth::from_snapshots(&snapshots),
             buy_orders: peg_runner::derive_offline_buy_orders(&snapshots),
+            has_observed_bids: false,
             snapshots,
             events,
         };

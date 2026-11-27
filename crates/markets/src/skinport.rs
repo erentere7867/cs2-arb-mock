@@ -1,24 +1,19 @@
 //! Skinport read-only client: `GET /v1/items` and `GET /v1/sales/history`.
 //!
-//! Endpoint verification (docs.skinport.com returned HTTP 403 to automated fetches; details
-//! below were cross-checked against the public wrappers PaxxPatriot/skinport.py,
-//! realBoltDev/skinport.js and WeirdPtr/skinport-rs):
-//! - Base URL `https://api.skinport.com/v1` — confirmed by all three wrappers.
-//! - `Accept-Encoding: br` is required — confirmed (skinport.py and skinport.js both send it;
-//!   the docs state Brotli is mandatory). reqwest's `brotli` feature decodes the response.
-//! - Both endpoints are unauthenticated, rate limited to 8 requests / 5 minutes and cached
-//!   server-side for 5 minutes — confirmed by skinport.js doc comments.
+//! See https://docs.skinport.com/items, https://docs.skinport.com/sales/history and
+//! https://docs.skinport.com/introduction/rate-limits.
+//! - Both endpoints require Brotli, are unauthenticated and share an 8 requests / 5 minutes
+//!   quota; responses are cached server-side for 5 minutes.
 //! - Query params `app_id` (730 for CS2 or 252490 for Rust), `currency` (we always send `USD` because `Money` is USD
 //!   cents), `tradable` (items) and `market_hash_name` (sales history, comma-delimited,
-//!   optional) — confirmed by skinport.js.
+//!   optional).
 //! - `/v1/items` returns aggregate rows: `market_hash_name, currency, suggested_price,
 //!   item_page, market_page, min_price, max_price, mean_price, median_price, quantity,
 //!   created_at, updated_at`; prices are JSON numbers in currency units and may be `null`.
 //! - `/v1/sales/history` returns aggregate rows with `last_24_hours`, `last_7_days`,
 //!   `last_30_days`, `last_90_days` each `{min,max,avg,median,volume}`; prices nullable.
-//! - UNVERIFIED: whether the two endpoints share one quota or have separate quotas (we
-//!   enforce 8 / 5 min on each independently, as specified). UNVERIFIED: whether
-//!   `/v1/items` exposes `version` (Doppler phase) rows like sales history does.
+//! - Both endpoints can return `version` rows such as Doppler phases. The public item
+//!   identity in this adapter is tier-level, not phase-specific.
 //!
 //! Skinport exposes no per-listing or per-sale records on these endpoints, so listings are
 //! one aggregate row per item (price = `min_price`) and sales are an aggregate record per
@@ -187,6 +182,7 @@ pub type SalesByName = Arc<HashMap<String, SkinportSalesHistory>>;
 #[derive(Deserialize)]
 struct RawItem {
     market_hash_name: String,
+    version: Option<String>,
     #[serde(default)]
     currency: Option<String>,
     #[serde(default)]
@@ -265,8 +261,10 @@ fn convert_stats(raw: Option<RawStats>) -> Result<Option<SkinportSalesStats>> {
 pub fn parse_items(body: &[u8]) -> Result<ItemsByName> {
     let rows: Vec<RawItem> = parse_json("skinport items", body)?;
     let mut map = HashMap::with_capacity(rows.len());
+    let mut aggregate = std::collections::HashSet::new();
     for row in rows {
         check_currency(&row.currency)?;
+        let is_aggregate = row.version.is_none_or(|v| v.is_empty());
         let item = SkinportItem {
             suggested_price: opt_cents(row.suggested_price)?,
             min_price: opt_cents(row.min_price)?,
@@ -277,7 +275,19 @@ pub fn parse_items(body: &[u8]) -> Result<ItemsByName> {
             updated_at: row.updated_at.and_then(|t| DateTime::from_timestamp(t, 0)),
             market_hash_name: row.market_hash_name,
         };
-        map.insert(item.market_hash_name.clone(), item);
+        if is_aggregate {
+            aggregate.insert(item.market_hash_name.clone());
+            map.insert(item.market_hash_name.clone(), item);
+        } else if !aggregate.contains(&item.market_hash_name) {
+            let previous = map
+                .entry(item.market_hash_name.clone())
+                .or_insert_with(|| item.clone());
+            if item.min_price.is_some()
+                && (previous.min_price.is_none() || item.min_price < previous.min_price)
+            {
+                *previous = item;
+            }
+        }
     }
     Ok(Arc::new(map))
 }
@@ -311,19 +321,17 @@ pub fn parse_sales_history(body: &[u8]) -> Result<SalesByName> {
 
 struct EndpointState<T> {
     endpoint: Endpoint,
-    limiter: SlidingWindowLimiter,
     cache: TtlCache<T>,
     fetch_lock: tokio::sync::Mutex<()>,
 }
 
 impl<T: Clone> EndpointState<T> {
-    fn new(endpoint: Endpoint, limit: WindowLimit, config: &SkinportConfig) -> Result<Self> {
-        Ok(Self {
+    fn new(endpoint: Endpoint, config: &SkinportConfig) -> Self {
+        Self {
             endpoint,
-            limiter: SlidingWindowLimiter::new(limit)?,
             cache: TtlCache::new(endpoint.name, config.cache_ttl, config.cache_dir.clone()),
             fetch_lock: tokio::sync::Mutex::new(()),
-        })
+        }
     }
 }
 
@@ -332,6 +340,7 @@ pub struct SkinportClient {
     fees: FeeSchedule,
     config: SkinportConfig,
     http: HttpCore,
+    limiter: SlidingWindowLimiter,
     items: EndpointState<ItemsByName>,
     sales: EndpointState<SalesByName>,
 }
@@ -365,8 +374,18 @@ impl SkinportClient {
         let http = HttpCore::new(&config.base_url, config.request_timeout, gate, clock)?;
         Ok(Self {
             fees,
-            items: EndpointState::new(ITEMS_ENDPOINT, config.items_limit, &config)?,
-            sales: EndpointState::new(SALES_HISTORY_ENDPOINT, config.sales_history_limit, &config)?,
+            limiter: SlidingWindowLimiter::new(WindowLimit {
+                max_requests: config
+                    .items_limit
+                    .max_requests
+                    .min(config.sales_history_limit.max_requests),
+                window: config
+                    .items_limit
+                    .window
+                    .max(config.sales_history_limit.window),
+            })?,
+            items: EndpointState::new(ITEMS_ENDPOINT, &config),
+            sales: EndpointState::new(SALES_HISTORY_ENDPOINT, &config),
             http,
             config,
         })
@@ -423,7 +442,7 @@ impl SkinportClient {
             }
         }
 
-        if let Err(err) = state.limiter.acquire(self.config.on_limit).await {
+        if let Err(err) = self.limiter.acquire(self.config.on_limit).await {
             return self.stale_or(state, key, err);
         }
         let mut headers = HeaderMap::new();
@@ -432,7 +451,7 @@ impl SkinportClient {
         let body = match self.http.get(&state.endpoint, key, headers).await {
             Ok(body) => body,
             Err(err @ Error::RateLimited { retry_after }) => {
-                state.limiter.penalize(retry_after);
+                self.limiter.penalize(retry_after);
                 return self.stale_or(state, key, err);
             }
             Err(err) => return Err(err),
@@ -499,7 +518,7 @@ impl MarketClient for SkinportClient {
             platform: Platform::Skinport,
             item: item.clone(),
             price,
-            quantity: row.quantity,
+            quantity: 1,
             float_value: None,
             observed_at: items.fetched_at,
             trade_locked_until: None,

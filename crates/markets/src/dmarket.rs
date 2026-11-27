@@ -32,8 +32,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use cs2_arb_core::{
-    Error, FeeSchedule, Game, ItemId, Listing, MarketClient, Platform, PriceSnapshot, Result, Sale,
-    WearTier,
+    BuyOrder, Error, FeeSchedule, Game, ItemId, Listing, MarketClient, Platform, PriceSnapshot,
+    Result, Sale, WearTier,
 };
 use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue, ACCEPT};
@@ -41,8 +41,8 @@ use serde::Deserialize;
 
 use crate::clock::{Clock, SystemClock};
 use crate::convert::{
-    cents_from_i64, cents_from_int_str, float_matches_tier, query_string, usd_decimal_str_to_cents,
-    usd_f64_to_cents, validate_item_for_game,
+    cents_from_i64, cents_from_int_str, float_matches_tier, percent_encode, query_string,
+    usd_decimal_str_to_cents, usd_f64_to_cents, validate_item_for_game,
 };
 use crate::gate::{Endpoint, NoopGate, RequestGate};
 use crate::http::{header_value, parse_json, HttpCore};
@@ -65,6 +65,57 @@ pub const LAST_SALES_ENDPOINT: Endpoint = Endpoint {
     name: "dmarket.last_sales",
     path: "/trade-aggregator/v1/last-sales",
 };
+
+const TARGETS_ENDPOINT: Endpoint = Endpoint {
+    platform: Platform::DMarket,
+    name: "dmarket.targets_by_title",
+    path: "/marketplace-api/v1/targets-by-title",
+};
+
+#[derive(Deserialize)]
+struct RawTarget {
+    title: String,
+    amount: String,
+    price: String,
+    #[serde(default)]
+    attributes: std::collections::HashMap<String, serde_json::Value>,
+}
+
+fn parse_targets(body: &[u8], item: &ItemId, observed_at: DateTime<Utc>) -> Result<Vec<BuyOrder>> {
+    #[derive(Deserialize)]
+    struct Response {
+        orders: Vec<RawTarget>,
+    }
+
+    let response: Response = parse_json("DMarket targets", body)?;
+    let mut bids = Vec::new();
+    for target in response.orders {
+        if target.title != item.market_hash_name
+            || target
+                .attributes
+                .values()
+                .any(|value| value.as_str() != Some("any"))
+        {
+            continue;
+        }
+        let price = cents_from_int_str(&target.price)?;
+        let quantity = target
+            .amount
+            .parse::<u32>()
+            .map_err(|_| Error::InvalidData("invalid DMarket target amount".into()))?;
+        if price.0 > 0 && quantity > 0 {
+            bids.push(BuyOrder {
+                platform: Platform::DMarket,
+                item: item.clone(),
+                float_bucket: None,
+                price,
+                quantity,
+                observed_at,
+            });
+        }
+    }
+    Ok(bids)
+}
 
 // ---- signing ---------------------------------------------------------------------------
 
@@ -626,12 +677,51 @@ impl MarketClient for DMarketClient {
     async fn fees(&self) -> Result<FeeSchedule> {
         Ok(self.fees)
     }
+
+    async fn top_buy_orders(&self, item: &ItemId) -> Result<Vec<BuyOrder>> {
+        validate_item_for_game(item, self.config.game())?;
+        let base = format!("{}/{}", TARGETS_ENDPOINT.path, self.config.game_id);
+        let encoded = format!("{base}/{}", percent_encode(&item.market_hash_name));
+        let decoded = format!("{base}/{}", item.market_hash_name);
+        let body = self
+            .http
+            .get_with_headers(&TARGETS_ENDPOINT, &encoded, |now| {
+                let mut headers =
+                    self.credentials
+                        .auth_headers("GET", &decoded, "", "", now.timestamp())?;
+                headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
+                Ok(headers)
+            })
+            .await?;
+        parse_targets(&body, item, self.http.clock().now())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use ed25519_dalek::{Signature, Verifier};
+
+    #[test]
+    fn targets_accept_only_unrestricted_depth_at_documented_usd_cent_price() {
+        let item = ItemId {
+            market_hash_name: "Alien Red".into(),
+            wear_tier: WearTier::NotApplicable,
+        };
+        let bids = parse_targets(
+            br#"{"orders":[
+            {"title":"Alien Red","amount":"3","price":"1550","attributes":{"paintSeed":"any"}},
+            {"title":"Alien Red","amount":"5","price":"2000","attributes":{"paintSeed":"661"}},
+            {"title":"Wrong","amount":"9","price":"3000"}
+        ]}"#,
+            &item,
+            DateTime::<Utc>::UNIX_EPOCH,
+        )
+        .unwrap();
+        assert_eq!(bids.len(), 1);
+        assert_eq!(bids[0].price.0, 1550);
+        assert_eq!(bids[0].quantity, 3);
+    }
 
     // Public RFC 8032 test vector 1 seed.
     const SEED: [u8; 32] = [

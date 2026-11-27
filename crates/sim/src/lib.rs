@@ -29,6 +29,7 @@ pub mod liquidity;
 pub mod portfolio;
 pub mod rejection;
 pub mod rng;
+pub mod venues;
 pub mod wear;
 
 pub use book::MarketBook;

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -27,6 +27,70 @@ pub const BUY_ORDERS: Endpoint = Endpoint {
     name: "waxpeer.buy_orders",
     path: "/v1/buy-orders/snapshot",
 };
+
+const DETAILED_BUY_ORDERS: Endpoint = Endpoint {
+    platform: Platform::Waxpeer,
+    name: "waxpeer.detailed_buy_orders",
+    path: "/v2/buy-orders",
+};
+
+fn parse_detailed_bids(
+    body: &[u8],
+    item: &ItemId,
+    game: &str,
+    at: DateTime<Utc>,
+) -> Result<Vec<BuyOrder>> {
+    #[derive(Deserialize)]
+    struct Response {
+        success: bool,
+        #[serde(default)]
+        orders: Vec<Row>,
+    }
+    #[derive(Deserialize)]
+    struct Row {
+        name: String,
+        game: String,
+        price: Minor,
+        amount: u32,
+        filled: u32,
+        filters: serde_json::Value,
+        by: String,
+    }
+    let response: Response = parse_json("Waxpeer detailed buy orders", body)?;
+    if !response.success {
+        return Err(Error::InvalidData(
+            "Waxpeer detailed buy orders unavailable".into(),
+        ));
+    }
+    let mut owners = HashSet::new();
+    let mut depth = BTreeMap::<Money, u32>::new();
+    for bid in response.orders {
+        if bid.name != item.market_hash_name
+            || bid.game != game
+            || !bid.filters.is_null()
+            || bid.amount <= bid.filled
+            || bid.by.is_empty()
+        {
+            continue;
+        }
+        let price = bid.price.cents(false)?;
+        if price.0 > 0 && owners.insert(bid.by) {
+            *depth.entry(price).or_default() += 1;
+        }
+    }
+    Ok(depth
+        .into_iter()
+        .rev()
+        .map(|(price, quantity)| BuyOrder {
+            platform: Platform::Waxpeer,
+            item: item.clone(),
+            float_bucket: None,
+            price,
+            quantity,
+            observed_at: at,
+        })
+        .collect())
+}
 
 type Listings = Arc<HashMap<String, Vec<Ask>>>;
 type BidsByName = Arc<HashMap<String, Money>>;
@@ -120,6 +184,7 @@ pub struct WaxpeerClient {
     listings: TtlCache<Listings>,
     bids: TtlCache<BidsByName>,
     fetch_lock: tokio::sync::Mutex<()>,
+    detailed_buy_orders: Option<Option<String>>,
 }
 
 impl WaxpeerClient {
@@ -147,7 +212,20 @@ impl WaxpeerClient {
             listings: TtlCache::new("waxpeer-asks", Duration::from_secs(10), None),
             bids: TtlCache::new("waxpeer-bids", Duration::from_secs(10), None),
             fetch_lock: tokio::sync::Mutex::new(()),
+            detailed_buy_orders: None,
         })
+    }
+
+    pub fn with_detailed_buy_orders(mut self, api_key: Option<String>) -> Self {
+        self.detailed_buy_orders = Some(api_key.filter(|key| !key.trim().is_empty()));
+        self
+    }
+
+    fn game_code(&self) -> &'static str {
+        match self.game {
+            Game::Cs2 => "csgo",
+            Game::Rust => "rust",
+        }
     }
 
     async fn fetch<T: Clone>(
@@ -156,10 +234,7 @@ impl WaxpeerClient {
         cache: &TtlCache<T>,
         parse: impl FnOnce(&[u8]) -> Result<(T, Option<i64>)>,
     ) -> Result<Cached<T>> {
-        let game = match self.game {
-            Game::Cs2 => "csgo",
-            Game::Rust => "rust",
-        };
+        let game = self.game_code();
         let key = format!("{}?{}", endpoint.path, query_string(&[("game", game)]));
         if let Some(hit) = cache.get_fresh(&key) {
             return Ok(hit);
@@ -232,6 +307,23 @@ impl MarketClient for WaxpeerClient {
 
     async fn top_buy_orders(&self, item: &ItemId) -> Result<Vec<BuyOrder>> {
         validate_item_for_game(item, self.game)?;
+        if let Some(api_key) = &self.detailed_buy_orders {
+            let Some(api_key) = api_key else {
+                return Ok(Vec::new());
+            };
+            let game = self.game_code();
+            let query = query_string(&[
+                ("api", api_key.as_str()),
+                ("name", item.market_hash_name.as_str()),
+                ("game", game),
+            ]);
+            let path = format!("{}?{query}", DETAILED_BUY_ORDERS.path);
+            let body = self
+                .http
+                .get(&DETAILED_BUY_ORDERS, &path, HeaderMap::new())
+                .await?;
+            return parse_detailed_bids(&body, item, game, self.http.clock().now());
+        }
         let bids = self.fetch(&BUY_ORDERS, &self.bids, parse_bids).await?;
         Ok(bids
             .value
@@ -250,5 +342,28 @@ impl MarketClient for WaxpeerClient {
 
     async fn fees(&self) -> Result<FeeSchedule> {
         Ok(self.fees)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detailed_depth_counts_one_funded_unit_per_distinct_unrestricted_owner() {
+        let item = ItemId {
+            market_hash_name: "Alien Red".into(),
+            wear_tier: cs2_arb_core::WearTier::NotApplicable,
+        };
+        let body = br#"{"success":true,"orders":[
+          {"name":"Alien Red","game":"rust","price":13500,"amount":5,"filled":0,"filters":{"paint_seeds":[1]},"by":"filtered"},
+          {"name":"Alien Red","game":"rust","price":12349,"amount":5,"filled":1,"filters":null,"by":"one"},
+          {"name":"Alien Red","game":"rust","price":12349,"amount":2,"filled":1,"filters":null,"by":"two"},
+          {"name":"Alien Red","game":"rust","price":12000,"amount":4,"filled":1,"filters":null,"by":"one"}
+        ]}"#;
+        let bids = parse_detailed_bids(body, &item, "rust", DateTime::<Utc>::UNIX_EPOCH).unwrap();
+        assert_eq!(bids.len(), 1);
+        assert_eq!(bids[0].quantity, 2);
+        assert_eq!(bids[0].price, Money(1234));
     }
 }

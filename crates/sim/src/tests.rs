@@ -217,6 +217,36 @@ fn replay_charges_all_fixed_fees_once_per_order() {
     assert_accounting_identity(h.exec.portfolio());
 }
 
+#[test]
+fn buy_does_not_spend_cash_from_another_venue() {
+    use crate::venues::{VenueAccounts, VenueAccountsConfig, VenueConfig};
+
+    let mut h = harness().liquid_csfloat(70).with_listing(listing(
+        "balance",
+        Platform::CsFloat,
+        1000,
+        1,
+        Some(LOW_FLOAT),
+    ));
+    let rules = VenueAccountsConfig {
+        venues: [
+            (Platform::CsFloat, VenueConfig::with_cash(1000)),
+            (Platform::Skinport, VenueConfig::with_cash(5000)),
+        ]
+        .into(),
+        ..VenueAccountsConfig::default()
+    };
+    h.exec
+        .set_venue_accounts(VenueAccounts::new(rules, test_fees()));
+    assert_eq!(
+        h.reject(buy("balance", 1, 1000)),
+        Rejection::InsufficientFunds {
+            required: Money(1027),
+            available: Money(1000),
+        }
+    );
+}
+
 /// Worked example (buy): CSFloat listing at $10.00, buyer fee 2.5% + 2c.
 /// fee = round(1000 * 0.025) + 2 = 25 + 2 = 27c; cash out 1027c; basis 1027c.
 #[test]

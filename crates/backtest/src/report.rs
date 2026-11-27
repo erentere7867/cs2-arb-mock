@@ -107,6 +107,10 @@ pub struct PerformanceReport {
     pub strategies: Vec<StrategyStats>,
     /// Closed trades in close order.
     pub trades: Vec<TradeRecord>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub venue_balances: std::collections::BTreeMap<String, Vec<cs2_arb_sim::venues::VenueBalance>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unverified_platform_assumptions: Vec<String>,
 }
 
 impl PerformanceReport {
@@ -126,6 +130,13 @@ impl PerformanceReport {
         let mut out = String::new();
         let _ = writeln!(out, "# Backtest performance report\n");
         let _ = writeln!(out, "> {}\n", self.disclaimer);
+        if !self.unverified_platform_assumptions.is_empty() {
+            let _ = writeln!(out, "## UNVERIFIED platform assumptions\n");
+            for item in &self.unverified_platform_assumptions {
+                let _ = writeln!(out, "- {item}");
+            }
+            let _ = writeln!(out);
+        }
         let w = &self.window;
         let _ = writeln!(
             out,
@@ -243,7 +254,40 @@ impl PerformanceReport {
                 .iter()
                 .filter_map(|t| t.fee_breakdown.map(|f| (t.position_id.as_str(), f))),
         );
+        write_venue_balances(
+            &mut out,
+            self.venue_balances
+                .iter()
+                .map(|(name, rows)| (name.as_str(), rows.as_slice())),
+        );
         out
+    }
+}
+
+pub fn write_venue_balances<'a>(
+    out: &mut String,
+    accounts: impl Iterator<Item = (&'a str, &'a [cs2_arb_sim::venues::VenueBalance])>,
+) {
+    let mut accounts = accounts.filter(|(_, rows)| !rows.is_empty()).peekable();
+    if accounts.peek().is_none() {
+        return;
+    }
+    let _ = writeln!(out, "\n### Mock venue balances\n");
+    let _ = writeln!(
+        out,
+        "| Simulation | Venue | Available | Pending |\n| --- | --- | ---: | ---: |"
+    );
+    for (name, rows) in accounts {
+        for row in rows {
+            let _ = writeln!(
+                out,
+                "| {} | {} | {} | {} |",
+                name,
+                platform_name(row.platform),
+                fmt_money(row.available),
+                fmt_money(row.pending)
+            );
+        }
     }
 }
 

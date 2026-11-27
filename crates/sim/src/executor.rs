@@ -12,7 +12,7 @@ use serde::Serialize;
 
 use crate::book::MarketBook;
 use crate::clock::Clock;
-use crate::config::{valve_trade_hold, SimConfig};
+use crate::config::SimConfig;
 use crate::fees::{FeeBreakdown, PlatformFees};
 use crate::liquidity::{self, LiquidityStats};
 use crate::portfolio::{proportional_cost, LedgerEntry, Portfolio};
@@ -58,6 +58,14 @@ pub struct MockExecutor {
 }
 
 impl MockExecutor {
+    pub fn set_venue_accounts(&mut self, accounts: crate::venues::VenueAccounts) {
+        self.portfolio.set_venue_accounts(accounts);
+    }
+
+    pub fn advance_venue_accounts(&mut self, at: DateTime<Utc>) -> Result<()> {
+        self.portfolio.advance_venue_accounts(at)
+    }
+
     /// Build an executor from core fee schedules (as loaded from config).
     pub fn new(
         mode: SimulationMode,
@@ -418,7 +426,7 @@ impl MockExecutor {
             listings: mut level,
         } = self.buy_level(order, target, now)?;
         let fees = self.execution_fees(order, best_ask, quantity)?;
-        if let Some(cash) = self.portfolio.cash() {
+        if let Some(cash) = self.portfolio.available_on(order.platform) {
             if fees.net > cash {
                 return Err(Rejection::InsufficientFunds {
                     required: fees.net,
@@ -450,7 +458,7 @@ impl MockExecutor {
             quantity,
             cost_basis: fees.net,
             acquired_at: filled_at,
-            locked_until: filled_at + valve_trade_hold(),
+            locked_until: self.portfolio.trade_unlock(order.platform, filled_at)?,
         };
         let entry = LedgerEntry {
             seq: self.portfolio.next_seq(),

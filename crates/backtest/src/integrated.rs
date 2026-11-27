@@ -14,7 +14,7 @@ use cs2_arb_strategy::{
     SubmitError,
 };
 
-use crate::{FillModel, FillOutcome, MarketView, QuoteKey, StrategyAdapter, DEFAULT_TRADE_HOLD};
+use crate::{FillModel, FillOutcome, MarketView, QuoteKey, StrategyAdapter};
 
 type PositionKey = (ItemId, Option<FloatBucket>);
 type BookKey = (Platform, ItemId);
@@ -133,6 +133,8 @@ pub struct SimFillModel<'a> {
     risk_limits: RiskLimits,
     kill_switch: KillSwitch,
     sessions: RefCell<HashMap<String, Session>>,
+    venue_accounts: Option<cs2_arb_sim::venues::VenueAccounts>,
+    sim_config: SimConfig,
 }
 
 impl<'a> SimFillModel<'a> {
@@ -148,7 +150,19 @@ impl<'a> SimFillModel<'a> {
             risk_limits,
             kill_switch,
             sessions: RefCell::default(),
+            venue_accounts: None,
+            sim_config: SimConfig::default(),
         }
+    }
+
+    pub fn with_venue_accounts(mut self, accounts: cs2_arb_sim::venues::VenueAccounts) -> Self {
+        self.venue_accounts = Some(accounts);
+        self
+    }
+
+    pub fn with_sim_config(mut self, config: SimConfig) -> Self {
+        self.sim_config = config;
+        self
     }
 }
 
@@ -160,6 +174,24 @@ impl FillModel for SimFillModel<'_> {
             .executor
             .preview_fill(order)
             .ok()
+    }
+
+    fn venue_balances(&self, strategy: &str) -> Result<Vec<cs2_arb_sim::venues::VenueBalance>> {
+        self.sessions.borrow().get(strategy).map_or_else(
+            || {
+                self.venue_accounts
+                    .as_ref()
+                    .map_or_else(|| Ok(Vec::new()), |a| a.balances())
+            },
+            |session| session.executor.portfolio().venue_balances(),
+        )
+    }
+
+    fn available_cash(&self, strategy: &str, platform: Platform) -> Option<Money> {
+        self.sessions
+            .borrow()
+            .get(strategy)
+            .and_then(|session| session.executor.portfolio().available_on(platform))
     }
 
     fn add_quote_update_times(&self, times: &mut BTreeSet<DateTime<Utc>>) {
@@ -182,12 +214,15 @@ impl FillModel for SimFillModel<'_> {
             let clock = Arc::new(ManualClock::new(view.now));
             let mut executor = MockExecutor::new(
                 SimulationMode,
-                SimConfig::default(),
+                self.sim_config.clone(),
                 &self.fees,
                 clock.clone(),
                 730,
             )?
             .with_order_fees(self.fees.clone());
+            if let Some(accounts) = &self.venue_accounts {
+                executor.set_venue_accounts(accounts.clone());
+            }
             executor
                 .book_mut()
                 .record_sales(self.depth.sales.iter().cloned());
@@ -202,6 +237,7 @@ impl FillModel for SimFillModel<'_> {
         }
         let session = sessions.get_mut(strategy).expect("session initialized");
         session.clock.set(view.now);
+        session.executor.advance_venue_accounts(view.now)?;
         if let Some(books) = self.depth.frames.get(&view.now) {
             for ((platform, item), listings) in books {
                 session
@@ -271,6 +307,13 @@ impl FillModel for SimFillModel<'_> {
     }
 
     fn locked_until(&self, fill: &Fill) -> DateTime<Utc> {
+        if let Some(unlock) = self.venue_accounts.as_ref().and_then(|accounts| {
+            accounts
+                .trade_unlock(fill.order.platform, fill.filled_at)
+                .ok()
+        }) {
+            return unlock;
+        }
         fill.filled_at + cs2_arb_sim::valve_trade_hold()
     }
 }
@@ -376,6 +419,12 @@ impl StrategyAdapter for SpreadAdapter {
             std::cmp::Reverse((*can_fill, candidate.expected_net_profit))
         });
         for (_, candidate) in executable {
+            if view
+                .available_cash(self.name(), candidate.buy_platform)
+                .is_some_and(|cash| cash < candidate.buy_cost)
+            {
+                continue;
+            }
             let key = (candidate.item.clone(), candidate.float_bucket);
             if occupied.insert(key) {
                 let order = candidate.buy_order(view.now);
@@ -451,6 +500,12 @@ impl StrategyAdapter for DipAdapter<'_> {
                     .preview_fill(self.name(), &signal.order)
                     .unwrap_or((quote.price, signal.order.quantity));
                 let cost = schedule.buyer_order_total(price, quantity)?;
+                if view
+                    .available_cash(self.name(), quote.platform)
+                    .is_some_and(|cash| cash < cost)
+                {
+                    continue;
+                }
                 let mean = PriceSnapshot {
                     price: Money(signal.stats.mean.floor() as i64),
                     ..quote.clone()
@@ -508,7 +563,7 @@ fn exit_order(
     limit_price: Money,
     now: DateTime<Utc>,
 ) -> Order {
-    debug_assert!(now >= position.acquired_at + DEFAULT_TRADE_HOLD);
+    debug_assert!(!position.is_trade_locked_at(now));
     Order {
         id: format!("exit-{}-{now}", position.id),
         side: OrderSide::Sell,

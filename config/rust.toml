@@ -42,11 +42,13 @@ window_seconds = 10
 
 [rate_limits.skinport.items]
 path = "/v1/items"
+quota_group = "public_catalogue"
 max_requests = 8
 window_seconds = 300
 
 [rate_limits.skinport.sales_history]
 path = "/v1/sales/history"
+quota_group = "public_catalogue"
 max_requests = 8
 window_seconds = 300
 

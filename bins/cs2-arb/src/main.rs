@@ -87,6 +87,7 @@ enum Market {
     Skinport,
     Csfloat,
     Dmarket,
+    Waxpeer,
 }
 
 impl From<Market> for Platform {
@@ -95,6 +96,7 @@ impl From<Market> for Platform {
             Market::Skinport => Self::Skinport,
             Market::Csfloat => Self::CsFloat,
             Market::Dmarket => Self::DMarket,
+            Market::Waxpeer => Self::Waxpeer,
         }
     }
 }
@@ -103,11 +105,33 @@ impl From<Market> for Platform {
 #[serde(default)]
 struct Settings {
     game: Game,
+    markets: Option<Vec<Platform>>,
     spread: SpreadConfig,
     dip: DipConfig,
     risk: RiskLimits,
     peg_bid: PegBidConfig,
     relist: RelistConfig,
+}
+
+impl Settings {
+    fn market_allowlist(&self) -> Result<&[Platform]> {
+        let markets = self.markets.as_deref().unwrap_or(match self.game {
+            Game::Cs2 => &[Platform::Skinport, Platform::CsFloat, Platform::DMarket],
+            Game::Rust => &[Platform::Skinport, Platform::Waxpeer, Platform::DMarket],
+        });
+        if markets.is_empty() {
+            return Err(Error::InvalidConfig("markets must not be empty".into()));
+        }
+        for &platform in markets {
+            if !self.game.supports_market(platform) {
+                return Err(Error::InvalidConfig(format!(
+                    "{platform:?} is not supported for {:?}",
+                    self.game
+                )));
+            }
+        }
+        Ok(markets)
+    }
 }
 
 #[tokio::main]
@@ -145,6 +169,7 @@ async fn run(cli: Cli) -> Result<()> {
     let settings: Settings =
         toml::from_str(&config).map_err(|err| Error::InvalidConfig(err.message().to_owned()))?;
     let game = settings.game;
+    let markets = settings.market_allowlist()?;
     let (inputs, output) = match cli.command {
         Command::RunMock {
             history,
@@ -158,7 +183,7 @@ async fn run(cli: Cli) -> Result<()> {
                 live::collect(
                     &config,
                     &fees,
-                    live::select_platforms(game, platform)?,
+                    live::select_platforms(game, platform, markets, settings.markets.is_some())?,
                     samples,
                     interval_seconds,
                     (game == Game::Cs2)
@@ -167,7 +192,7 @@ async fn run(cli: Cli) -> Result<()> {
                 )
                 .await?
             } else {
-                historical(game, history)?
+                historical(game, markets, history)?
             };
             (inputs, None)
         }
@@ -175,7 +200,7 @@ async fn run(cli: Cli) -> Result<()> {
             history,
             output_dir,
         } => (
-            historical(game, history)?,
+            historical(game, markets, history)?,
             Some(backtest_output_dir(game, output_dir)),
         ),
         Command::Watch { .. } => unreachable!("handled before loading market configuration"),
@@ -244,9 +269,9 @@ fn filter_history_events(game: Game, events: &mut Vec<MarketEvent>) {
     });
 }
 
-fn historical(game: Game, args: HistoricalArgs) -> Result<Inputs> {
+fn historical(game: Game, markets: &[Platform], args: HistoricalArgs) -> Result<Inputs> {
     let bundled = args.snapshots.is_none();
-    let snapshots = match args.snapshots {
+    let mut snapshots = match args.snapshots {
         Some(path) => fixtures::load_snapshots(path)?,
         None if game == Game::Cs2 => {
             fixtures::load_snapshots("data/fixtures/price_snapshots.json")?
@@ -261,6 +286,7 @@ fn historical(game: Game, args: HistoricalArgs) -> Result<Inputs> {
             snapshot.float_bucket.is_some(),
         )?;
     }
+    snapshots.retain(|snapshot| markets.contains(&snapshot.platform));
     let mut events = match args.events {
         Some(path) => fixtures::load_events(path)?,
         None if bundled && game == Game::Cs2 => {
@@ -276,11 +302,15 @@ fn historical(game: Game, args: HistoricalArgs) -> Result<Inputs> {
         for sale in &sales {
             validate_history_item(game, sale.platform, &sale.item, sale.float_value.is_some())?;
         }
-        depth.add_sales(sales);
+        depth.add_sales(
+            sales
+                .into_iter()
+                .filter(|sale| markets.contains(&sale.platform)),
+        );
     } else if bundled {
         depth.add_bundled_mock_sales(&snapshots);
     }
-    let buy_orders: Vec<BuyOrder> = if let Some(path) = args.buy_orders {
+    let mut buy_orders: Vec<BuyOrder> = if let Some(path) = args.buy_orders {
         serde_json::from_str(&read(&path)?)
             .map_err(|err| Error::InvalidData(format!("invalid buy orders JSON: {err}")))?
     } else if bundled {
@@ -296,6 +326,7 @@ fn historical(game: Game, args: HistoricalArgs) -> Result<Inputs> {
             buy_order.float_bucket.is_some(),
         )?;
     }
+    buy_orders.retain(|bid| markets.contains(&bid.platform));
     Ok(Inputs {
         snapshots,
         events,
@@ -460,7 +491,12 @@ mod tests {
         let settings: Settings = toml::from_str(config).unwrap();
         assert_eq!(settings.game, Game::Rust);
         assert!(toml::from_str::<Settings>("game = 'unknown'").is_err());
-        let inputs = historical(settings.game, HistoricalArgs::default()).unwrap();
+        let inputs = historical(
+            settings.game,
+            settings.market_allowlist().unwrap(),
+            HistoricalArgs::default(),
+        )
+        .unwrap();
         assert!(inputs.events.is_empty());
         assert!(!inputs.depth.sales().is_empty());
         assert!(inputs.snapshots.iter().all(|snapshot| {
@@ -500,17 +536,62 @@ mod tests {
     #[test]
     fn rust_live_platforms_exclude_csfloat() {
         assert_eq!(
-            live::select_platforms(Game::Cs2, Vec::new()).unwrap(),
+            live::select_platforms(Game::Cs2, Vec::new(), Platform::ALL.as_slice(), false).unwrap(),
             [Platform::Skinport, Platform::CsFloat]
         );
         assert_eq!(
-            live::select_platforms(Game::Rust, Vec::new()).unwrap(),
-            [Platform::Skinport]
+            live::select_platforms(Game::Rust, Vec::new(), Platform::ALL.as_slice(), false)
+                .unwrap(),
+            [Platform::Skinport, Platform::Waxpeer]
         );
         assert_eq!(
-            live::select_platforms(Game::Rust, vec![Market::Dmarket]).unwrap(),
+            live::select_platforms(
+                Game::Rust,
+                vec![Market::Dmarket],
+                Platform::ALL.as_slice(),
+                false
+            )
+            .unwrap(),
             [Platform::DMarket]
         );
-        assert!(live::select_platforms(Game::Rust, vec![Market::Csfloat]).is_err());
+        assert!(live::select_platforms(
+            Game::Rust,
+            vec![Market::Csfloat],
+            Platform::ALL.as_slice(),
+            false
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn market_allowlist_filters_all_replay_inputs_and_live_selection() {
+        let settings: Settings = toml::from_str("game = 'rust'\nmarkets = ['waxpeer']").unwrap();
+        let markets = settings.market_allowlist().unwrap();
+        let inputs = historical(settings.game, markets, HistoricalArgs::default()).unwrap();
+        assert!(!inputs.snapshots.is_empty());
+        assert!(inputs
+            .snapshots
+            .iter()
+            .all(|q| q.platform == Platform::Waxpeer));
+        assert!(!inputs.depth.sales().is_empty());
+        assert!(inputs
+            .depth
+            .sales()
+            .iter()
+            .all(|s| s.platform == Platform::Waxpeer));
+        assert!(!inputs.buy_orders.is_empty());
+        assert!(inputs
+            .buy_orders
+            .iter()
+            .all(|bid| bid.platform == Platform::Waxpeer));
+        assert_eq!(
+            live::select_platforms(settings.game, vec![], markets, true).unwrap(),
+            markets
+        );
+        assert!(
+            live::select_platforms(settings.game, vec![Market::Skinport], markets, true).is_err()
+        );
+        let invalid: Settings = toml::from_str("game = 'rust'\nmarkets = ['csfloat']").unwrap();
+        assert!(invalid.market_allowlist().is_err());
     }
 }

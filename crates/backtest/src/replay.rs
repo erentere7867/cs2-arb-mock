@@ -6,7 +6,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use chrono::{DateTime, Duration, Utc};
 use cs2_arb_core::{
     Error, FeeSchedules, Fill, FloatBucket, ItemId, MarketEvent, Money, Order, OrderSide, Platform,
-    Position, PriceSnapshot, Result, SimulationMode,
+    Position, PriceSnapshot, Result, SimulationMode, TradeFees,
 };
 
 use crate::fill::{FillModel, FillOutcome, SnapshotFillModel};
@@ -16,7 +16,7 @@ use crate::report::{
 use crate::strategies::{DipStrategy, SpreadStrategy};
 
 /// Every supported platform, in a fixed order used for deterministic iteration.
-pub const PLATFORMS: [Platform; 3] = [Platform::Skinport, Platform::CsFloat, Platform::DMarket];
+pub const PLATFORMS: [Platform; 4] = Platform::ALL;
 
 /// Identity of a replayed quote series.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -509,6 +509,15 @@ impl<F: FillModel> Backtester<F> {
                 exit_fee,
                 gross_pnl: gross,
                 fees,
+                fee_breakdown: TradeFees::from_trade(
+                    self.config.fees.get(lot.position.acquired_on),
+                    self.config.fees.get(order.platform),
+                    entry_fee,
+                    exit_fee,
+                    Money(entry_subtotal.0 / i64::from(take)),
+                    fill.unit_price,
+                    take,
+                )?,
                 net_pnl: gross.checked_sub(fees)?,
                 opened_at: lot.position.acquired_at,
                 locked_until: lot.position.locked_until,
@@ -805,11 +814,13 @@ mod tests {
             seller_fee_pct: seller,
             buyer_fixed_fee: Money(0),
             seller_fixed_fee: Money(0),
+            ..FeeSchedule::default()
         };
         FeeSchedules {
             skinport: schedule(8.0),
             csfloat: schedule(2.0),
             dmarket: schedule(5.0),
+            waxpeer: schedule(6.0),
         }
     }
 
@@ -869,7 +880,10 @@ mod tests {
 
     fn daily(days: i64, price: impl Fn(Platform, i64) -> i64) -> Vec<PriceSnapshot> {
         (0..days)
-            .flat_map(|d| PLATFORMS.map(|p| snap(p, d, price(p, d))))
+            .flat_map(|d| {
+                [Platform::Skinport, Platform::CsFloat, Platform::DMarket]
+                    .map(|p| snap(p, d, price(p, d)))
+            })
             .collect()
     }
 

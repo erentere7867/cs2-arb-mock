@@ -3,7 +3,7 @@
 use std::fmt::Write as _;
 
 use chrono::{DateTime, Utc};
-use cs2_arb_core::{Error, FloatBucket, ItemId, Money, Platform, Result};
+use cs2_arb_core::{Error, FloatBucket, ItemId, Money, Platform, Result, TradeFees};
 use serde::{Deserialize, Serialize};
 
 pub const REPORT_DISCLAIMER: &str = "Mock simulation only. Results come from replaying \
@@ -29,6 +29,8 @@ pub struct TradeRecord {
     pub gross_pnl: Money,
     /// `entry_fee + exit_fee`.
     pub fees: Money,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fee_breakdown: Option<TradeFees>,
     /// `gross_pnl - fees`.
     pub net_pnl: Money,
     pub opened_at: DateTime<Utc>,
@@ -235,7 +237,38 @@ impl PerformanceReport {
                 );
             }
         }
+        write_fee_breakdowns(
+            &mut out,
+            self.trades
+                .iter()
+                .filter_map(|t| t.fee_breakdown.map(|f| (t.position_id.as_str(), f))),
+        );
         out
+    }
+}
+
+pub fn write_fee_breakdowns<'a>(
+    out: &mut String,
+    rows: impl Iterator<Item = (&'a str, TradeFees)>,
+) {
+    let mut rows = rows.peekable();
+    if rows.peek().is_none() {
+        return;
+    }
+    let _ = writeln!(out, "\n### Trade fee breakdown\n");
+    let _ = writeln!(out, "| Position | Platform buy | Platform sell | Crypto deposit | Crypto withdrawal | Bank cash-out |");
+    let _ = writeln!(out, "| --- | ---: | ---: | ---: | ---: | ---: |");
+    for (id, f) in rows {
+        let _ = writeln!(
+            out,
+            "| {} | {} | {} | {} | {} | {} |",
+            id.replace('|', "\\|"),
+            fmt_money(f.platform_buy),
+            fmt_money(f.platform_sell),
+            fmt_money(f.crypto_deposit),
+            fmt_money(f.crypto_withdrawal),
+            fmt_money(f.bank_cashout)
+        );
     }
 }
 
@@ -244,6 +277,7 @@ pub(crate) fn platform_name(platform: Platform) -> &'static str {
         Platform::Skinport => "Skinport",
         Platform::CsFloat => "CSFloat",
         Platform::DMarket => "DMarket",
+        Platform::Waxpeer => "Waxpeer",
     }
 }
 

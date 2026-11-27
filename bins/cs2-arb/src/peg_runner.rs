@@ -169,6 +169,12 @@ impl PegBidDashboard {
             out.push('\n');
         }
 
+        cs2_arb_backtest::report::write_fee_breakdowns(
+            &mut out,
+            self.realized_sales
+                .iter()
+                .filter_map(|s| s.fee_breakdown.map(|f| (s.position_id.as_str(), f))),
+        );
         out
     }
 }
@@ -178,7 +184,12 @@ impl PegBidDashboard {
 pub fn derive_offline_buy_orders(snapshots: &[PriceSnapshot]) -> Vec<BuyOrder> {
     snapshots
         .iter()
-        .filter(|q| matches!(q.platform, Platform::CsFloat | Platform::Skinport) && q.price.0 > 0)
+        .filter(|q| {
+            matches!(
+                q.platform,
+                Platform::CsFloat | Platform::Skinport | Platform::Waxpeer
+            ) && q.price.0 > 0
+        })
         .map(|q| {
             // Illustrative top-of-book bid at 86% of ask snapshot so peg-bidding
             // stays within the strict >= 7% net margin ceiling after fees & hold.
@@ -318,7 +329,7 @@ pub fn run_peg_bid_engine(
                     strategy.mark_filled(&report.fill.order.id);
                 }
                 if let Some(pos) = report.position {
-                    relist.track_position(pos, report.fill.filled_at);
+                    relist.track_filled_position(pos, &report.fill);
                 }
             }
             sale_idx += 1;

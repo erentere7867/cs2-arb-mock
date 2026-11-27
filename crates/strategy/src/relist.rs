@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use chrono::{DateTime, Duration, Utc};
 use cs2_arb_core::{
     Error, FeeSchedules, FloatBucket, ItemId, Money, Order, OrderSide, Platform, Position,
-    PriceSnapshot, Result, Sale,
+    PriceSnapshot, Result, Sale, TradeFees,
 };
 use serde::{Deserialize, Serialize};
 
@@ -39,6 +39,8 @@ pub struct RelistConfig {
     pub min_listing_age_secs: i64,
     /// Count only `sale.verified` transactions when measuring volume and median. Default true.
     pub require_verified_sales: bool,
+    /// Consider additional venues that have enough observed sales to fill a mock ask.
+    pub cross_venue: bool,
 }
 
 impl Default for RelistConfig {
@@ -50,6 +52,7 @@ impl Default for RelistConfig {
             min_sales_for_ask_fill: 15,
             min_listing_age_secs: 3600,
             require_verified_sales: true,
+            cross_venue: false,
         }
     }
 }
@@ -85,6 +88,8 @@ pub enum InventoryStatus {
         order_id: String,
         ask_price: Money,
         listed_at: DateTime<Utc>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sell_platform: Option<Platform>,
     },
     #[serde(rename = "SOLD")]
     Sold {
@@ -100,6 +105,8 @@ pub enum InventoryStatus {
 pub struct TrackedInventoryItem {
     pub position: Position,
     pub status: InventoryStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    entry: Option<(Money, Money)>,
 }
 
 impl TrackedInventoryItem {
@@ -126,6 +133,8 @@ pub struct RealizedRelistSale {
     pub ask_price: Money,
     pub gross_proceeds: Money,
     pub seller_fee: Money,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fee_breakdown: Option<TradeFees>,
     pub net_proceeds: Money,
     pub realized_net_pnl: Money,
     pub listed_at: DateTime<Utc>,
@@ -175,6 +184,14 @@ impl RelistEngine {
     /// Register a newly filled simulated position. Starts `LOCKED` if `now < locked_until`,
     /// otherwise `READY_TO_SELL`.
     pub fn track_position(&mut self, position: Position, now: DateTime<Utc>) {
+        self.track(position, None, now);
+    }
+
+    pub fn track_filled_position(&mut self, position: Position, fill: &cs2_arb_core::Fill) {
+        self.track(position, Some((fill.unit_price, fill.fee)), fill.filled_at);
+    }
+
+    fn track(&mut self, position: Position, entry: Option<(Money, Money)>, now: DateTime<Utc>) {
         if self.items.contains_key(&position.id) {
             return;
         }
@@ -187,7 +204,11 @@ impl RelistEngine {
         };
         self.items.insert(
             position.id.clone(),
-            TrackedInventoryItem { position, status },
+            TrackedInventoryItem {
+                position,
+                status,
+                entry,
+            },
         );
     }
 
@@ -243,29 +264,63 @@ impl RelistEngine {
                     if pos.is_trade_locked_at(now) {
                         continue;
                     }
-                    let Some(ask_price) = self.rolling_median_price(
-                        pos.acquired_on,
-                        &pos.item,
-                        pos.float_bucket,
-                        sales,
-                        snapshots,
-                        now,
-                    ) else {
+                    let mut best = None;
+                    for platform in std::iter::once(pos.acquired_on).chain(
+                        Platform::ALL
+                            .into_iter()
+                            .filter(|p| self.config.cross_venue && *p != pos.acquired_on),
+                    ) {
+                        if platform != pos.acquired_on
+                            && self.trailing_volume(
+                                platform,
+                                &pos.item,
+                                pos.float_bucket,
+                                sales,
+                                now,
+                            ) < self.config.min_sales_for_ask_fill.max(1)
+                        {
+                            continue;
+                        }
+                        let Some(ask) = self.rolling_median_price(
+                            platform,
+                            &pos.item,
+                            pos.float_bucket,
+                            sales,
+                            snapshots,
+                            now,
+                        ) else {
+                            continue;
+                        };
+                        if ask.0 <= 0 {
+                            continue;
+                        }
+                        let net = fees
+                            .get(platform)
+                            .seller_proceeds(ask)?
+                            .checked_mul(pos.quantity)?;
+                        if (fees.get(pos.acquired_on).funding.enabled()
+                            || fees.get(platform).funding.enabled())
+                            && net <= pos.cost_basis
+                        {
+                            continue;
+                        }
+                        if best.is_none_or(|(_, _, best_net)| net > best_net) {
+                            best = Some((platform, ask, net));
+                        }
+                    }
+                    let Some((platform, ask_price, _)) = best else {
                         continue;
                     };
-                    if ask_price.0 <= 0 {
-                        continue;
-                    }
                     let oid = order_id(
                         "relist-ask",
-                        &[platform_slug(pos.acquired_on), &pos.item.market_hash_name],
+                        &[platform_slug(platform), &pos.item.market_hash_name],
                         pos.float_bucket,
                         now,
                     );
                     let order = Order {
                         id: oid.clone(),
                         side: OrderSide::Sell,
-                        platform: pos.acquired_on,
+                        platform,
                         item: pos.item.clone(),
                         float_bucket: pos.float_bucket,
                         quantity: pos.quantity,
@@ -277,6 +332,7 @@ impl RelistEngine {
                             order_id: oid,
                             ask_price,
                             listed_at: now,
+                            sell_platform: (platform != pos.acquired_on).then_some(platform),
                         };
                     }
                     result.listed_orders.push(order);
@@ -285,21 +341,18 @@ impl RelistEngine {
                     order_id: oid,
                     ask_price,
                     listed_at,
+                    sell_platform,
                 } => {
                     let pos = self.items[&id].position.clone();
                     if pos.is_trade_locked_at(now) {
                         continue;
                     }
-                    let trailing_vol = self.trailing_volume(
-                        pos.acquired_on,
-                        &pos.item,
-                        pos.float_bucket,
-                        sales,
-                        now,
-                    );
+                    let platform = sell_platform.unwrap_or(pos.acquired_on);
+                    let trailing_vol =
+                        self.trailing_volume(platform, &pos.item, pos.float_bucket, sales, now);
                     let has_crossing_print = sales.iter().any(|s| {
                         (!self.config.require_verified_sales || s.verified)
-                            && s.platform == pos.acquired_on
+                            && s.platform == platform
                             && s.item == pos.item
                             && s.sold_at > listed_at
                             && s.sold_at <= now
@@ -315,7 +368,7 @@ impl RelistEngine {
                         continue;
                     }
 
-                    let schedule = fees.get(pos.acquired_on);
+                    let schedule = fees.get(platform);
                     let gross_proceeds = ask_price.checked_mul(pos.quantity)?;
                     let unit_seller_fee = schedule.seller_fee(ask_price)?;
                     let seller_fee = unit_seller_fee.checked_mul(pos.quantity)?;
@@ -324,18 +377,38 @@ impl RelistEngine {
                         continue;
                     }
                     let realized_net_pnl = net_proceeds.checked_sub(pos.cost_basis)?;
+                    if (fees.get(pos.acquired_on).funding.enabled() || schedule.funding.enabled())
+                        && realized_net_pnl.0 <= 0
+                    {
+                        continue;
+                    }
+                    let (entry_schedule, entry_unit, entry_fee) = self.items[&id]
+                        .entry
+                        .map_or((Default::default(), Money(0), Money(0)), |(unit, fee)| {
+                            (fees.get(pos.acquired_on), unit, fee)
+                        });
+                    let fee_breakdown = TradeFees::from_trade(
+                        entry_schedule,
+                        schedule,
+                        entry_fee,
+                        seller_fee,
+                        entry_unit,
+                        ask_price,
+                        pos.quantity,
+                    )?;
 
                     let record = RealizedRelistSale {
                         position_id: pos.id.clone(),
                         order_id: oid,
                         item: pos.item.clone(),
                         float_bucket: pos.float_bucket,
-                        platform: pos.acquired_on,
+                        platform,
                         quantity: pos.quantity,
                         cost_basis: pos.cost_basis,
                         ask_price,
                         gross_proceeds,
                         seller_fee,
+                        fee_breakdown,
                         net_proceeds,
                         realized_net_pnl,
                         listed_at,
@@ -573,6 +646,50 @@ mod tests {
                 verified: true,
             })
             .collect()
+    }
+
+    #[test]
+    fn cross_venue_relist_requires_liquidity_and_ranks_net_proceeds() {
+        let acquired = t(1, 12);
+        let now = t(8, 12);
+        let position = make_position(acquired);
+        let fees = fees();
+        let mut sales = make_sales(20, 10_000, now);
+        let waxpeer_sales: Vec<_> = make_sales(20, 12_000, now)
+            .into_iter()
+            .map(|s| Sale {
+                platform: Platform::Waxpeer,
+                ..s
+            })
+            .collect();
+        let mut engine = RelistEngine::new(RelistConfig {
+            cross_venue: true,
+            ..RelistConfig::default()
+        })
+        .unwrap();
+        engine.track_position(position.clone(), acquired);
+        sales.extend(waxpeer_sales.iter().take(1).cloned());
+        let step = engine.step(&sales, &[], &fees, now).unwrap();
+        assert_eq!(step.listed_orders[0].platform, Platform::CsFloat);
+
+        let mut engine = RelistEngine::new(RelistConfig {
+            cross_venue: true,
+            ..RelistConfig::default()
+        })
+        .unwrap();
+        engine.track_position(position, acquired);
+        sales.extend(waxpeer_sales.into_iter().skip(1));
+        let step = engine.step(&sales, &[], &fees, now).unwrap();
+        assert_eq!(step.listed_orders[0].platform, Platform::Waxpeer);
+        let step = engine.step(&sales, &[], &fees, t(8, 14)).unwrap();
+        assert_eq!(step.realized_sales[0].platform, Platform::Waxpeer);
+        assert_eq!(
+            step.realized_sales[0]
+                .fee_breakdown
+                .unwrap()
+                .crypto_withdrawal,
+            Money(180)
+        );
     }
 
     #[test]

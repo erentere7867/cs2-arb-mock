@@ -1,4 +1,4 @@
-//! Read-only marketplace adapters for Skinport, CSFloat and DMarket.
+//! Read-only marketplace adapters for Skinport, CSFloat, DMarket and Waxpeer.
 //!
 //! MOCK SIMULATION MODE ONLY: this crate exposes no marketplace execution interface. Every
 //! HTTP request issued here is a `GET` against a listings / sales / price endpoint; there is
@@ -20,6 +20,7 @@ pub mod gate;
 mod http;
 pub mod limiter;
 pub mod skinport;
+pub mod waxpeer;
 
 pub use cache::Cached;
 pub use clock::{Clock, ManualClock, SystemClock};
@@ -30,6 +31,7 @@ mod resilient;
 pub use limiter::{LimitPolicy, SlidingWindowLimiter, WindowLimit};
 pub use resilient::ResilientMarket;
 pub use skinport::{SkinportClient, SkinportConfig};
+pub use waxpeer::WaxpeerClient;
 
 /// User-Agent sent on every request.
 pub const USER_AGENT: &str = concat!("cs2-arb-mock/", env!("CARGO_PKG_VERSION"), " (read-only)");

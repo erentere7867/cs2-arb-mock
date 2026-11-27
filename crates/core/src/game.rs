@@ -23,7 +23,10 @@ impl Game {
     pub const fn supports_market(self, platform: Platform) -> bool {
         match self {
             Self::Cs2 => true,
-            Self::Rust => matches!(platform, Platform::Skinport | Platform::DMarket),
+            Self::Rust => matches!(
+                platform,
+                Platform::Skinport | Platform::DMarket | Platform::Waxpeer
+            ),
         }
     }
 

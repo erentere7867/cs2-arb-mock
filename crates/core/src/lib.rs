@@ -12,7 +12,7 @@ pub use clock::{Clock, ManualClock, SystemClock};
 pub use error::{Error, Result};
 pub use event::{MarketEvent, CS2_APP_ID};
 pub use execution::{Fill, Order, OrderSide, Position, SimulationMode};
-pub use fees::{FeeSchedule, FeeSchedules, Money};
+pub use fees::{FeeSchedule, FeeSchedules, FundingCharge, FundingFees, Money, TradeFees};
 pub use game::{Game, RUST_APP_ID};
 pub use market::{
     comparable_wear, BuyOrder, FloatBucket, ItemId, Listing, MarketClient, Platform, PriceSnapshot,

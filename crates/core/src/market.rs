@@ -10,6 +10,11 @@ pub enum Platform {
     Skinport,
     CsFloat,
     DMarket,
+    Waxpeer,
+}
+
+impl Platform {
+    pub const ALL: [Self; 4] = [Self::Skinport, Self::CsFloat, Self::DMarket, Self::Waxpeer];
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]

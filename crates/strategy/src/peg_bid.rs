@@ -66,7 +66,7 @@ impl Default for PegBidConfig {
             max_order_age_secs: Some(3600),
             lower_to_ceiling: false,
             quantity: 1,
-            allowed_platforms: vec![Platform::CsFloat, Platform::Skinport],
+            allowed_platforms: vec![Platform::CsFloat, Platform::Skinport, Platform::Waxpeer],
         }
     }
 }
@@ -536,37 +536,17 @@ pub fn compute_effective_ceiling(
         return Ok(None);
     }
 
-    let unit_sell_proceeds = fees.seller_proceeds(rolling_median)?;
-    if unit_sell_proceeds.0 <= 0 {
-        return Ok(None);
+    let (mut low, mut high) = (0, raw_ceiling.0);
+    while low < high {
+        let mid = high - (high - low) / 2;
+        if meets_net_margin(Money(mid), rolling_median, fees, config)? {
+            low = mid;
+        } else {
+            high = mid - 1;
+        }
     }
 
-    let opp_fraction = config.opportunity_cost_fraction();
-    let buyer_factor = 1.0 + fees.buyer_fee_pct / 100.0;
-    let total_multiplier = (1.0 + target_margin + opp_fraction) * buyer_factor;
-    let per_unit_proceeds = unit_sell_proceeds.0 as f64
-        - fees.buyer_fixed_fee.0 as f64 * (1.0 + target_margin + opp_fraction);
-    let mut candidate = ((per_unit_proceeds / total_multiplier).floor() as i64).min(raw_ceiling.0);
-
-    if candidate <= 0 {
-        return Ok(None);
-    }
-
-    // Refine downward (if rounding pushed margin slightly below target) or upward
-    // (if conservative fixed-fee estimate left 1 cent of room) while staying <= raw_ceiling.
-    while candidate > 0 && !meets_net_margin(Money(candidate), rolling_median, fees, config)? {
-        candidate -= 1;
-    }
-    if candidate <= 0 {
-        return Ok(None);
-    }
-    while candidate < raw_ceiling.0
-        && meets_net_margin(Money(candidate + 1), rolling_median, fees, config)?
-    {
-        candidate += 1;
-    }
-
-    Ok(Some(Money(candidate)))
+    Ok((low > 0).then_some(Money(low)))
 }
 
 /// Checks whether a candidate unit bid guarantees at least `config.target_margin_pct`
@@ -582,7 +562,8 @@ pub fn meets_net_margin(
     }
     let econ = evaluate_bid_economics(unit_bid, rolling_median, unit_bid, fees, config)?;
     let required_net_profit = cents_ceil(econ.buy_cost.0 as f64 * config.target_margin_fraction())?;
-    Ok(econ.expected_net_profit >= required_net_profit)
+    Ok(econ.expected_net_profit >= required_net_profit
+        && (!fees.funding.enabled() || econ.expected_net_profit.0 > 0))
 }
 
 /// Computes full integer-cent economics for a candidate unit bid.

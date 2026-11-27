@@ -12,6 +12,7 @@ use cs2_arb_events::EventQueue;
 use cs2_arb_markets::{
     CsFloatClient, CsFloatConfig, CsFloatCredentials, DMarketClient, DMarketConfig,
     DMarketCredentials, NetGate, RequestGate, ResilientMarket, SkinportClient, SkinportConfig,
+    WaxpeerClient,
 };
 use cs2_arb_net::{NetConfig, TokioClock};
 use cs2_arb_sim::wear::quote_bucket;
@@ -20,11 +21,20 @@ use crate::{bundled_snapshots, watch, Inputs, Market};
 
 type MarketClients = Vec<(Platform, Box<dyn MarketClient>)>;
 
-pub fn select_platforms(game: Game, requested: Vec<Market>) -> Result<Vec<Platform>> {
+pub fn select_platforms(
+    game: Game,
+    requested: Vec<Market>,
+    allowlist: &[Platform],
+    explicit_allowlist: bool,
+) -> Result<Vec<Platform>> {
     let platforms = if requested.is_empty() {
-        match game {
-            Game::Cs2 => vec![Platform::Skinport, Platform::CsFloat],
-            Game::Rust => vec![Platform::Skinport],
+        if explicit_allowlist {
+            allowlist.to_vec()
+        } else {
+            match game {
+                Game::Cs2 => vec![Platform::Skinport, Platform::CsFloat],
+                Game::Rust => vec![Platform::Skinport, Platform::Waxpeer],
+            }
         }
     } else {
         requested.into_iter().map(Platform::from).collect()
@@ -33,6 +43,11 @@ pub fn select_platforms(game: Game, requested: Vec<Market>) -> Result<Vec<Platfo
         if !game.supports_market(platform) {
             return Err(Error::InvalidConfig(format!(
                 "{platform:?} is not supported for {game:?}"
+            )));
+        }
+        if !allowlist.contains(&platform) {
+            return Err(Error::InvalidConfig(format!(
+                "{platform:?} is not enabled in markets"
             )));
         }
     }
@@ -65,6 +80,10 @@ fn make_clients(
                     gate.clone(),
                     clock.clone(),
                 )?,
+                net.retry,
+            )),
+            Platform::Waxpeer => Box::new(ResilientMarket::new(
+                WaxpeerClient::new(schedule, game, gate.clone(), clock.clone())?,
                 net.retry,
             )),
             Platform::CsFloat => {
@@ -161,7 +180,10 @@ pub async fn collect(
                         tracing::warn!(?platform, %error, "read-only sales request skipped")
                     }
                 }
-                if matches!(platform, Platform::CsFloat | Platform::Skinport) {
+                if matches!(
+                    platform,
+                    Platform::CsFloat | Platform::Skinport | Platform::Waxpeer
+                ) {
                     match client.top_buy_orders(item).await {
                         Ok(orders) => buy_orders.extend(orders),
                         Err(error) => {

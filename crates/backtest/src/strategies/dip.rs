@@ -1,7 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 
 use chrono::Duration;
-use cs2_arb_core::{Order, Result};
+use cs2_arb_core::{Money, Order, Result};
 
 use super::{buy_order, exit_orders, ExitRule};
 use crate::replay::{MarketView, QuoteKey, StrategyAdapter};
@@ -73,7 +73,13 @@ impl StrategyAdapter for DipStrategy {
                     .open_positions_for(&snapshot.item, snapshot.float_bucket)
                     .count()
                     + planned.iter().filter(|k| **k == item_key).count();
-                if (snapshot.price.0 as f64) <= threshold && open < self.max_open_per_item {
+                let fees = view.fees.get(snapshot.platform);
+                if (snapshot.price.0 as f64) <= threshold
+                    && open < self.max_open_per_item
+                    && (!fees.funding.enabled()
+                        || fees.seller_proceeds(Money(mean.floor() as i64))?
+                            > fees.buyer_total(snapshot.price)?)
+                {
                     planned.push(item_key);
                     orders.push(buy_order(
                         Self::next_id(&name, counter),

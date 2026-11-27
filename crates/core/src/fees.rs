@@ -3,7 +3,9 @@ use serde::{Deserialize, Serialize};
 use crate::{Error, Platform, Result};
 
 /// Normalized USD cents; signed for P&L. Marketplace adapters normalize source currency.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
 #[serde(transparent)]
 pub struct Money(pub i64);
 
@@ -30,13 +32,114 @@ impl Money {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct FundingCharge {
+    pub pct: f64,
+    pub fixed: Money,
+}
+
+impl FundingCharge {
+    pub fn unit_fee(self, price: Money) -> Result<Money> {
+        fee(price, self.pct, self.fixed)
+    }
+
+    fn valid(self) -> bool {
+        (0.0..=100.0).contains(&self.pct) && self.fixed.0 >= 0
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct FundingFees {
+    pub crypto_deposit: FundingCharge,
+    pub crypto_withdrawal: FundingCharge,
+    pub bank_cashout: FundingCharge,
+}
+
+impl FundingFees {
+    pub const NONE: Self = Self {
+        crypto_deposit: FundingCharge {
+            pct: 0.0,
+            fixed: Money(0),
+        },
+        crypto_withdrawal: FundingCharge {
+            pct: 0.0,
+            fixed: Money(0),
+        },
+        bank_cashout: FundingCharge {
+            pct: 0.0,
+            fixed: Money(0),
+        },
+    };
+
+    pub fn enabled(self) -> bool {
+        self != Self::default()
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TradeFees {
+    pub platform_buy: Money,
+    pub platform_sell: Money,
+    pub crypto_deposit: Money,
+    pub crypto_withdrawal: Money,
+    pub bank_cashout: Money,
+}
+
+impl TradeFees {
+    pub fn from_trade(
+        entry: FeeSchedule,
+        exit: FeeSchedule,
+        entry_fee: Money,
+        exit_fee: Money,
+        entry_unit: Money,
+        exit_unit: Money,
+        quantity: u32,
+    ) -> Result<Option<Self>> {
+        if !entry.funding.enabled() && !exit.funding.enabled() {
+            return Ok(None);
+        }
+        let crypto_deposit = entry
+            .funding
+            .crypto_deposit
+            .unit_fee(entry_unit)?
+            .checked_mul(quantity)?;
+        let crypto_withdrawal = exit
+            .funding
+            .crypto_withdrawal
+            .unit_fee(exit_unit)?
+            .checked_mul(quantity)?;
+        let bank_cashout = exit
+            .funding
+            .bank_cashout
+            .unit_fee(exit_unit)?
+            .checked_mul(quantity)?;
+        Ok(Some(Self {
+            platform_buy: entry_fee.checked_sub(crypto_deposit)?,
+            platform_sell: exit_fee
+                .checked_sub(crypto_withdrawal)?
+                .checked_sub(bank_cashout)?,
+            crypto_deposit,
+            crypto_withdrawal,
+            bank_cashout,
+        }))
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 pub struct FeeSchedule {
     /// Percentage points: 5.0 denotes five percent.
     pub buyer_fee_pct: f64,
     pub seller_fee_pct: f64,
     pub buyer_fixed_fee: Money,
     pub seller_fixed_fee: Money,
+    #[serde(default, skip_serializing_if = "funding_disabled")]
+    pub funding: FundingFees,
+}
+
+fn funding_disabled(funding: &FundingFees) -> bool {
+    !funding.enabled()
 }
 
 impl FeeSchedule {
@@ -45,6 +148,9 @@ impl FeeSchedule {
             || !(0.0..=100.0).contains(&self.seller_fee_pct)
             || self.buyer_fixed_fee.0 < 0
             || self.seller_fixed_fee.0 < 0
+            || !self.funding.crypto_deposit.valid()
+            || !self.funding.crypto_withdrawal.valid()
+            || !self.funding.bank_cashout.valid()
         {
             return Err(Error::InvalidConfig(
                 "fee percentages must be in [0, 100], and fixed fees must be nonnegative".into(),
@@ -55,12 +161,15 @@ impl FeeSchedule {
 
     pub fn buyer_fee(self, subtotal: Money) -> Result<Money> {
         self.validate()?;
-        fee(subtotal, self.buyer_fee_pct, self.buyer_fixed_fee)
+        fee(subtotal, self.buyer_fee_pct, self.buyer_fixed_fee)?
+            .checked_add(self.funding.crypto_deposit.unit_fee(subtotal)?)
     }
 
     pub fn seller_fee(self, subtotal: Money) -> Result<Money> {
         self.validate()?;
-        fee(subtotal, self.seller_fee_pct, self.seller_fixed_fee)
+        fee(subtotal, self.seller_fee_pct, self.seller_fixed_fee)?
+            .checked_add(self.funding.crypto_withdrawal.unit_fee(subtotal)?)?
+            .checked_add(self.funding.bank_cashout.unit_fee(subtotal)?)
     }
 
     pub fn buyer_total(self, subtotal: Money) -> Result<Money> {
@@ -85,6 +194,15 @@ pub struct FeeSchedules {
     pub skinport: FeeSchedule,
     pub csfloat: FeeSchedule,
     pub dmarket: FeeSchedule,
+    #[serde(default = "default_waxpeer_fees")]
+    pub waxpeer: FeeSchedule,
+}
+
+fn default_waxpeer_fees() -> FeeSchedule {
+    FeeSchedule {
+        seller_fee_pct: 6.0,
+        ..FeeSchedule::default()
+    }
 }
 
 impl FeeSchedules {
@@ -96,7 +214,7 @@ impl FeeSchedules {
 
         let config: Config =
             toml::from_str(source).map_err(|err| Error::InvalidConfig(err.to_string()))?;
-        for platform in [Platform::Skinport, Platform::CsFloat, Platform::DMarket] {
+        for platform in Platform::ALL {
             config.fees.get(platform).validate()?;
         }
         Ok(config.fees)
@@ -107,6 +225,7 @@ impl FeeSchedules {
             Platform::Skinport => self.skinport,
             Platform::CsFloat => self.csfloat,
             Platform::DMarket => self.dmarket,
+            Platform::Waxpeer => self.waxpeer,
         }
     }
 }
@@ -122,6 +241,7 @@ mod tests {
             seller_fee_pct: 5.0,
             buyer_fixed_fee: Money(2),
             seller_fixed_fee: Money(3),
+            ..FeeSchedule::default()
         };
         assert_eq!(schedule.buyer_total(Money(1020)).unwrap(), Money(1048));
         assert_eq!(schedule.seller_proceeds(Money(1020)).unwrap(), Money(966));
@@ -135,6 +255,7 @@ mod tests {
             seller_fee_pct: 0.0,
             buyer_fixed_fee: Money(1),
             seller_fixed_fee: Money(0),
+            ..FeeSchedule::default()
         };
         assert!(matches!(
             schedule.buyer_total(Money(i64::MAX)),

@@ -37,7 +37,11 @@ pub trait FillModel {
         quantity: u32,
         fees: FeeSchedule,
     ) -> Result<Money> {
-        fees.seller_proceeds(unit_price.checked_mul(quantity)?)
+        if fees.funding.enabled() {
+            fees.seller_proceeds(unit_price)?.checked_mul(quantity)
+        } else {
+            fees.seller_proceeds(unit_price.checked_mul(quantity)?)
+        }
     }
 
     fn prepare_run(&self) {}
@@ -112,10 +116,18 @@ impl FillModel for SnapshotFillModel {
             )));
         }
         let subtotal = quote.price.checked_mul(order.quantity)?;
-        let fee = match order.side {
-            OrderSide::Buy => fees.buyer_fee(subtotal)?,
-            OrderSide::Sell => fees.seller_fee(subtotal)?,
+        let price = if fees.funding.enabled() {
+            quote.price
+        } else {
+            subtotal
         };
+        let mut fee = match order.side {
+            OrderSide::Buy => fees.buyer_fee(price)?,
+            OrderSide::Sell => fees.seller_fee(price)?,
+        };
+        if fees.funding.enabled() {
+            fee = fee.checked_mul(order.quantity)?;
+        }
         Ok(FillOutcome::Filled(Fill {
             order: order.clone(),
             quantity: order.quantity,
@@ -169,6 +181,7 @@ mod tests {
         seller_fee_pct: 2.0,
         buyer_fixed_fee: Money(5),
         seller_fixed_fee: Money(0),
+        funding: cs2_arb_core::FundingFees::NONE,
     };
 
     #[test]

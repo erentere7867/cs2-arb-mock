@@ -294,7 +294,12 @@ pub fn evaluate_spread(
                     continue;
                 }
                 match spread_breakdown(buy, sell, fees, config) {
-                    Ok(breakdown) if breakdown.expected_net_profit > config.min_net_profit => {
+                    Ok(breakdown)
+                        if breakdown.expected_net_profit > config.min_net_profit
+                            && (breakdown.expected_net_profit.0 > 0
+                                || (!fees.get(buy.platform).funding.enabled()
+                                    && !fees.get(sell.platform).funding.enabled())) =>
+                    {
                         out.push(breakdown)
                     }
                     Ok(_) => {}
@@ -358,6 +363,7 @@ mod tests {
             seller_fee_pct: seller_pct,
             buyer_fixed_fee: Money(buyer_fixed),
             seller_fixed_fee: Money(seller_fixed),
+            ..FeeSchedule::default()
         }
     }
 
@@ -366,6 +372,7 @@ mod tests {
             skinport: schedule(0.0, 8.0, 0, 0),
             csfloat: schedule(2.5, 2.0, 10, 0),
             dmarket: schedule(0.0, 7.0, 0, 5),
+            waxpeer: schedule(0.0, 6.0, 0, 0),
         }
     }
 
@@ -453,6 +460,47 @@ mod tests {
         assert_eq!(b.sell_proceeds, Money(11_348));
         assert_eq!(b.drift_haircut, Money(412));
         assert_eq!(b.expected_net_profit, Money(1_348));
+    }
+
+    #[test]
+    fn waxpeer_can_win_either_side_and_funding_can_erase_the_spread() {
+        let mut config = cfg();
+        config.annual_opportunity_rate_pct = 0.0;
+        let mut fees = fees();
+        let waxpeer_buy = quote(Platform::Waxpeer, 10_000);
+        let skinport_sell = quote(Platform::Skinport, 11_000);
+        let found = evaluate_spread(
+            &[waxpeer_buy.clone(), skinport_sell.clone()],
+            &fees,
+            &config,
+            t0(),
+        )
+        .unwrap();
+        assert_eq!(found[0].buy_platform, Platform::Waxpeer);
+        fees.waxpeer.funding.crypto_deposit.fixed = Money(120);
+        assert!(
+            evaluate_spread(&[waxpeer_buy, skinport_sell], &fees, &config, t0())
+                .unwrap()
+                .is_empty()
+        );
+
+        let waxpeer_sell = quote(Platform::Waxpeer, 11_000);
+        let skinport_buy = quote(Platform::Skinport, 10_000);
+        let found = evaluate_spread(
+            &[waxpeer_sell.clone(), skinport_buy.clone()],
+            &fees,
+            &config,
+            t0(),
+        )
+        .unwrap();
+        assert_eq!(found[0].sell_platform, Platform::Waxpeer);
+        fees.waxpeer.funding.crypto_withdrawal.fixed = Money(200);
+        fees.waxpeer.funding.bank_cashout.fixed = Money(150);
+        assert!(
+            evaluate_spread(&[waxpeer_sell, skinport_buy], &fees, &config, t0())
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

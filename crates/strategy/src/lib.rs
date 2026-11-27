@@ -43,6 +43,7 @@ pub(crate) fn platform_slug(platform: Platform) -> &'static str {
         Platform::Skinport => "skinport",
         Platform::CsFloat => "csfloat",
         Platform::DMarket => "dmarket",
+        Platform::Waxpeer => "waxpeer",
     }
 }
 

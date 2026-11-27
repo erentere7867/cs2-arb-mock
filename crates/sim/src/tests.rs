@@ -39,6 +39,7 @@ fn schedule(buyer_pct: f64, seller_pct: f64, buyer_fixed: i64, seller_fixed: i64
         seller_fee_pct: seller_pct,
         buyer_fixed_fee: Money(buyer_fixed),
         seller_fixed_fee: Money(seller_fixed),
+        ..FeeSchedule::default()
     }
 }
 
@@ -49,6 +50,7 @@ fn test_fees() -> FeeSchedules {
         skinport: schedule(0.0, 8.0, 0, 0),
         csfloat: schedule(2.5, 2.0, 2, 0),
         dmarket: schedule(0.0, 7.0, 0, 0),
+        waxpeer: schedule(0.0, 6.0, 0, 0),
     }
 }
 

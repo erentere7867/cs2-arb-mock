@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use common::*;
-use cs2_arb_core::{Error, MarketClient, Money, Platform};
+use cs2_arb_core::{Error, Game, ItemId, MarketClient, Money, Platform, WearTier};
 use cs2_arb_markets::skinport::{SkinportClient, SkinportConfig};
 use cs2_arb_markets::{LimitPolicy, NoopGate, RequestGate, WindowLimit};
 use serde_json::json;
@@ -107,6 +107,51 @@ async fn hits(server: &MockServer, p: &str) -> usize {
         .iter()
         .filter(|r| r.url.path() == p)
         .count()
+}
+
+#[tokio::test]
+async fn rust_reads_its_catalogue_without_wear_or_verified_sales() {
+    let server = MockServer::start().await;
+    let name = "Alien Red";
+    let item = ItemId {
+        market_hash_name: name.into(),
+        wear_tier: WearTier::NotApplicable,
+    };
+    Mock::given(method("GET"))
+        .and(path("/v1/items"))
+        .and(query_param("app_id", "252490"))
+        .and(query_param("currency", "USD"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            {"market_hash_name": name, "min_price": 21.37, "quantity": 3}
+        ])))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1/sales/history"))
+        .and(query_param("app_id", "252490"))
+        .and(query_param("currency", "USD"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            {"market_hash_name": name, "last_24_hours": stats(20.0, 30)}
+        ])))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let sp = client(SkinportConfig {
+        game: Game::Rust,
+        ..config(&server)
+    });
+    assert!(sp.list_listings(&redline()).await.is_err());
+    let listings = sp.list_listings(&item).await.unwrap();
+    assert_eq!(listings.len(), 1);
+    assert_eq!(listings[0].item, item);
+    assert_eq!(listings[0].price, Money(2137));
+    assert_eq!(listings[0].float_value, None);
+    assert_eq!(sp.price_snapshot(&item).await.unwrap().float_bucket, None);
+    let sales = sp.recent_sales(&item, t0()).await.unwrap();
+    assert_eq!(sales.len(), 1);
+    assert_eq!(sales[0].price, Money(2000));
+    assert!(!sales[0].verified);
 }
 
 #[tokio::test]

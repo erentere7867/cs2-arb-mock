@@ -5,7 +5,8 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use cs2_arb_backtest::integrated::{DipAdapter, MarketDepth, SimFillModel, SpreadAdapter};
 use cs2_arb_backtest::{fixtures, BacktestConfig, Backtester, PerformanceReport, StrategyAdapter};
 use cs2_arb_core::{
-    BuyOrder, Error, FeeSchedules, MarketEvent, Platform, PriceSnapshot, Result, SimulationMode,
+    BuyOrder, Error, FeeSchedules, Game, ItemId, MarketEvent, Platform, PriceSnapshot, Result,
+    SimulationMode,
 };
 use cs2_arb_strategy::{
     DipConfig, KillSwitch, PegBidConfig, RelistConfig, RiskLimits, SpreadConfig,
@@ -16,12 +17,13 @@ mod live;
 mod peg_runner;
 mod watch;
 
-const DEFAULT_SNAPSHOTS: &str = "data/fixtures/price_snapshots.json";
-const DEFAULT_EVENTS: &str = "data/fixtures/market_events.json";
 const DEFAULT_DB: &str = "data/events.db";
 
 #[derive(Parser)]
-#[command(name = "cs2-arb", about = "CS2 market analysis — MOCK SIMULATION ONLY")]
+#[command(
+    name = "cs2-arb",
+    about = "Skin market analysis — MOCK SIMULATION ONLY"
+)]
 struct Cli {
     #[arg(long, global = true, default_value = "config/default.toml")]
     config: PathBuf,
@@ -63,7 +65,7 @@ enum Command {
     },
 }
 
-#[derive(Args)]
+#[derive(Args, Default)]
 struct HistoricalArgs {
     /// Historical snapshots JSON; defaults to the bundled synthetic history.
     #[arg(long)]
@@ -99,6 +101,7 @@ impl From<Market> for Platform {
 #[derive(Default, Deserialize)]
 #[serde(default)]
 struct Settings {
+    game: Game,
     spread: SpreadConfig,
     dip: DipConfig,
     risk: RiskLimits,
@@ -123,11 +126,24 @@ async fn main() -> ExitCode {
 async fn run(cli: Cli) -> Result<()> {
     let config = read(&cli.config)?;
     if let Command::Watch { database, once } = cli.command {
+        #[derive(Deserialize, Default)]
+        #[serde(default)]
+        struct WatchGame {
+            game: Game,
+        }
+        let WatchGame { game } = toml::from_str(&config)
+            .map_err(|err| Error::InvalidConfig(err.message().to_owned()))?;
+        if game != Game::Cs2 {
+            return Err(Error::InvalidConfig(
+                "watch only supports CS2 (App ID 730)".into(),
+            ));
+        }
         return watch::run(&config, &database, once).await;
     }
     let fees = FeeSchedules::from_toml(&config)?;
     let settings: Settings =
         toml::from_str(&config).map_err(|err| Error::InvalidConfig(err.message().to_owned()))?;
+    let game = settings.game;
     let (inputs, output) = match cli.command {
         Command::RunMock {
             history,
@@ -138,30 +154,26 @@ async fn run(cli: Cli) -> Result<()> {
             database,
         } => {
             let inputs = if live_market_data {
-                let platforms = if platform.is_empty() {
-                    vec![Platform::Skinport, Platform::CsFloat]
-                } else {
-                    platform.into_iter().map(Platform::from).collect()
-                };
                 live::collect(
                     &config,
                     &fees,
-                    platforms,
+                    live::select_platforms(game, platform)?,
                     samples,
                     interval_seconds,
-                    &database,
-                    settings.dip.branch_update_window_hours,
+                    (game == Game::Cs2)
+                        .then_some((database.as_str(), settings.dip.branch_update_window_hours)),
+                    game,
                 )
                 .await?
             } else {
-                historical(history)?
+                historical(game, history)?
             };
             (inputs, None)
         }
         Command::Backtest {
             history,
             output_dir,
-        } => (historical(history)?, Some(output_dir)),
+        } => (historical(game, history)?, Some(output_dir)),
         Command::Watch { .. } => unreachable!("handled before loading market configuration"),
     };
     let kill_switch = KillSwitch::with_defaults();
@@ -196,29 +208,70 @@ struct Inputs {
     buy_orders: Vec<BuyOrder>,
 }
 
-fn historical(args: HistoricalArgs) -> Result<Inputs> {
+fn bundled_snapshots(game: Game) -> Result<Vec<PriceSnapshot>> {
+    fixtures::parse_snapshots(match game {
+        Game::Cs2 => include_str!("../../../data/fixtures/price_snapshots.json"),
+        Game::Rust => include_str!("../../../data/fixtures/rust_price_snapshots.json"),
+    })
+}
+
+fn validate_history_item(
+    game: Game,
+    platform: Platform,
+    item: &ItemId,
+    has_float: bool,
+) -> Result<()> {
+    if !game.supports_market(platform)
+        || !game.supports_wear(item.wear_tier)
+        || (item.wear_tier == cs2_arb_core::WearTier::NotApplicable && has_float)
+    {
+        return Err(Error::InvalidData(format!(
+            "{platform:?} history for {:?} is incompatible with {game:?}",
+            item.market_hash_name
+        )));
+    }
+    Ok(())
+}
+
+fn historical(game: Game, args: HistoricalArgs) -> Result<Inputs> {
     let bundled = args.snapshots.is_none();
-    let snapshots = fixtures::load_snapshots(
-        args.snapshots
-            .as_deref()
-            .unwrap_or_else(|| Path::new(DEFAULT_SNAPSHOTS)),
-    )?;
-    let event_path = args
-        .events
-        .or_else(|| bundled.then(|| PathBuf::from(DEFAULT_EVENTS)));
-    let events = event_path
-        .map(fixtures::load_events)
-        .transpose()?
-        .unwrap_or_default();
+    let snapshots = match args.snapshots {
+        Some(path) => fixtures::load_snapshots(path)?,
+        None if game == Game::Cs2 => {
+            fixtures::load_snapshots("data/fixtures/price_snapshots.json")?
+        }
+        None => bundled_snapshots(game)?,
+    };
+    for snapshot in &snapshots {
+        validate_history_item(
+            game,
+            snapshot.platform,
+            &snapshot.item,
+            snapshot.float_bucket.is_some(),
+        )?;
+    }
+    let events = match args.events {
+        Some(path) => fixtures::load_events(path)?,
+        None if bundled && game == Game::Cs2 => {
+            fixtures::load_events("data/fixtures/market_events.json")?
+        }
+        None => Vec::new(),
+    };
+    if game == Game::Rust && events.iter().any(|event| matches!(event, MarketEvent::BranchUpdated { app_id, .. } if *app_id != game.app_id())) {
+        return Err(Error::InvalidData("branch update history is not for Rust".into()));
+    }
     let mut depth = MarketDepth::from_snapshots(&snapshots);
     if let Some(path) = args.sales {
-        let sales: Vec<_> = serde_json::from_str(&read(&path)?)
+        let sales: Vec<cs2_arb_core::Sale> = serde_json::from_str(&read(&path)?)
             .map_err(|err| Error::InvalidData(format!("invalid sales JSON: {err}")))?;
+        for sale in &sales {
+            validate_history_item(game, sale.platform, &sale.item, sale.float_value.is_some())?;
+        }
         depth.add_sales(sales);
     } else if bundled {
         depth.add_bundled_mock_sales(&snapshots);
     }
-    let buy_orders = if let Some(path) = args.buy_orders {
+    let buy_orders: Vec<BuyOrder> = if let Some(path) = args.buy_orders {
         serde_json::from_str(&read(&path)?)
             .map_err(|err| Error::InvalidData(format!("invalid buy orders JSON: {err}")))?
     } else if bundled {
@@ -226,6 +279,14 @@ fn historical(args: HistoricalArgs) -> Result<Inputs> {
     } else {
         Vec::new()
     };
+    for buy_order in &buy_orders {
+        validate_history_item(
+            game,
+            buy_order.platform,
+            &buy_order.item,
+            buy_order.float_bucket.is_some(),
+        )?;
+    }
     Ok(Inputs {
         snapshots,
         events,
@@ -350,5 +411,47 @@ mod tests {
             .iter()
             .all(|trade| trade.closed_at >= trade.locked_until));
         assert!(report.totals.total_fees.0 > 0);
+    }
+
+    #[test]
+    fn rust_profile_replays_exteriorless_items() {
+        let default: Settings = toml::from_str("").unwrap();
+        assert_eq!(default.game, Game::Cs2);
+        let config = include_str!("../../../config/rust.toml");
+        let settings: Settings = toml::from_str(config).unwrap();
+        assert_eq!(settings.game, Game::Rust);
+        assert!(toml::from_str::<Settings>("game = 'unknown'").is_err());
+        let inputs = historical(settings.game, HistoricalArgs::default()).unwrap();
+        assert!(inputs.events.is_empty());
+        assert!(!inputs.depth.sales().is_empty());
+        assert!(inputs.snapshots.iter().all(|snapshot| {
+            snapshot.item.wear_tier == cs2_arb_core::WearTier::NotApplicable
+                && snapshot.float_bucket.is_none()
+        }));
+        let report = simulate(
+            &inputs,
+            FeeSchedules::from_toml(config).unwrap(),
+            settings,
+            KillSwitch::new(),
+        )
+        .unwrap();
+        assert!(report.strategy("spread").unwrap().trade_count > 0);
+    }
+
+    #[test]
+    fn rust_live_platforms_exclude_csfloat() {
+        assert_eq!(
+            live::select_platforms(Game::Cs2, Vec::new()).unwrap(),
+            [Platform::Skinport, Platform::CsFloat]
+        );
+        assert_eq!(
+            live::select_platforms(Game::Rust, Vec::new()).unwrap(),
+            [Platform::Skinport]
+        );
+        assert_eq!(
+            live::select_platforms(Game::Rust, vec![Market::Dmarket]).unwrap(),
+            [Platform::DMarket]
+        );
+        assert!(live::select_platforms(Game::Rust, vec![Market::Csfloat]).is_err());
     }
 }

@@ -3,7 +3,7 @@ mod common;
 use std::sync::Arc;
 
 use common::*;
-use cs2_arb_core::{MarketClient, Money, Platform};
+use cs2_arb_core::{Game, ItemId, MarketClient, Money, Platform, WearTier};
 use cs2_arb_markets::dmarket::{string_to_sign, DMarketClient, DMarketConfig, DMarketCredentials};
 use cs2_arb_markets::NoopGate;
 use ed25519_dalek::{Signature, SigningKey, Verifier};
@@ -55,6 +55,15 @@ fn client_with_gate(
     gate: Arc<dyn cs2_arb_markets::RequestGate>,
     clock: Arc<cs2_arb_markets::ManualClock>,
 ) -> DMarketClient {
+    client_for_game(server, gate, clock, Game::Cs2)
+}
+
+fn client_for_game(
+    server: &MockServer,
+    gate: Arc<dyn cs2_arb_markets::RequestGate>,
+    clock: Arc<cs2_arb_markets::ManualClock>,
+    game: Game,
+) -> DMarketClient {
     let signing_key = SigningKey::from_bytes(&FIXTURE_SEED);
     let public = hex_encode(&signing_key.verifying_key().to_bytes());
     let private = hex_encode(&FIXTURE_SEED);
@@ -62,7 +71,7 @@ fn client_with_gate(
     let cfg = DMarketConfig {
         base_url: server.uri(),
         request_timeout: None,
-        ..DMarketConfig::default()
+        ..DMarketConfig::for_game(game)
     };
     DMarketClient::with_config(fees(), cfg, creds, gate, clock).unwrap()
 }
@@ -205,6 +214,54 @@ async fn parses_signed_offers() {
             .unwrap()
             .contains("title=AK-47%20%7C%20Redline%20%28Field-Tested%29"));
         assert_signed(req);
+    }
+}
+
+#[tokio::test]
+async fn rust_reads_exact_names_and_normalizes_listings_and_sales_without_float() {
+    let server = MockServer::start().await;
+    let name = "Alien Red";
+    let item = ItemId {
+        market_hash_name: name.into(),
+        wear_tier: WearTier::NotApplicable,
+    };
+    Mock::given(method("GET"))
+        .and(path("/marketplace-api/v2/offers"))
+        .and(query_param("gameId", "rust"))
+        .and(query_param("title", name))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"items": [
+            {"offerId": "rust", "priceCents": "2100", "attributes": {"title": name}},
+            {"offerId": "other", "priceCents": "100", "attributes": {"title": "Alien Red Variant"}}
+        ]})))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/trade-aggregator/v1/last-sales"))
+        .and(query_param("gameId", "rust"))
+        .and(query_param("title", name))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"sales": [
+            {"price": "20.15", "date": t0().timestamp(), "offerAttributes": {"floatValue": "0.2"}}
+        ]})))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let dm = client_for_game(&server, Arc::new(NoopGate), clock(), Game::Rust);
+    assert!(dm.list_listings(&redline()).await.is_err());
+    let listings = dm.list_listings(&item).await.unwrap();
+    assert_eq!(listings.len(), 1);
+    assert_eq!(listings[0].item, item);
+    assert_eq!(listings[0].price, Money(2100));
+    assert_eq!(listings[0].float_value, None);
+    let sales = dm.recent_sales(&item, t0()).await.unwrap();
+    assert_eq!(sales.len(), 1);
+    assert_eq!(sales[0].price, Money(2015));
+    assert_eq!(sales[0].float_value, None);
+    assert!(sales[0].verified);
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 2);
+    for request in &requests {
+        assert_signed(request);
     }
 }
 

@@ -8,7 +8,7 @@
 //!   the docs state Brotli is mandatory). reqwest's `brotli` feature decodes the response.
 //! - Both endpoints are unauthenticated, rate limited to 8 requests / 5 minutes and cached
 //!   server-side for 5 minutes — confirmed by skinport.js doc comments.
-//! - Query params `app_id` (730), `currency` (we always send `USD` because `Money` is USD
+//! - Query params `app_id` (730 for CS2 or 252490 for Rust), `currency` (we always send `USD` because `Money` is USD
 //!   cents), `tradable` (items) and `market_hash_name` (sales history, comma-delimited,
 //!   optional) — confirmed by skinport.js.
 //! - `/v1/items` returns aggregate rows: `market_hash_name, currency, suggested_price,
@@ -35,15 +35,15 @@ use std::time::Duration;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use cs2_arb_core::{
-    Error, FeeSchedule, ItemId, Listing, MarketClient, Money, Platform, PriceSnapshot, Result,
-    Sale, CS2_APP_ID,
+    Error, FeeSchedule, Game, ItemId, Listing, MarketClient, Money, Platform, PriceSnapshot,
+    Result, Sale,
 };
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, ACCEPT_ENCODING};
 use serde::Deserialize;
 
 use crate::cache::{Cached, TtlCache};
 use crate::clock::{Clock, SystemClock};
-use crate::convert::{query_string, usd_f64_to_cents, validate_item};
+use crate::convert::{query_string, usd_f64_to_cents, validate_item_for_game};
 use crate::gate::{Endpoint, NoopGate, RequestGate};
 use crate::http::{parse_json, HttpCore};
 use crate::limiter::{LimitPolicy, SlidingWindowLimiter, WindowLimit};
@@ -64,6 +64,7 @@ pub const SALES_HISTORY_ENDPOINT: Endpoint = Endpoint {
 
 #[derive(Debug, Clone)]
 pub struct SkinportConfig {
+    pub game: Game,
     /// Without trailing `/v1`; e.g. `https://api.skinport.com` or a mock server URL.
     pub base_url: String,
     /// Response cache TTL. Skinport caches these responses for 5 minutes server-side.
@@ -84,6 +85,7 @@ pub struct SkinportConfig {
 impl Default for SkinportConfig {
     fn default() -> Self {
         Self {
+            game: Game::default(),
             base_url: DEFAULT_BASE_URL.into(),
             cache_ttl: Duration::from_secs(300),
             cache_dir: None,
@@ -371,7 +373,7 @@ impl SkinportClient {
     }
 
     fn items_query(&self) -> String {
-        let app_id = CS2_APP_ID.to_string();
+        let app_id = self.config.game.app_id().to_string();
         let mut pairs = vec![("app_id", app_id.as_str()), ("currency", "USD")];
         if self.config.tradable_only {
             pairs.push(("tradable", "1"));
@@ -380,7 +382,7 @@ impl SkinportClient {
     }
 
     fn sales_query(&self) -> String {
-        let app_id = CS2_APP_ID.to_string();
+        let app_id = self.config.game.app_id().to_string();
         query_string(&[("app_id", app_id.as_str()), ("currency", "USD")])
     }
 
@@ -484,7 +486,7 @@ impl SkinportClient {
 #[async_trait]
 impl MarketClient for SkinportClient {
     async fn list_listings(&self, item: &ItemId) -> Result<Vec<Listing>> {
-        validate_item(item)?;
+        validate_item_for_game(item, self.config.game)?;
         let items = self.items().await?;
         let Some(row) = items.value.get(&item.market_hash_name) else {
             return Ok(Vec::new());
@@ -508,7 +510,7 @@ impl MarketClient for SkinportClient {
     /// window that covers `since` (median price, falling back to average), stamped with the
     /// fetch time.
     async fn recent_sales(&self, item: &ItemId, since: DateTime<Utc>) -> Result<Vec<Sale>> {
-        validate_item(item)?;
+        validate_item_for_game(item, self.config.game)?;
         let history = self.sales_history().await?;
         let Some(row) = history.value.get(&item.market_hash_name) else {
             return Ok(Vec::new());
@@ -540,7 +542,7 @@ impl MarketClient for SkinportClient {
     }
 
     async fn price_snapshot(&self, item: &ItemId) -> Result<PriceSnapshot> {
-        validate_item(item)?;
+        validate_item_for_game(item, self.config.game)?;
         let items = self.items().await?;
         let price = items
             .value

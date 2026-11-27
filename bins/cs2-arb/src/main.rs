@@ -36,7 +36,7 @@ enum Command {
     RunMock {
         #[command(flatten)]
         history: HistoricalArgs,
-        #[arg(long, conflicts_with_all = ["snapshots", "events", "sales"])]
+        #[arg(long, conflicts_with_all = ["snapshots", "events", "sales", "buy_orders"])]
         live_market_data: bool,
         #[arg(long, value_enum, requires = "live_market_data")]
         platform: Vec<Market>,
@@ -74,6 +74,9 @@ struct HistoricalArgs {
     /// Individual sales JSON for historical liquidity; custom snapshots never invent sales.
     #[arg(long)]
     sales: Option<PathBuf>,
+    /// Optional top-of-book buy orders JSON for custom peg-bidding replays.
+    #[arg(long)]
+    buy_orders: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -215,7 +218,10 @@ fn historical(args: HistoricalArgs) -> Result<Inputs> {
     } else if bundled {
         depth.add_bundled_mock_sales(&snapshots);
     }
-    let buy_orders = if bundled {
+    let buy_orders = if let Some(path) = args.buy_orders {
+        serde_json::from_str(&read(&path)?)
+            .map_err(|err| Error::InvalidData(format!("invalid buy orders JSON: {err}")))?
+    } else if bundled {
         peg_runner::derive_offline_buy_orders(&snapshots)
     } else {
         Vec::new()

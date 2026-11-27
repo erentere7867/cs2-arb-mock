@@ -44,7 +44,7 @@ enum BidIdentity {
     Fallback {
         owner: String,
         price: i64,
-        page: usize,
+        quantity: u32,
     },
 }
 
@@ -55,7 +55,6 @@ fn add_detailed_bid_page(
     item: &ItemId,
     game: &str,
     orders: &mut DetailedBids,
-    page: usize,
     observed_at: DateTime<Utc>,
 ) -> Result<usize> {
     #[derive(Deserialize)]
@@ -98,14 +97,17 @@ fn add_detailed_bid_page(
                 (None, Some(owner)) if !owner.is_empty() => BidIdentity::Fallback {
                     owner,
                     price: raw_price,
-                    page,
+                    quantity: bid.amount,
                 },
                 _ => continue,
             };
+            let identified = matches!(key, BidIdentity::Id(_));
             orders
                 .entry(key)
                 .and_modify(|old| {
-                    if (observed_at, price) > (old.1, old.0) {
+                    if (identified && (observed_at, price) > (old.1, old.0))
+                        || (!identified && observed_at < old.1)
+                    {
                         *old = (price, observed_at);
                     }
                 })
@@ -381,8 +383,7 @@ impl MarketClient for WaxpeerClient {
                     .await?;
                 let observed_at = self.http.clock().now();
                 last_response_at = Some(observed_at);
-                let rows =
-                    add_detailed_bid_page(&body, item, game, &mut orders, page, observed_at)?;
+                let rows = add_detailed_bid_page(&body, item, game, &mut orders, observed_at)?;
                 if rows < BID_PAGE_SIZE || orders.len() >= MAX_BID_ORDERS {
                     break;
                 }
@@ -465,7 +466,6 @@ mod tests {
                 &item,
                 "rust",
                 &mut orders,
-                0,
                 DateTime::<Utc>::UNIX_EPOCH
             )
             .unwrap(),

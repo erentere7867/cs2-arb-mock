@@ -438,6 +438,7 @@ impl RelistEngine {
         now: DateTime<Utc>,
     ) -> Option<Money> {
         let cutoff = now - Duration::days(self.config.lookback_days);
+        let mut seen_ids = std::collections::HashSet::new();
         let mut prices: Vec<i64> = sales
             .iter()
             .filter(|s| {
@@ -448,6 +449,7 @@ impl RelistEngine {
                     && s.sold_at <= now
                     && s.price.0 > 0
                     && matches_bucket(bucket, s.float_value)
+                    && seen_ids.insert((s.platform, s.id.as_str()))
             })
             .map(|s| s.price.0)
             .collect();
@@ -483,6 +485,7 @@ impl RelistEngine {
         now: DateTime<Utc>,
     ) -> u32 {
         let cutoff = now - Duration::days(self.config.volume_window_days);
+        let mut seen_ids = std::collections::HashSet::new();
         let count = sales
             .iter()
             .filter(|s| {
@@ -492,6 +495,7 @@ impl RelistEngine {
                     && s.sold_at > cutoff
                     && s.sold_at <= now
                     && matches_bucket(bucket, s.float_value)
+                    && seen_ids.insert((s.platform, s.id.as_str()))
             })
             .count();
         u32::try_from(count).unwrap_or(u32::MAX)

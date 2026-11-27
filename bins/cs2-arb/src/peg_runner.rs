@@ -220,7 +220,12 @@ pub fn run_peg_bid_engine(
     let mut sorted_snapshots = snapshots.to_vec();
     sorted_snapshots.sort_by_key(|s| s.observed_at);
 
-    let mut sorted_sales = sales.to_vec();
+    let mut seen_sales = std::collections::HashSet::new();
+    let mut sorted_sales: Vec<Sale> = sales
+        .iter()
+        .filter(|s| seen_sales.insert((s.platform, s.id.clone())))
+        .cloned()
+        .collect();
     sorted_sales.sort_by_key(|s| s.sold_at);
 
     let mut sorted_bids = buy_orders.to_vec();

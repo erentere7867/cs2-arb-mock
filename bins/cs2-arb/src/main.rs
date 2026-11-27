@@ -1278,7 +1278,7 @@ amount = 100
         };
         run(cli, &sources, io::sink()).await.unwrap();
         let markdown = std::fs::read_to_string(out.join("backtest.md")).unwrap();
-        assert!(markdown.contains("· 6 snapshots ·"), "{markdown}");
+        assert!(markdown.contains("· 4 steps · 6 snapshots ·"), "{markdown}");
         let queue = EventQueue::open(db).await.unwrap();
         let stored = queue
             .load_market_replay(Game::Cs2, now - TimeDelta::days(1), now)

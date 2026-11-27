@@ -176,10 +176,6 @@ impl FillModel for SimFillModel<'_> {
             .sample_fill_time(now)
     }
 
-    fn uses_venue_holds(&self) -> bool {
-        self.venue_accounts.is_some()
-    }
-
     fn venue_trade_holds(&self) -> Vec<cs2_arb_sim::venues::VenueTradeHold> {
         self.venue_accounts
             .as_ref()
@@ -376,11 +372,36 @@ impl SpreadAdapter {
             pending: HashMap::new(),
         }
     }
+
+    pub fn validate_holds(
+        config: &SpreadConfig,
+        holds: &[cs2_arb_sim::venues::VenueTradeHold],
+    ) -> Result<()> {
+        if holds.is_empty() {
+            return config.validate();
+        }
+        for hold in holds {
+            let duration = Duration::try_seconds(hold.seconds)
+                .filter(|_| hold.seconds >= 0)
+                .ok_or_else(|| {
+                    Error::InvalidConfig(format!(
+                        "{:?} venue hold must be nonnegative and representable",
+                        hold.platform
+                    ))
+                })?;
+            config.validate_venue_hold(hold.platform, duration)?;
+        }
+        Ok(())
+    }
 }
 
 impl StrategyAdapter for SpreadAdapter {
     fn name(&self) -> &str {
         "spread"
+    }
+
+    fn validate(&self, fill_model: &dyn FillModel) -> Result<()> {
+        Self::validate_holds(&self.config, &fill_model.venue_trade_holds())
     }
 
     fn on_step(&mut self, view: &MarketView<'_>) -> Result<Vec<Order>> {
@@ -406,20 +427,20 @@ impl StrategyAdapter for SpreadAdapter {
                 }
             }
         }
-        let quotes: Vec<_> = view.latest_quotes().cloned().collect();
-        let mut executable = Vec::new();
         let venue_holds = view.venue_trade_holds();
         let hold = |platform| {
-            view.uses_venue_holds().then(|| {
-                venue_holds
-                    .iter()
-                    .find(|hold| hold.platform == platform)
-                    .map_or_else(cs2_arb_sim::valve_trade_hold, |hold| {
-                        chrono::Duration::seconds(hold.seconds)
-                    })
-            })
+            venue_holds
+                .iter()
+                .find(|hold| hold.platform == platform)
+                .map(|hold| Duration::seconds(hold.seconds))
         };
-        let candidates = if view.uses_venue_holds() {
+        let quotes: Vec<_> = view
+            .latest_quotes()
+            .filter(|quote| venue_holds.is_empty() || hold(quote.platform).is_some())
+            .cloned()
+            .collect();
+        let mut executable = Vec::new();
+        let candidates = if !venue_holds.is_empty() {
             evaluate_spread_with_holds(&quotes, view.fees, &self.config, view.now, hold)?
         } else {
             evaluate_spread(&quotes, view.fees, &self.config, view.now)?

@@ -241,6 +241,7 @@ async fn run(cli: Cli) -> Result<()> {
     let accounts = if let Some(rules) = &settings.venue_accounts {
         rules.validate(markets)?;
         let accounts = VenueAccounts::new(rules.clone(), fees.clone());
+        SpreadAdapter::validate_holds(&settings.spread, &accounts.trade_holds())?;
         for schedule in [
             &mut fees.skinport,
             &mut fees.csfloat,

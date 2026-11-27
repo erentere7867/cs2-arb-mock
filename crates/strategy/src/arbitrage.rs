@@ -66,6 +66,17 @@ impl SpreadConfig {
         self.validate_for_hold(f64::from(self.hold_days))
     }
 
+    pub fn validate_venue_hold(&self, venue: Platform, hold: Duration) -> Result<()> {
+        let hold_days = self.effective_hold(Some(hold)).num_seconds() as f64 / 86_400.0;
+        self.validate_for_hold(hold_days).map_err(|error| {
+            Error::InvalidConfig(format!(
+                "{} venue hold ({} seconds): {error}",
+                platform_slug(venue),
+                hold.num_seconds()
+            ))
+        })
+    }
+
     fn validate_for_hold(&self, hold_days: f64) -> Result<()> {
         let bad = |msg: &str| Err(Error::InvalidConfig(format!("spread: {msg}")));
         if !self.annual_opportunity_rate_pct.is_finite() || self.annual_opportunity_rate_pct < 0.0 {
@@ -290,6 +301,11 @@ pub fn evaluate_spread_with_holds(
     hold: impl Fn(Platform) -> Option<Duration>,
 ) -> Result<Vec<SpreadBreakdown>> {
     config.validate_for_hold(0.0)?;
+    for platform in Platform::ALL {
+        if let Some(duration) = hold(platform) {
+            config.validate_venue_hold(platform, duration)?;
+        }
+    }
     let oldest = config
         .max_quote_age_secs
         .map(|age| now - Duration::seconds(age));

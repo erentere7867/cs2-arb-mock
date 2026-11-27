@@ -28,10 +28,6 @@ pub trait FillModel {
         now
     }
 
-    fn uses_venue_holds(&self) -> bool {
-        false
-    }
-
     fn venue_trade_holds(&self) -> Vec<VenueTradeHold> {
         Vec::new()
     }

@@ -135,10 +135,6 @@ pub struct MarketView<'a> {
 }
 
 impl<'a> MarketView<'a> {
-    pub fn uses_venue_holds(&self) -> bool {
-        self.fill_model.uses_venue_holds()
-    }
-
     pub fn venue_trade_holds(&self) -> Vec<cs2_arb_sim::venues::VenueTradeHold> {
         self.fill_model.venue_trade_holds()
     }
@@ -223,6 +219,10 @@ pub trait StrategyAdapter {
     /// Unique name, used for the per-strategy breakdown.
     fn name(&self) -> &str;
 
+    fn validate(&self, _fill_model: &dyn FillModel) -> Result<()> {
+        Ok(())
+    }
+
     /// Decide on simulated orders for this step. Buys fill on `order.platform`
     /// against the latest quote; sells consume this strategy's unlocked
     /// positions for the same item and float bucket in FIFO order.
@@ -297,6 +297,7 @@ impl<F: FillModel> Backtester<F> {
                     strategy.name()
                 )));
             }
+            strategy.validate(&self.fill_model)?;
         }
         if let Some(bad) = snapshots.iter().find(|s| s.price.0 < 0) {
             return Err(Error::InvalidData(format!(
@@ -1380,6 +1381,47 @@ mod tests {
                 assert_eq!(report.trade_hold_secs, 7 * 86_400);
             }
         }
+    }
+
+    #[test]
+    fn spread_rejects_invalid_venue_drift_before_any_replay_tick() {
+        use crate::integrated::{MarketDepth, SimFillModel, SpreadAdapter};
+        use cs2_arb_sim::venues::{VenueAccounts, VenueAccountsConfig, VenueConfig};
+        use cs2_arb_strategy::{KillSwitch, RiskLimits, SpreadConfig};
+
+        let depth = MarketDepth::default();
+        let model = SimFillModel::new(&depth, fees(), RiskLimits::default(), KillSwitch::new())
+            .with_venue_accounts(VenueAccounts::new(
+                VenueAccountsConfig {
+                    venues: [(
+                        Platform::CsFloat,
+                        VenueConfig {
+                            starting_cash: Money(5_000),
+                            trade_hold_seconds: 10 * 86_400,
+                            sale_balance_hold_seconds: 0,
+                            transfer_in_seconds: 0,
+                            transfer_out_seconds: 0,
+                        },
+                    )]
+                    .into(),
+                    transfers: vec![],
+                },
+                fees(),
+            ));
+        let error = Backtester::with_fill_model(BacktestConfig::new(fees()), model)
+            .run(
+                SimulationMode,
+                &[],
+                &[],
+                &mut [Box::new(SpreadAdapter::new(SpreadConfig {
+                    price_drift_pct_per_day: 10.0,
+                    ..SpreadConfig::default()
+                }))],
+            )
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidConfig(message)
+            if message.contains("csfloat venue hold (864000 seconds)")
+            && message.contains("total drift over the hold must be below 100%")));
     }
 
     #[test]

@@ -23,6 +23,11 @@ pub enum FillOutcome {
 /// Pluggable simulated execution. The real `cs2-arb-sim` can be adapted to this
 /// trait at integration time (for example by synthesizing a `Listing` from the quote).
 pub trait FillModel {
+    /// Schedule an order without changing inventory, cash, or risk.
+    fn schedule_fill(&self, _strategy: &str, now: DateTime<Utc>) -> DateTime<Utc> {
+        now
+    }
+
     fn uses_venue_holds(&self) -> bool {
         false
     }

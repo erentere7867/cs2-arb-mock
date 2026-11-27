@@ -1,7 +1,7 @@
 //! Deterministic historical replay of price snapshots and market events through
 //! one or more strategies and a simulated fill model.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use chrono::{DateTime, Duration, Utc};
 use cs2_arb_core::{
@@ -242,6 +242,7 @@ struct Lot {
 #[derive(Default)]
 struct Book {
     lots: Vec<Lot>,
+    pending: BTreeMap<DateTime<Utc>, Vec<Order>>,
     next_position: u64,
     trades: Vec<TradeRecord>,
     submitted: u32,
@@ -319,7 +320,9 @@ impl<F: FillModel> Backtester<F> {
         let first = times.first().copied();
         let last = times.last().copied();
 
-        for now in times {
+        let market_times = times.clone();
+        while let Some(now) = times.pop_first() {
+            let market_tick = market_times.contains(&now);
             let end = start
                 + snapshots[start..]
                     .iter()
@@ -330,7 +333,7 @@ impl<F: FillModel> Backtester<F> {
                 latest.insert(QuoteKey::of(snapshot), snapshot.clone());
             }
             let first_new_event = delivered;
-            while delivered < events.len() && event_time(&events[delivered]) <= now {
+            while market_tick && delivered < events.len() && event_time(&events[delivered]) <= now {
                 delivered += 1;
             }
 
@@ -350,32 +353,37 @@ impl<F: FillModel> Backtester<F> {
                     fill_model: &self.fill_model,
                 };
                 self.fill_model.prepare_step(strategy.name(), &view)?;
+                for order in book.pending.remove(&now).into_iter().flatten() {
+                    self.book_execution(strategy.as_mut(), book, &order, &view)?;
+                }
+                if !market_tick {
+                    continue;
+                }
+                let positions: Vec<_> = book.lots.iter().map(|lot| lot.position.clone()).collect();
+                let view = MarketView {
+                    positions: &positions,
+                    ..view
+                };
                 let orders = strategy.on_step(&view)?;
                 for order in orders {
                     book.submitted += 1;
-                    match self.execute(strategy.name(), book, &order, &latest, now)? {
-                        Ok(fill) => {
-                            self.fill_model.after_fill(strategy.name(), &view, &fill)?;
-                            book.filled += 1;
-                            tracing::debug!(
-                                strategy = strategy.name(),
-                                order = %order.id,
-                                side = ?order.side,
-                                price = fill.unit_price.0,
-                                "simulated fill"
-                            );
-                            strategy.on_fill(&fill);
+                    if book.pending.values().flatten().any(|pending| {
+                        pending.side == order.side
+                            && pending.item == order.item
+                            && pending.float_bucket == order.float_bucket
+                    }) {
+                        book.rejected += 1;
+                        strategy.on_reject(&order, "another order for this item is pending");
+                        continue;
+                    }
+                    let at = self.fill_model.schedule_fill(strategy.name(), now);
+                    if at > now {
+                        book.pending.entry(at).or_default().push(order);
+                        if Some(at) <= last {
+                            times.insert(at);
                         }
-                        Err(reason) => {
-                            book.rejected += 1;
-                            tracing::debug!(
-                                strategy = strategy.name(),
-                                order = %order.id,
-                                %reason,
-                                "simulated order rejected"
-                            );
-                            strategy.on_reject(&order, &reason);
-                        }
+                    } else {
+                        self.book_execution(strategy.as_mut(), book, &order, &view)?;
                     }
                 }
             }
@@ -396,6 +404,29 @@ impl<F: FillModel> Backtester<F> {
             events_total: events.len() as u32,
         };
         self.build_report(window, strategies, &books, &latest)
+    }
+
+    fn book_execution(
+        &self,
+        strategy: &mut dyn StrategyAdapter,
+        book: &mut Book,
+        order: &Order,
+        view: &MarketView<'_>,
+    ) -> Result<()> {
+        match self.execute(strategy.name(), book, order, view.latest, view.now)? {
+            Ok(fill) => {
+                self.fill_model.after_fill(strategy.name(), view, &fill)?;
+                book.filled += 1;
+                tracing::debug!(strategy = strategy.name(), order = %order.id, side = ?order.side, price = fill.unit_price.0, "simulated fill");
+                strategy.on_fill(&fill);
+            }
+            Err(reason) => {
+                book.rejected += 1;
+                tracing::debug!(strategy = strategy.name(), order = %order.id, %reason, "simulated order rejected");
+                strategy.on_reject(order, &reason);
+            }
+        }
+        Ok(())
     }
 
     /// Outer `Result` is a hard error; inner `Err` is a rejection reason.
@@ -1053,6 +1084,52 @@ mod tests {
             }));
         }
         depth
+    }
+
+    #[test]
+    fn cli_latency_executes_at_the_due_tick_and_leaves_late_orders_pending() {
+        use crate::integrated::SimFillModel;
+        use cs2_arb_sim::{FillLatency, SimConfig};
+        use cs2_arb_strategy::{KillSwitch, RiskLimits};
+
+        let rows = [
+            (snap(Platform::CsFloat, 0, 1000), 1, 70),
+            (snap(Platform::CsFloat, 1, 1000), 1, 70),
+        ];
+        let depth = depth_with_snapshots(&rows);
+        let latency = Duration::seconds(3);
+        let log = std::rc::Rc::default();
+        let model = SimFillModel::new(&depth, fees(), RiskLimits::default(), KillSwitch::new())
+            .with_sim_config(SimConfig {
+                fill_latency: FillLatency {
+                    min: latency,
+                    max: latency,
+                },
+                ..SimConfig::default()
+            });
+        let report = Backtester::with_fill_model(BacktestConfig::new(fees()), model)
+            .run(
+                SimulationMode,
+                &rows.map(|(q, _, _)| q),
+                &[],
+                &mut [Box::new(Scripted {
+                    name: "s".into(),
+                    script: (0..=1)
+                        .map(|day| (day, order(OrderSide::Buy, Platform::CsFloat, 1, 1000, day)))
+                        .collect(),
+                    log: std::rc::Rc::clone(&log),
+                })],
+            )
+            .unwrap();
+        let log = log.borrow();
+        assert_eq!(log.fills.len(), 1);
+        assert_eq!(log.fills[0].filled_at, t(0) + latency);
+        assert!(log.rejects.is_empty());
+        assert_eq!(report.window.end, Some(t(1)));
+        assert_eq!(report.window.steps, 3);
+        assert_eq!(report.totals.orders_submitted, 2);
+        assert_eq!(report.totals.orders_filled, 1);
+        assert_eq!(report.totals.open_positions, 1);
     }
 
     #[test]

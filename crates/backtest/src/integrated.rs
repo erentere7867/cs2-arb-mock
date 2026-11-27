@@ -167,6 +167,15 @@ impl<'a> SimFillModel<'a> {
 }
 
 impl FillModel for SimFillModel<'_> {
+    fn schedule_fill(&self, strategy: &str, now: DateTime<Utc>) -> DateTime<Utc> {
+        self.sessions
+            .borrow_mut()
+            .get_mut(strategy)
+            .expect("strategy prepared")
+            .executor
+            .sample_fill_time(now)
+    }
+
     fn uses_venue_holds(&self) -> bool {
         self.venue_accounts.is_some()
     }
@@ -223,7 +232,8 @@ impl FillModel for SimFillModel<'_> {
                 clock.clone(),
                 730,
             )?
-            .with_order_fees(self.fees.clone());
+            .with_order_fees(self.fees.clone())
+            .with_replay_scheduling();
             if let Some(accounts) = &self.venue_accounts {
                 executor.set_venue_accounts(accounts.clone());
             }
@@ -356,7 +366,6 @@ impl StrategyAdapter for SpreadAdapter {
     }
 
     fn on_step(&mut self, view: &MarketView<'_>) -> Result<Vec<Order>> {
-        self.pending.clear();
         let mut occupied = occupied_keys(view.positions);
         self.targets.retain(|key, _| occupied.contains(key));
         let mut orders = Vec::new();
@@ -449,6 +458,10 @@ impl StrategyAdapter for SpreadAdapter {
             self.targets
                 .insert((fill.order.item.clone(), fill.order.float_bucket), target);
         }
+    }
+
+    fn on_reject(&mut self, order: &Order, _reason: &str) {
+        self.pending.remove(&order.id);
     }
 }
 

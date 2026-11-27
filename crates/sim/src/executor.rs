@@ -51,6 +51,7 @@ pub struct MockExecutor {
     order_fees: Option<FeeSchedules>,
     clock: Arc<dyn Clock>,
     rng: SplitMix64,
+    replay_schedules_fills: bool,
     book: MarketBook,
     portfolio: Portfolio,
     filled_order_ids: HashSet<String>,
@@ -95,6 +96,7 @@ impl MockExecutor {
             order_fees: None,
             clock,
             rng: SplitMix64::new(seed),
+            replay_schedules_fills: false,
             book: MarketBook::new(),
             filled_order_ids: HashSet::new(),
             rejections: Vec::new(),
@@ -103,6 +105,12 @@ impl MockExecutor {
 
     pub fn config(&self) -> &SimConfig {
         &self.config
+    }
+
+    /// Execute at the current replay clock; the replay schedules orders before submitting them.
+    pub fn with_replay_scheduling(mut self) -> Self {
+        self.replay_schedules_fills = true;
+        self
     }
 
     pub fn fees(&self) -> &PlatformFees {
@@ -333,11 +341,19 @@ impl MockExecutor {
         now - listing.observed_at > self.config.max_listing_age
     }
 
-    fn fill_time(&mut self, now: DateTime<Utc>) -> DateTime<Utc> {
+    pub fn sample_fill_time(&mut self, now: DateTime<Utc>) -> DateTime<Utc> {
         let latency = self.config.fill_latency;
         let span_ms = (latency.max - latency.min).num_milliseconds().max(0) as u64;
         let offset = self.rng.below(span_ms.saturating_add(1)) as i64;
         now + latency.min + TimeDelta::milliseconds(offset)
+    }
+
+    fn fill_time(&mut self, now: DateTime<Utc>) -> DateTime<Utc> {
+        if self.replay_schedules_fills {
+            now
+        } else {
+            self.sample_fill_time(now)
+        }
     }
 
     fn buy_level(

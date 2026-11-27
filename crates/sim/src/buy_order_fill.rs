@@ -354,7 +354,11 @@ impl BuyOrderFillSimulator {
 
             // A single historical/live sale print represents one traded skin unit.
             let fill_qty = 1u32;
-            let Ok(fees) = self.fees.get(order.platform).buy(order.limit_price, fill_qty) else {
+            let Ok(fees) = self
+                .fees
+                .get(order.platform)
+                .buy(order.limit_price, fill_qty)
+            else {
                 continue;
             };
 

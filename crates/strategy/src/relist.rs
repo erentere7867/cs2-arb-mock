@@ -387,7 +387,8 @@ impl RelistEngine {
     /// Sorted unique `locked_until` timestamps strictly before `now` for items
     /// still in [`InventoryStatus::Locked`].
     pub fn pending_unlocks_before(&self, now: DateTime<Utc>) -> Vec<DateTime<Utc>> {
-        let mut times: std::collections::BTreeSet<DateTime<Utc>> = std::collections::BTreeSet::new();
+        let mut times: std::collections::BTreeSet<DateTime<Utc>> =
+            std::collections::BTreeSet::new();
         for item in self.items.values() {
             if let InventoryStatus::Locked { locked_until } = item.status {
                 if locked_until < now {

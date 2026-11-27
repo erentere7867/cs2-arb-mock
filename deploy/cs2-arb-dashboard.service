@@ -1,6 +1,7 @@
 [Unit]
 Description=Read-only mock market dashboard
 After=network.target
+ConditionFileIsExecutable=/home/ubuntu/cs2-arb-mock-data/current/cs2-arb-dashboard
 
 [Service]
 User=ubuntu

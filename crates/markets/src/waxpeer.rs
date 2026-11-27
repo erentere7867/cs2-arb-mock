@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -33,13 +33,15 @@ const DETAILED_BUY_ORDERS: Endpoint = Endpoint {
     name: "waxpeer.detailed_buy_orders",
     path: "/v2/buy-orders",
 };
+const BID_PAGE_SIZE: usize = 100;
+const MAX_BID_PAGES: usize = 3;
 
-fn parse_detailed_bids(
+fn add_detailed_bid_page(
     body: &[u8],
     item: &ItemId,
     game: &str,
-    at: DateTime<Utc>,
-) -> Result<Vec<BuyOrder>> {
+    owners: &mut HashMap<String, Money>,
+) -> Result<usize> {
     #[derive(Deserialize)]
     struct Response {
         success: bool,
@@ -62,8 +64,7 @@ fn parse_detailed_bids(
             "Waxpeer detailed buy orders unavailable".into(),
         ));
     }
-    let mut owners = HashSet::new();
-    let mut depth = BTreeMap::<Money, u32>::new();
+    let count = response.orders.len();
     for bid in response.orders {
         if bid.name != item.market_hash_name
             || bid.game != game
@@ -74,11 +75,26 @@ fn parse_detailed_bids(
             continue;
         }
         let price = bid.price.cents(false)?;
-        if price.0 > 0 && owners.insert(bid.by) {
-            *depth.entry(price).or_default() += 1;
+        if price.0 > 0 {
+            owners
+                .entry(bid.by)
+                .and_modify(|old| *old = (*old).max(price))
+                .or_insert(price);
         }
     }
-    Ok(depth
+    Ok(count)
+}
+
+fn detailed_depth(
+    owners: HashMap<String, Money>,
+    item: &ItemId,
+    at: DateTime<Utc>,
+) -> Vec<BuyOrder> {
+    let mut depth = BTreeMap::<Money, u32>::new();
+    for price in owners.into_values() {
+        *depth.entry(price).or_default() += 1;
+    }
+    depth
         .into_iter()
         .rev()
         .map(|(price, quantity)| BuyOrder {
@@ -89,7 +105,7 @@ fn parse_detailed_bids(
             quantity,
             observed_at: at,
         })
-        .collect())
+        .collect()
 }
 
 type Listings = Arc<HashMap<String, Vec<Ask>>>;
@@ -312,17 +328,27 @@ impl MarketClient for WaxpeerClient {
                 return Ok(Vec::new());
             };
             let game = self.game_code();
-            let query = query_string(&[
-                ("api", api_key.as_str()),
-                ("name", item.market_hash_name.as_str()),
-                ("game", game),
-            ]);
-            let path = format!("{}?{query}", DETAILED_BUY_ORDERS.path);
-            let body = self
-                .http
-                .get(&DETAILED_BUY_ORDERS, &path, HeaderMap::new())
-                .await?;
-            return parse_detailed_bids(&body, item, game, self.http.clock().now());
+            let observed_at = self.http.clock().now();
+            let mut owners = HashMap::new();
+            for page in 0..MAX_BID_PAGES {
+                let skip = (page * BID_PAGE_SIZE).to_string();
+                let query = query_string(&[
+                    ("api", api_key.as_str()),
+                    ("name", item.market_hash_name.as_str()),
+                    ("game", game),
+                    ("skip", skip.as_str()),
+                ]);
+                let path = format!("{}?{query}", DETAILED_BUY_ORDERS.path);
+                let body = self
+                    .http
+                    .get(&DETAILED_BUY_ORDERS, &path, HeaderMap::new())
+                    .await?;
+                let rows = add_detailed_bid_page(&body, item, game, &mut owners)?;
+                if rows < BID_PAGE_SIZE || owners.len() >= BID_PAGE_SIZE {
+                    break;
+                }
+            }
+            return Ok(detailed_depth(owners, item, observed_at));
         }
         let bids = self.fetch(&BUY_ORDERS, &self.bids, parse_bids).await?;
         Ok(bids
@@ -361,7 +387,12 @@ mod tests {
           {"name":"Alien Red","game":"rust","price":12349,"amount":2,"filled":1,"by":"two"},
           {"name":"Alien Red","game":"rust","price":12000,"amount":4,"filled":1,"filters":null,"by":"one"}
         ]}"#;
-        let bids = parse_detailed_bids(body, &item, "rust", DateTime::<Utc>::UNIX_EPOCH).unwrap();
+        let mut owners = HashMap::new();
+        assert_eq!(
+            add_detailed_bid_page(body, &item, "rust", &mut owners).unwrap(),
+            4
+        );
+        let bids = detailed_depth(owners, &item, DateTime::<Utc>::UNIX_EPOCH);
         assert_eq!(bids.len(), 1);
         assert_eq!(bids[0].quantity, 2);
         assert_eq!(bids[0].price, Money(1234));

@@ -10,6 +10,51 @@ use wiremock::matchers::{method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 #[tokio::test]
+async fn detailed_bids_page_past_filtered_depth_on_get() {
+    let server = MockServer::start().await;
+    let filtered = json!({"name":"Alien Red","game":"rust","price":14000,"amount":1,"filled":0,"filters":{"float_min":0.1},"by":"filtered"});
+    let first_page: Vec<_> = std::iter::repeat_n(filtered, 100).collect();
+    for (skip, rows) in [
+        ("0", first_page),
+        (
+            "100",
+            vec![
+                json!({"name":"Alien Red","game":"rust","price":12500,"amount":5,"filled":0,"by":"owner"}),
+            ],
+        ),
+    ] {
+        Mock::given(method("GET"))
+            .and(path("/v2/buy-orders"))
+            .and(query_param("name", "Alien Red"))
+            .and(query_param("game", "rust"))
+            .and(query_param("skip", skip))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"success":true,"orders":rows})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+    let client = WaxpeerClient::with_base_url(
+        fees(),
+        Game::Rust,
+        &server.uri(),
+        Arc::new(NoopGate),
+        clock(),
+    )
+    .unwrap()
+    .with_detailed_buy_orders(Some("fixture-api-key".into()));
+    let item = ItemId {
+        market_hash_name: "Alien Red".into(),
+        wear_tier: WearTier::NotApplicable,
+    };
+    let bids = client.top_buy_orders(&item).await.unwrap();
+    assert_eq!(bids.len(), 1);
+    assert_eq!(bids[0].price, Money(1250));
+    assert_eq!(bids[0].quantity, 1);
+}
+
+#[tokio::test]
 async fn snapshots_are_get_only_cached_and_game_specific() {
     let server = MockServer::start().await;
     for (game, code, name, tier) in [

@@ -39,6 +39,10 @@ pub struct DipConfig {
     pub volume_multiplier: f64,
     /// Reject quotes more than this percentage below the rolling mean. Default 30.
     pub max_drop_pct: f64,
+    /// Liquidate unlocked lots if the current market median falls more than this far below cost.
+    pub stop_loss_pct: f64,
+    /// Liquidate unlocked lots at this age, measured from the buy fill.
+    pub max_hold_days: i64,
     /// Count only sales flagged `verified`. Default true.
     pub require_verified_sales: bool,
     /// Units per signal. Default 1.
@@ -63,6 +67,8 @@ impl Default for DipConfig {
             min_sales_in_window: 10,
             volume_multiplier: 1.5,
             max_drop_pct: 30.0,
+            stop_loss_pct: 25.0,
+            max_hold_days: 21,
             require_verified_sales: true,
             quantity: 1,
             branch_update_window_hours: None,
@@ -89,6 +95,12 @@ impl DipConfig {
         }
         if !self.max_drop_pct.is_finite() || !(0.0..100.0).contains(&self.max_drop_pct) {
             return bad("max_drop_pct must be finite and in [0, 100)");
+        }
+        if !self.stop_loss_pct.is_finite() || !(0.0..100.0).contains(&self.stop_loss_pct) {
+            return bad("stop_loss_pct must be finite and in [0, 100)");
+        }
+        if self.max_hold_days <= 0 || Duration::try_days(self.max_hold_days).is_none() {
+            return bad("max_hold_days must be positive and representable");
         }
         if self.quantity == 0 {
             return bad("quantity must be >= 1");

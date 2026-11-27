@@ -47,7 +47,7 @@ impl StrategyAdapter for SpreadStrategy {
     fn on_step(&mut self, view: &MarketView<'_>) -> Result<Vec<Order>> {
         let name = self.name.clone();
         let counter = &mut self.next_id;
-        let mut orders = exit_orders(view, self.exit, || Self::next_id(&name, counter))?;
+        let mut orders = exit_orders(view, self.exit, |_| false, || Self::next_id(&name, counter))?;
 
         let mut seen = Vec::new();
         for snapshot in view.batch {

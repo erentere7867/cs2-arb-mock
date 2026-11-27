@@ -16,6 +16,9 @@ an emergency kill switch.
   at least 10 verified sales occurred on the quoting venue over seven days at 1.5×
   the preceding 30-day sales rate, and an update/panic window is active.
   `dip::evaluate_dip` is a batch helper.
+- Dip replay adapters liquidate unlocked lots when the median of fresh quotes falls
+  more than `stop_loss_pct` below per-unit cost basis or the lot reaches `max_hold_days`.
+  Defaults are 25% and 21 days from purchase; liquidation still requires an executable offer.
 - `risk::RiskManager` enforces position, item and total exposure limits, halts entries for
   the rest of the UTC day once the intraday drawdown reaches the cap, and consults
   `kill_switch::KillSwitch` (AtomicBool, `KILL_SWITCH` file, `KILL_SWITCH` env) to block

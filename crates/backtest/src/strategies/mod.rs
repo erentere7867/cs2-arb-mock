@@ -6,11 +6,12 @@
 mod dip;
 mod spread;
 
+pub(crate) use dip::DipLiquidations;
 pub use dip::DipStrategy;
 pub use spread::SpreadStrategy;
 
 use chrono::Duration;
-use cs2_arb_core::{Money, Order, OrderSide, Result};
+use cs2_arb_core::{Money, Order, OrderSide, Position, Result};
 
 use crate::replay::MarketView;
 
@@ -31,6 +32,7 @@ pub struct ExitRule {
 pub(crate) fn exit_orders(
     view: &MarketView<'_>,
     rule: ExitRule,
+    should_liquidate: impl Fn(&Position) -> bool,
     mut next_id: impl FnMut() -> String,
 ) -> Result<Vec<Order>> {
     let mut orders = Vec::new();
@@ -52,7 +54,7 @@ pub(crate) fn exit_orders(
         };
         let target = position.cost_basis.0 as f64 * (1.0 + rule.take_profit_pct / 100.0);
         let expired = view.now - position.acquired_at >= rule.max_hold;
-        if net.0 as f64 >= target || expired {
+        if net.0 as f64 >= target || expired || should_liquidate(position) {
             orders.push(Order {
                 id: next_id(),
                 side: OrderSide::Sell,

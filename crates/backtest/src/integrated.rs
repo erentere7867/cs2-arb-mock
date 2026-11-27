@@ -16,6 +16,7 @@ use cs2_arb_strategy::{
     SubmitError,
 };
 
+use crate::strategies::DipLiquidations;
 use crate::{FillModel, FillOutcome, MarketView, QuoteKey, StrategyAdapter};
 
 type PositionKey = (ItemId, Option<FloatBucket>);
@@ -518,13 +519,17 @@ impl StrategyAdapter for SpreadAdapter {
 
 pub struct DipAdapter {
     detector: DipDetector,
+    liquidations: DipLiquidations,
 }
 
 impl DipAdapter {
     pub fn new(config: DipConfig, depth: &MarketDepth) -> Result<Self> {
         let mut detector = DipDetector::new(config)?;
         detector.record_sales(depth.sales());
-        Ok(Self { detector })
+        Ok(Self {
+            detector,
+            liquidations: DipLiquidations::default(),
+        })
     }
 
     pub fn seed_daily_sale_prices(&mut self, sales: &[Sale], first_quote: DateTime<Utc>) {
@@ -572,22 +577,46 @@ impl StrategyAdapter for DipAdapter {
         }
         let mut occupied = occupied_keys(view.positions);
         let mut orders = Vec::new();
+        let config = self.detector.config();
+        self.liquidations.update(
+            view,
+            config.stop_loss_pct,
+            Duration::days(config.max_hold_days),
+        );
         for position in view
             .positions
             .iter()
             .filter(|p| !p.is_trade_locked_at(view.now))
         {
             let mut best = None;
+            let liquidate = self.liquidations.contains(position);
             for quote in view.quotes_for(&position.item, position.float_bucket) {
-                if let Some((order, profit)) =
-                    profitable_exit(view, self.name(), position, quote, quote.price)?
-                {
-                    if best.as_ref().is_none_or(|(_, previous)| profit > *previous) {
-                        best = Some((order, profit));
+                let Some((order, proceeds, profit)) =
+                    executable_exit(view, self.name(), position, quote, quote.price)?
+                else {
+                    continue;
+                };
+                if liquidate {
+                    if proceeds.0 <= 0 {
+                        continue;
                     }
+                } else if profit.0 <= 0 {
+                    continue;
+                }
+                let better = |previous: &(Order, Money, Money)| {
+                    if liquidate {
+                        let current_unit = i128::from(proceeds.0) * i128::from(previous.0.quantity);
+                        let previous_unit = i128::from(previous.1 .0) * i128::from(order.quantity);
+                        (current_unit, order.quantity) > (previous_unit, previous.0.quantity)
+                    } else {
+                        profit > previous.2
+                    }
+                };
+                if best.as_ref().is_none_or(better) {
+                    best = Some((order, proceeds, profit));
                 }
             }
-            if let Some((order, _)) = best {
+            if let Some((order, _, _)) = best {
                 orders.push(order);
             }
         }
@@ -630,6 +659,17 @@ fn profitable_exit(
     quote: &PriceSnapshot,
     price: Money,
 ) -> Result<Option<(Order, Money)>> {
+    Ok(executable_exit(view, strategy, position, quote, price)?
+        .and_then(|(order, _, profit)| (profit.0 > 0).then_some((order, profit))))
+}
+
+fn executable_exit(
+    view: &MarketView<'_>,
+    strategy: &str,
+    position: &Position,
+    quote: &PriceSnapshot,
+    price: Money,
+) -> Result<Option<(Order, Money, Money)>> {
     if !view.quote_is_fresh(quote) || price.0 <= 0 {
         return Ok(None);
     }
@@ -645,7 +685,7 @@ fn profitable_exit(
         .seller_order_proceeds(price, quantity)?;
     let profit = proceeds.checked_sub(Money(released as i64))?;
     order.quantity = quantity;
-    Ok((profit.0 > 0).then_some((order, profit)))
+    Ok(Some((order, proceeds, profit)))
 }
 
 fn occupied_keys(positions: &[Position]) -> HashSet<PositionKey> {

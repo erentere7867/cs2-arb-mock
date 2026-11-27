@@ -1320,6 +1320,100 @@ mod tests {
     }
 
     #[test]
+    fn dip_liquidates_after_unlock_on_a_median_stop_or_maximum_age() {
+        use crate::integrated::{DipAdapter, SimFillModel};
+        use cs2_arb_strategy::{DipConfig, KillSwitch, RiskLimits};
+
+        for (max_hold_days, day_10_price, blocked, basic_exit, integrated_exit) in [
+            (21, 650, false, 10, 10),
+            (9, 750, false, 11, 11),
+            (21, 650, true, 10, 11),
+        ] {
+            let snapshots = [
+                snap(Platform::CsFloat, 0, 999),
+                snap(Platform::CsFloat, 1, 1001),
+                snap(Platform::CsFloat, 2, 900),
+                snap(Platform::CsFloat, 8, 500),
+                snap(Platform::CsFloat, 9, 675),
+                snap(Platform::CsFloat, 10, day_10_price),
+                snap(Platform::Waxpeer, 10, day_10_price + 50),
+                snap(Platform::DMarket, 10, day_10_price - 50),
+                snap(Platform::CsFloat, 11, 750),
+                snap(Platform::Waxpeer, 11, 800),
+                snap(Platform::DMarket, 11, 700),
+            ];
+            let rows = snapshots.clone().map(|quote| {
+                let sales = if blocked && (t(8)..=t(10)).contains(&quote.observed_at) {
+                    0
+                } else {
+                    70
+                };
+                (quote, 1, sales)
+            });
+            let mut depth = depth_with_snapshots(&rows);
+            add_dip_baseline_sale(&mut depth);
+            let config = DipConfig {
+                min_samples: 2,
+                min_sales_in_window: 1,
+                max_hold_days,
+                ..DipConfig::default()
+            };
+            let fees = FeeSchedules {
+                skinport: FeeSchedule::default(),
+                csfloat: FeeSchedule::default(),
+                dmarket: FeeSchedule::default(),
+                waxpeer: FeeSchedule {
+                    seller_fee_pct: 20.0,
+                    ..FeeSchedule::default()
+                },
+            };
+            let events = [
+                MarketEvent::PanicWindowOpened {
+                    branch: "test".into(),
+                    opened_at: t(2),
+                },
+                MarketEvent::PanicWindowClosed {
+                    branch: "test".into(),
+                    closed_at: t(3),
+                },
+            ];
+            let model = SimFillModel::new(
+                &depth,
+                fees.clone(),
+                RiskLimits::default(),
+                KillSwitch::new(),
+            );
+            let basic = Backtester::new(BacktestConfig::new(fees.clone()))
+                .run(
+                    SimulationMode,
+                    &snapshots,
+                    &events,
+                    &mut [Box::new(
+                        DipStrategy::with_sales(config.clone(), depth.sales()).unwrap(),
+                    )],
+                )
+                .unwrap();
+            let integrated = Backtester::with_fill_model(BacktestConfig::new(fees), model)
+                .run(
+                    SimulationMode,
+                    &snapshots,
+                    &events,
+                    &mut [Box::new(DipAdapter::new(config, &depth).unwrap())],
+                )
+                .unwrap();
+            for (report, expected_exit) in [(basic, basic_exit), (integrated, integrated_exit)] {
+                assert_eq!(report.trades.len(), 1);
+                let trade = &report.trades[0];
+                assert_eq!(trade.opened_at, t(2));
+                assert_eq!(trade.locked_until, t(9));
+                assert_eq!(trade.closed_at, t(expected_exit));
+                assert_eq!(trade.sell_platform, Platform::CsFloat);
+                assert!(trade.net_pnl.0 < 0);
+            }
+        }
+    }
+
+    #[test]
     fn default_spread_exits_at_unlock_even_when_the_edge_has_disappeared() {
         let snapshots = [
             snap(Platform::CsFloat, 0, 1000),

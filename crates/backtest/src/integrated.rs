@@ -477,7 +477,11 @@ impl StrategyAdapter for SpreadAdapter {
             } else {
                 candidate
             };
-            if candidate.expected_net_profit > self.config.min_net_profit.max(Money(0)) {
+            let required = self
+                .config
+                .required_net_profit(candidate.buy_cost, candidate.hold)?
+                .max(Money(0));
+            if candidate.expected_net_profit > required {
                 executable.push((actual.is_some(), candidate));
             }
         }

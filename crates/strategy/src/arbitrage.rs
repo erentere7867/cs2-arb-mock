@@ -8,7 +8,11 @@
 //! * the opportunity cost of the locked capital: `buy_cost * annual_rate * hold_days / 365`,
 //! * and an optional adverse price drift over the hold applied to the sale price,
 //!
-//! is strictly greater than [`SpreadConfig::min_net_profit`].
+//! is strictly greater than [`SpreadConfig::required_net_profit`]: the larger of the
+//! absolute floor `min_net_profit` and a percentage hurdle on the buy cost. The hurdle is
+//! `min_net_margin_pct` plus `risk_sigma_multiple` standard deviations of the price move
+//! expected over the hold (`daily_volatility_pct * sqrt(hold_days)`). Opportunity cost
+//! prices the capital; the hurdle prices the risk that the exit moves while it is locked.
 
 use std::collections::HashMap;
 
@@ -34,6 +38,14 @@ pub struct SpreadConfig {
     pub price_drift_pct_per_day: f64,
     /// Accept only when expected net profit (for `quantity` units) is strictly above this.
     pub min_net_profit: Money,
+    /// Minimum expected net margin on the buy cost, in percentage points. Default 0.
+    pub min_net_margin_pct: f64,
+    /// Typical one-day standard deviation of the item's price, in percentage points.
+    /// Scaled by the square root of the hold to size the risk hurdle. Default 0.
+    pub daily_volatility_pct: f64,
+    /// Standard deviations of hold-period price risk the expected margin must clear on top
+    /// of `min_net_margin_pct`. Default 0 (no risk hurdle).
+    pub risk_sigma_multiple: f64,
     /// Cents to list below the sell-side reference price to get filled. Default 0.
     pub sell_undercut: Money,
     /// Units per opportunity. Default 1.
@@ -50,6 +62,9 @@ impl Default for SpreadConfig {
             annual_opportunity_rate_pct: 10.0,
             price_drift_pct_per_day: 0.0,
             min_net_profit: Money(50),
+            min_net_margin_pct: 0.0,
+            daily_volatility_pct: 0.0,
+            risk_sigma_multiple: 0.0,
             sell_undercut: Money(0),
             quantity: 1,
             max_quote_age_secs: Some(3600),
@@ -88,6 +103,17 @@ impl SpreadConfig {
         if self.price_drift_pct_per_day * hold_days >= 100.0 {
             return bad("total drift over the hold must be below 100%");
         }
+        for (name, value) in [
+            ("min_net_margin_pct", self.min_net_margin_pct),
+            ("daily_volatility_pct", self.daily_volatility_pct),
+            ("risk_sigma_multiple", self.risk_sigma_multiple),
+        ] {
+            if !value.is_finite() || value < 0.0 {
+                return Err(Error::InvalidConfig(format!(
+                    "spread: {name} must be finite and >= 0"
+                )));
+            }
+        }
         if self.sell_undercut.0 < 0 {
             return bad("sell_undercut must be >= 0");
         }
@@ -103,6 +129,26 @@ impl SpreadConfig {
     /// Fraction of capital charged over the hold: `rate/100 * hold_days / 365`.
     pub fn opportunity_cost_fraction(&self) -> f64 {
         self.annual_opportunity_rate_pct / 100.0 * f64::from(self.hold_days) / 365.0
+    }
+
+    /// Hurdle on the buy cost, in percentage points, for a hold of `hold`:
+    /// `min_net_margin_pct + risk_sigma_multiple * daily_volatility_pct * sqrt(hold_days)`.
+    pub fn required_margin_pct(&self, hold: Duration) -> f64 {
+        let hold_days = (hold.num_seconds() as f64 / 86_400.0).max(0.0);
+        self.min_net_margin_pct
+            + self.risk_sigma_multiple * self.daily_volatility_pct * hold_days.sqrt()
+    }
+
+    /// Smallest expected net profit an opportunity must strictly exceed: the larger of
+    /// `min_net_profit` and the percentage hurdle applied to `buy_cost` (rounded up).
+    /// With no hurdle configured this is exactly `min_net_profit`, which may be negative.
+    pub fn required_net_profit(&self, buy_cost: Money, hold: Duration) -> Result<Money> {
+        let pct = self.required_margin_pct(hold);
+        if pct <= 0.0 {
+            return Ok(self.min_net_profit);
+        }
+        let hurdle = cents_ceil(buy_cost.0 as f64 * pct / 100.0)?;
+        Ok(hurdle.max(self.min_net_profit))
     }
 
     /// Fraction of the sale price lost to drift over the hold.
@@ -340,7 +386,9 @@ pub fn evaluate_spread_with_holds(
                 }
                 match spread_breakdown_with_hold(buy, sell, fees, config, hold(buy.platform)) {
                     Ok(breakdown)
-                        if breakdown.expected_net_profit > config.min_net_profit
+                        if config
+                            .required_net_profit(breakdown.buy_cost, breakdown.hold)
+                            .is_ok_and(|required| breakdown.expected_net_profit > required)
                             && (breakdown.expected_net_profit.0 > 0
                                 || (!fees.get(buy.platform).funding.enabled()
                                     && !fees.get(sell.platform).funding.enabled())) =>
@@ -427,9 +475,69 @@ mod tests {
             annual_opportunity_rate_pct: 10.0,
             price_drift_pct_per_day: 0.0,
             min_net_profit: Money(0),
+            min_net_margin_pct: 0.0,
+            daily_volatility_pct: 0.0,
+            risk_sigma_multiple: 0.0,
             sell_undercut: Money(0),
             quantity: 1,
             max_quote_age_secs: None,
+        }
+    }
+
+    #[test]
+    fn percentage_and_risk_hurdles_scale_with_cost_and_hold() {
+        // Same pair as the strict-threshold test: buy cost 10_000, net 220 (2.2%).
+        let mut config = cfg();
+        config.annual_opportunity_rate_pct = 36.5;
+        let quotes = [
+            quote(Platform::Skinport, 10_000),
+            quote(Platform::CsFloat, 10_500),
+        ];
+        let found =
+            |config: &SpreadConfig| evaluate_spread(&quotes, &fees(), config, t0()).unwrap();
+
+        config.min_net_margin_pct = 2.19; // Requires > 219.
+        assert_eq!(found(&config).len(), 1);
+        config.min_net_margin_pct = 2.2; // Requires > 220: strict, like min_net_profit.
+        assert!(found(&config).is_empty());
+
+        // One sigma of a 1%/day item over seven days is 1% * sqrt(7) = 2.6458%, i.e. 265
+        // on this cost: a 2.2% edge is inside the noise of the hold and is rejected.
+        config.min_net_margin_pct = 0.0;
+        config.daily_volatility_pct = 1.0;
+        config.risk_sigma_multiple = 1.0;
+        assert_eq!(
+            config
+                .required_net_profit(Money(10_000), Duration::days(7))
+                .unwrap(),
+            Money(265)
+        );
+        assert!(found(&config).is_empty());
+        config.risk_sigma_multiple = 0.8; // 0.8 * 2.6458% = 2.1166% -> 212 < 220.
+        assert_eq!(found(&config).len(), 1);
+
+        // The absolute floor still applies when it is the larger requirement.
+        config.min_net_profit = Money(500);
+        assert!(found(&config).is_empty());
+    }
+
+    #[test]
+    fn rejects_negative_or_non_finite_hurdles() {
+        for config in [
+            SpreadConfig {
+                min_net_margin_pct: -0.1,
+                ..cfg()
+            },
+            SpreadConfig {
+                daily_volatility_pct: f64::NAN,
+                ..cfg()
+            },
+            SpreadConfig {
+                risk_sigma_multiple: f64::INFINITY,
+                ..cfg()
+            },
+        ] {
+            assert!(config.validate().is_err(), "{config:?}");
         }
     }
 

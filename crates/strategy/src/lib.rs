@@ -24,8 +24,8 @@ pub use arbitrage::{
     SpreadBreakdown, SpreadConfig,
 };
 pub use dip::{
-    evaluate_dip, rolling_stats, DipConfig, DipDetector, DipEvaluation, DipSignal, EventWindows,
-    RollingStats,
+    evaluate_dip, robust_log_stats, rolling_stats, DipBaseline, DipConfig, DipDetector,
+    DipEvaluation, DipSignal, EventWindows, RollingStats,
 };
 pub use executor::{submit_with_risk, SimExecutor, SubmitError};
 pub use kill_switch::KillSwitch;

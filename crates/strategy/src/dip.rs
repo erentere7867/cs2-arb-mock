@@ -10,6 +10,12 @@
 //!    baseline sales rate by the configured multiplier;
 //! 3. an update/panic window derived from [`MarketEvent`]s is active at the observation time.
 //! 4. the price is no more than `max_drop_pct` below the mean.
+//!
+//! [`DipBaseline::RobustLog`] replaces the mean and sample standard deviation of raw
+//! observations with the median and scaled MAD of per-day median log prices. Skin prices
+//! move multiplicatively and carry outliers (sticker crafts, fat-finger listings), and raw
+//! observations over-weight whichever days were polled most; one log value per day fixes
+//! all three. The band is then `exp(median - k_sigma * 1.4826 * MAD)`.
 
 use std::collections::HashMap;
 
@@ -21,6 +27,21 @@ use cs2_arb_core::{
 use serde::Deserialize;
 
 use crate::{order_id, platform_slug};
+
+/// How the dip baseline summarizes prior prices.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DipBaseline {
+    /// Mean and sample standard deviation of every prior observation, in cents.
+    #[default]
+    Raw,
+    /// Median and 1.4826 * MAD of per-UTC-day median log prices. `min_samples` then
+    /// counts days, and a baseline with zero dispersion never signals.
+    RobustLog,
+}
+
+/// Scale factor that makes the median absolute deviation estimate a normal sigma.
+const MAD_TO_SIGMA: f64 = 1.4826;
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -55,6 +76,8 @@ pub struct DipConfig {
     /// Keep a separate baseline per platform (default true). When false, quotes for the
     /// same item and bucket on all platforms share one series.
     pub per_platform: bool,
+    /// Baseline statistic. Default [`DipBaseline::Raw`].
+    pub baseline: DipBaseline,
 }
 
 impl Default for DipConfig {
@@ -74,6 +97,7 @@ impl Default for DipConfig {
             branch_update_window_hours: None,
             branches: None,
             per_platform: true,
+            baseline: DipBaseline::Raw,
         }
     }
 }
@@ -134,6 +158,43 @@ impl RollingStats {
     /// Standard score of `price`; `None` when the window has zero variance.
     pub fn z_score(&self, price: f64) -> Option<f64> {
         (self.std_dev > 0.0).then(|| (price - self.mean) / self.std_dev)
+    }
+}
+
+/// Robust baseline of `(time, price)` points: one median log price per UTC day, then the
+/// median of those days and their scaled MAD. Returns `(days, center_ln, sigma_ln)`;
+/// `None` for fewer than two days.
+pub fn robust_log_stats(points: &[(DateTime<Utc>, f64)]) -> Option<(usize, f64, f64)> {
+    let mut by_day: std::collections::BTreeMap<chrono::NaiveDate, Vec<f64>> =
+        std::collections::BTreeMap::new();
+    for (at, price) in points {
+        if *price > 0.0 {
+            by_day.entry(at.date_naive()).or_default().push(price.ln());
+        }
+    }
+    let mut daily: Vec<f64> = by_day
+        .into_values()
+        .map(|mut day| median_f64(&mut day))
+        .collect();
+    if daily.len() < 2 {
+        return None;
+    }
+    let center = median_f64(&mut daily);
+    let mut deviations: Vec<f64> = daily.iter().map(|v| (v - center).abs()).collect();
+    Some((
+        daily.len(),
+        center,
+        MAD_TO_SIGMA * median_f64(&mut deviations),
+    ))
+}
+
+fn median_f64(values: &mut [f64]) -> f64 {
+    values.sort_by(f64::total_cmp);
+    let mid = values.len() / 2;
+    if values.len() % 2 == 1 {
+        values[mid]
+    } else {
+        (values[mid - 1] + values[mid]) / 2.0
     }
 }
 
@@ -271,6 +332,8 @@ pub struct DipEvaluation {
     pub baseline_volume: f64,
     pub liquid: bool,
     pub window_active: bool,
+    /// Distance below the baseline in its own sigma units (log units for `RobustLog`).
+    pub z_score: Option<f64>,
 }
 
 impl DipEvaluation {
@@ -384,20 +447,50 @@ impl DipDetector {
         }
         let at = snapshot.observed_at;
         let from = at - Duration::days(self.config.lookback_days);
-        let prior: Vec<f64> = self
+        let prior: Vec<(DateTime<Utc>, f64)> = self
             .prices
             .get(&self.key(snapshot))
             .map(|series| {
                 series
                     .iter()
                     .filter(|(t, _)| *t >= from && *t < at)
-                    .map(|(_, p)| *p)
+                    .copied()
                     .collect()
             })
             .unwrap_or_default();
-        let stats = rolling_stats(&prior);
-        let threshold = stats.map(|s| s.lower_band(self.config.k_sigma));
         let price = snapshot.price.0 as f64;
+        let k = self.config.k_sigma;
+        let (stats, threshold, z_score, samples) = match self.config.baseline {
+            DipBaseline::Raw => {
+                let values: Vec<f64> = prior.iter().map(|(_, p)| *p).collect();
+                let stats = rolling_stats(&values);
+                (
+                    stats,
+                    stats.map(|s| s.lower_band(k)),
+                    stats.and_then(|s| s.z_score(price)),
+                    values.len(),
+                )
+            }
+            DipBaseline::RobustLog => match robust_log_stats(&prior) {
+                Some((days, center, sigma)) => {
+                    // `mean` is the baseline price an exit reverts to (exp of the median
+                    // log); `std_dev` is sigma converted to cents at that price.
+                    let stats = RollingStats {
+                        count: days,
+                        mean: center.exp(),
+                        std_dev: center.exp() * sigma,
+                    };
+                    let signals = sigma > 0.0;
+                    (
+                        Some(stats),
+                        signals.then(|| (center - k * sigma).exp()),
+                        signals.then(|| (price.ln() - center) / sigma),
+                        days,
+                    )
+                }
+                None => (None, None, None, 0),
+            },
+        };
         let current_from = at - Duration::days(self.config.liquidity_window_days);
         let baseline_from = current_from - Duration::days(self.config.lookback_days);
         let (mut sales_in_window, mut baseline_sales) = (0, 0);
@@ -419,7 +512,7 @@ impl DipDetector {
         Ok(DipEvaluation {
             stats,
             threshold,
-            enough_samples: prior.len() >= self.config.min_samples,
+            enough_samples: samples >= self.config.min_samples,
             below_band: threshold.is_some_and(|t| price <= t),
             within_max_drop: stats
                 .is_some_and(|s| price >= s.mean * (1.0 - self.config.max_drop_pct / 100.0)),
@@ -429,6 +522,7 @@ impl DipDetector {
                 && sales_in_window >= self.config.min_sales_in_window
                 && sales_in_window as f64 >= self.config.volume_multiplier * baseline_volume,
             window_active: self.windows.is_active(at),
+            z_score,
         })
     }
 
@@ -444,7 +538,7 @@ impl DipDetector {
             return Ok(None);
         };
         Ok(Some(DipSignal {
-            z_score: stats.z_score(snapshot.price.0 as f64),
+            z_score: eval.z_score,
             order: self.buy_order(snapshot),
             snapshot: snapshot.clone(),
             stats,
@@ -879,5 +973,78 @@ mod tests {
         assert_eq!(c.k_sigma, 2.5);
         assert_eq!(c.lookback_days, 30);
         assert_eq!(c.branch_update_window_hours, Some(48));
+    }
+    /// Twenty days alternating 9_900 / 10_100, plus a polling burst of 50 sticker-craft
+    /// prints at 30_000 on day 10.
+    fn outlier_history(detector: &mut DipDetector) {
+        for day in 1..=20 {
+            detector.record_baseline_price(&snap(day, if day % 2 == 1 { 9_900 } else { 10_100 }));
+        }
+        for minute in 0..50 {
+            let mut burst = snap(10, 30_000);
+            burst.observed_at += Duration::minutes(minute + 1);
+            detector.record_baseline_price(&burst);
+        }
+    }
+
+    #[test]
+    fn robust_log_baseline_sees_a_dip_that_outliers_hide_from_the_raw_baseline() {
+        let probe = snap(21, 9_300);
+        let mut raw = DipDetector::new(DipConfig::default()).unwrap();
+        outlier_history(&mut raw);
+        let raw_eval = raw.evaluate(&probe).unwrap();
+        // 50 of 70 raw points are the burst, so the "mean" is ~24_000 and 9_300 looks
+        // ordinary: sigma is so wide the band sits far below any real price.
+        assert!(raw_eval.stats.unwrap().mean > 20_000.0);
+        assert!(!raw_eval.below_band);
+
+        let mut robust = DipDetector::new(DipConfig {
+            baseline: DipBaseline::RobustLog,
+            ..DipConfig::default()
+        })
+        .unwrap();
+        outlier_history(&mut robust);
+        let eval = robust.evaluate(&probe).unwrap();
+        let stats = eval.stats.unwrap();
+        // One median per day: the burst is one day of twenty, the baseline stays ~10_000.
+        assert_eq!(stats.count, 20);
+        assert!((stats.mean - 10_000.0).abs() < 1.0, "{stats:?}");
+        // sigma = 1.4826 * ~0.01 log units, so the 2-sigma band is ~9_707.
+        let threshold = eval.threshold.unwrap();
+        assert!((9_690.0..9_720.0).contains(&threshold), "{threshold}");
+        assert!(eval.below_band && eval.within_max_drop && eval.enough_samples);
+        assert!(eval.z_score.unwrap() < -2.0);
+    }
+
+    #[test]
+    fn robust_log_baseline_needs_days_and_dispersion() {
+        let config = DipConfig {
+            baseline: DipBaseline::RobustLog,
+            ..DipConfig::default()
+        };
+        // Fifty observations on two days are two samples, not fifty.
+        let mut sparse = DipDetector::new(config.clone()).unwrap();
+        for minute in 0..50 {
+            let mut point = snap(minute % 2, 10_000 + minute);
+            point.observed_at += Duration::minutes(minute);
+            sparse.record_baseline_price(&point);
+        }
+        assert!(!sparse.evaluate(&snap(3, 5_000)).unwrap().enough_samples);
+
+        // A flat history has no dispersion to judge a move against, so nothing signals.
+        let mut flat = DipDetector::new(config).unwrap();
+        for day in 1..=20 {
+            flat.record_baseline_price(&snap(day, 10_000));
+        }
+        let eval = flat.evaluate(&snap(21, 9_000)).unwrap();
+        assert_eq!(eval.threshold, None);
+        assert!(!eval.below_band);
+    }
+
+    #[test]
+    fn baseline_deserializes_from_snake_case() {
+        let config: DipConfig = toml::from_str("baseline = \"robust_log\"").unwrap();
+        assert_eq!(config.baseline, DipBaseline::RobustLog);
+        assert!(toml::from_str::<DipConfig>("baseline = \"mean\"").is_err());
     }
 }

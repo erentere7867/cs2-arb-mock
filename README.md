@@ -150,10 +150,10 @@ Actual output of `cs2-arb backtest` on the bundled synthetic scenario: **50 UTC 
 | --- | ---: | ---: | ---: |
 | Closed trades | 1 | 1 | 0 |
 | Gross realized P&L | $8.23 | $8.23 | $0.00 |
-| Net realized and total P&L | $7.65 | $7.65 | $0.00 |
-| Fees / fee drag (% of gross P&L) | $0.58 / 7.05% | $0.58 / 7.05% | $0.00 / n/a |
+| Net realized and total P&L | $6.92 | $6.92 | $0.00 |
+| Fees / fee drag (% of gross P&L) | $1.31 / 15.92% | $1.31 / 15.92% | $0.00 / n/a |
 | Average / median trade duration | 7 days / 7 days | 7 days / 7 days | n/a |
-| Max drawdown | $1.13 | $1.13 | $0.00 |
+| Max drawdown | $1.10 | $1.10 | $0.00 |
 | Orders submitted / filled / rejected | 2 / 2 / 0 | 2 / 2 / 0 | 0 / 0 / 0 |
 
-Spread selected the synthetic AK-47 Redline; the dip strategy stood down because the uniform mock tape shows no relative volume surge. The combined result is **not** a joint book, earnings forecast, or evidence of a live trading opportunity. Historical asks stand in for book prices, and market transfers after the hold are not separately simulated.
+Fees include the shipped cash-out legs, so the same trade nets less than with the earlier illustrative schedules. Spread selected the synthetic AK-47 Redline; the dip strategy stood down because the uniform mock tape shows no relative volume surge. The combined result is **not** a joint book, earnings forecast, or evidence of a live trading opportunity. Historical asks stand in for book prices, and market transfers after the hold are not separately simulated.

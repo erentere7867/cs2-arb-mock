@@ -102,8 +102,17 @@ trigger_branches = ["staging", "prerelease"]
 annual_opportunity_rate_pct = 10.0
 hold_days = 7
 min_net_profit = 50
+# A spread must beat the price risk of the lock, not just fees. research/validate.py on two
+# years of CSFloat history (2024-11 to 2026-11): median true daily sigma of tradable skins
+# 1.54%, so one sigma over seven days is ~4.1%. Require that plus a 2% margin on the cost.
+min_net_margin_pct = 2.0
+daily_volatility_pct = 1.54
+risk_sigma_multiple = 1.0
 
 [dip]
+# Median/MAD of one median log price per day: robust to sticker-craft outliers and to
+# uneven polling. See DipBaseline in crates/strategy/src/dip.rs.
+baseline = "robust_log"
 lookback_days = 30
 k_sigma = 2.0
 volume_multiplier = 1.5

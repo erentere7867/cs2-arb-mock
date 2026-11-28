@@ -1159,6 +1159,9 @@ mod tests {
         let config = PegBidConfig {
             lower_to_ceiling: true,
             min_median_samples: 1,
+            // No sales are supplied: these ticks test book reactions, so value the exit
+            // from asks explicitly rather than from a sales tape.
+            ask_only_exit_haircut_pct: Some(0.0),
             ..PegBidConfig::default()
         };
         let fees = fees();
@@ -1221,6 +1224,9 @@ mod tests {
         let config = PegBidConfig {
             lower_to_ceiling: true,
             min_median_samples: 1,
+            // No sales are supplied: these ticks test book reactions, so value the exit
+            // from asks explicitly rather than from a sales tape.
+            ask_only_exit_haircut_pct: Some(0.0),
             ..PegBidConfig::default()
         };
         let fees = fees();
@@ -1326,6 +1332,9 @@ mod tests {
                 lower_to_ceiling: true,
                 min_median_samples: 1,
                 lookback_days: 1,
+                // No sales are supplied: these ticks test book reactions, so value the exit
+                // from asks explicitly rather than from a sales tape.
+                ask_only_exit_haircut_pct: Some(0.0),
                 ..PegBidConfig::default()
             },
             RelistConfig::default(),

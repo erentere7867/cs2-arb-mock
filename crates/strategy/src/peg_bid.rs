@@ -2,9 +2,15 @@
 //!
 //! Ingests read-only top-of-book buy orders from supported marketplaces (CSFloat /
 //! Waxpeer), computes `target_bid = max_current_bid + bid_increment`, enforces a
-//! strict margin ceiling guaranteeing at least `target_margin_pct` (7% default)
+//! strict margin ceiling targeting at least `target_margin_pct` (7% default)
 //! net profit after platform fees and the 7-day trade hold, and applies cooldown
 //! and debounce controls to prevent 1-cent bot-war churn.
+//!
+//! The exit value behind that ceiling comes from verified sales, because a lot is sold
+//! at the price buyers pay, not at the price sellers ask. Asks can only lower it: an ask
+//! median under recent prints means sellers are already undercutting them. A tier-only
+//! bid can be filled by any float in its wear tier, and sellers route their worst floats
+//! to it, so it is valued at a lower quantile of the tier's sales instead of the median.
 
 use std::collections::HashMap;
 
@@ -52,6 +58,13 @@ pub struct PegBidConfig {
     pub quantity: u32,
     /// Platforms permitted for peg-bidding. Default `[CsFloat, Waxpeer]`.
     pub allowed_platforms: Vec<Platform>,
+    /// Quantile of the tier's verified sales used as the exit value of a tier-only bid
+    /// (`float_bucket: None`). Default 0.25; 0.5 restores the median.
+    pub tier_only_exit_quantile: f64,
+    /// When set, a venue without enough verified sales is valued at its ask median less
+    /// this percentage. `None` (default) declines to bid without a sales tape, which is
+    /// the case for Waxpeer, whose adapter has no verified sale feed.
+    pub ask_only_exit_haircut_pct: Option<f64>,
 }
 
 impl Default for PegBidConfig {
@@ -70,6 +83,8 @@ impl Default for PegBidConfig {
             lower_to_ceiling: false,
             quantity: 1,
             allowed_platforms: vec![Platform::CsFloat, Platform::Waxpeer],
+            tier_only_exit_quantile: 0.25,
+            ask_only_exit_haircut_pct: None,
         }
     }
 }
@@ -112,6 +127,13 @@ impl PegBidConfig {
         }
         if self.quantity == 0 {
             return bad("quantity must be >= 1");
+        }
+        if !(self.tier_only_exit_quantile > 0.0 && self.tier_only_exit_quantile <= 0.5) {
+            return bad("tier_only_exit_quantile must be in (0, 0.5]");
+        }
+        if matches!(self.ask_only_exit_haircut_pct, Some(pct) if !pct.is_finite() || !(0.0..100.0).contains(&pct))
+        {
+            return bad("ask_only_exit_haircut_pct must be finite and in [0, 100)");
         }
         if self.allowed_platforms.is_empty()
             || self
@@ -200,8 +222,11 @@ pub struct PegBidStrategy {
     config: PegBidConfig,
     /// Observed top-of-book buy orders keyed by `(platform, item, float_bucket)`.
     top_bids: HashMap<BookKey, BuyOrder>,
-    /// Historical/live price points used to compute rolling medians.
+    /// Verified sale prints: the primary exit-value evidence.
     price_history: HashMap<BookKey, Vec<PricePoint>>,
+    /// Lowest-ask snapshots: they can only lower the exit value, or stand in for missing
+    /// sales when `ask_only_exit_haircut_pct` is configured.
+    ask_history: HashMap<BookKey, Vec<PricePoint>>,
     /// Active mock bids maintained by this strategy.
     active_bids: HashMap<BookKey, ActivePegBid>,
     /// Last bid update time per key for anti-jitter cooldown enforcement.
@@ -215,6 +240,7 @@ impl PegBidStrategy {
             config,
             top_bids: HashMap::new(),
             price_history: HashMap::new(),
+            ask_history: HashMap::new(),
             active_bids: HashMap::new(),
             last_updated: HashMap::new(),
         })
@@ -304,7 +330,7 @@ impl PegBidStrategy {
         });
     }
 
-    /// Record a price snapshot into the rolling median price history.
+    /// Record a lowest-ask snapshot; see [`Self::rolling_median`] for how asks are used.
     pub fn observe_snapshot(&mut self, snapshot: &PriceSnapshot) {
         if snapshot.price.0 <= 0 {
             return;
@@ -314,17 +340,20 @@ impl PegBidStrategy {
             snapshot.item.clone(),
             snapshot.float_bucket,
         );
-        self.price_history.entry(key).or_default().push(PricePoint {
+        self.ask_history.entry(key).or_default().push(PricePoint {
             observed_at: snapshot.observed_at,
             price: snapshot.price,
         });
     }
 
-    /// Compute the rolling median market price in `(now - lookback_days, now]`.
+    /// Exit value of a lot bought on `platform`, from observations in
+    /// `(now - lookback_days, now]`, with the number of observations behind it.
     ///
-    /// For bucket-qualified queries (`Some(bucket)`), only observations in the same
-    /// bucket are used. For tier-only queries (`None`), exact `None` observations are
-    /// preferred and fall back to all observations of the same `(platform, item)` tier.
+    /// * With at least `min_median_samples` verified sales: the sales median for a float
+    ///   bucket, or the `tier_only_exit_quantile` of all the tier's sales for a tier-only
+    ///   query, lowered to the ask median when asks sit below it.
+    /// * Without them: the ask median less `ask_only_exit_haircut_pct`, if configured.
+    /// * Otherwise `None`; no bid is placed against an unknown exit.
     pub fn rolling_median(
         &self,
         platform: Platform,
@@ -332,34 +361,48 @@ impl PegBidStrategy {
         float_bucket: Option<FloatBucket>,
         now: DateTime<Utc>,
     ) -> Option<(Money, usize)> {
+        let required = self.config.min_median_samples;
+        let mut sales = self.window_prices(&self.price_history, platform, item, float_bucket, now);
+        let mut asks = self.window_prices(&self.ask_history, platform, item, float_bucket, now);
+        let ask_median = (asks.len() >= required).then(|| median_cents(&mut asks));
+        if sales.len() >= required {
+            let count = sales.len();
+            let sales_value = match float_bucket {
+                Some(_) => median_cents(&mut sales),
+                None => quantile_cents(&mut sales, self.config.tier_only_exit_quantile),
+            };
+            return Some((
+                ask_median.map_or(sales_value, |ask| ask.min(sales_value)),
+                count,
+            ));
+        }
+        let haircut = self.config.ask_only_exit_haircut_pct?;
+        let ask = ask_median?;
+        let value = Money((ask.0 as f64 * (1.0 - haircut / 100.0)).floor() as i64);
+        Some((value, asks.len()))
+    }
+
+    /// Prices in the lookback window for one venue and item. A float bucket selects only
+    /// that bucket; a tier-only query takes every bucket, because any float in the tier
+    /// can fill a tier-only bid.
+    fn window_prices(
+        &self,
+        history: &HashMap<BookKey, Vec<PricePoint>>,
+        platform: Platform,
+        item: &ItemId,
+        float_bucket: Option<FloatBucket>,
+        now: DateTime<Utc>,
+    ) -> Vec<i64> {
         let cutoff = now - Duration::days(self.config.lookback_days);
-        let mut prices: Vec<i64> = self
-            .price_history
-            .get(&(platform, item.clone(), float_bucket))
-            .into_iter()
-            .flatten()
-            .filter(|p| p.observed_at > cutoff && p.observed_at <= now)
-            .map(|p| p.price.0)
-            .collect();
-
-        if prices.is_empty() && float_bucket.is_none() {
-            for ((p, it, _), points) in &self.price_history {
-                if *p == platform && it == item {
-                    prices.extend(
-                        points
-                            .iter()
-                            .filter(|pt| pt.observed_at > cutoff && pt.observed_at <= now)
-                            .map(|pt| pt.price.0),
-                    );
-                }
-            }
-        }
-
-        let count = prices.len();
-        if count < self.config.min_median_samples {
-            return None;
-        }
-        Some((median_cents(&mut prices), count))
+        history
+            .iter()
+            .filter(|((p, it, bucket), _)| {
+                *p == platform && it == item && (float_bucket.is_none() || *bucket == float_bucket)
+            })
+            .flat_map(|(_, points)| points.iter())
+            .filter(|point| point.observed_at > cutoff && point.observed_at <= now)
+            .map(|point| point.price.0)
+            .collect()
     }
 
     /// Evaluate a single `(platform, item, float_bucket)` against its ingested
@@ -642,23 +685,14 @@ impl PegBidStrategy {
         float_bucket: Option<FloatBucket>,
         now: DateTime<Utc>,
     ) -> usize {
-        let cutoff = now - Duration::days(self.config.lookback_days);
-        let exact = self
-            .price_history
-            .get(&(platform, item.clone(), float_bucket))
-            .into_iter()
-            .flatten()
-            .filter(|p| p.observed_at > cutoff && p.observed_at <= now)
-            .count();
-        if exact > 0 || float_bucket.is_some() {
-            return exact;
+        let sales = self
+            .window_prices(&self.price_history, platform, item, float_bucket, now)
+            .len();
+        if sales > 0 || self.config.ask_only_exit_haircut_pct.is_none() {
+            return sales;
         }
-        self.price_history
-            .iter()
-            .filter(|((p, it, _), _)| *p == platform && it == item)
-            .flat_map(|(_, pts)| pts.iter())
-            .filter(|pt| pt.observed_at > cutoff && pt.observed_at <= now)
-            .count()
+        self.window_prices(&self.ask_history, platform, item, float_bucket, now)
+            .len()
     }
 }
 
@@ -756,6 +790,14 @@ pub fn evaluate_bid_economics(
     })
 }
 
+/// Lower nearest-rank quantile (`q` in `(0, 1]`) of a non-empty price slice, in cents.
+/// Rounding the rank down keeps the estimate on the conservative side.
+pub fn quantile_cents(prices: &mut [i64], q: f64) -> Money {
+    prices.sort_unstable();
+    let rank = ((prices.len() - 1) as f64 * q).floor() as usize;
+    Money(prices[rank.min(prices.len() - 1)])
+}
+
 /// Computes the conservative integer-cent median of a non-empty price slice.
 pub fn median_cents(prices: &mut [i64]) -> Money {
     prices.sort_unstable();
@@ -795,13 +837,17 @@ mod tests {
         median: i64,
         now: DateTime<Utc>,
     ) {
-        for (i, delta) in [-20, 0, 20].into_iter().enumerate() {
-            strategy.observe_snapshot(&PriceSnapshot {
+        // Verified prints at one price make the tier quantile and the median coincide, so
+        // tests can state ceilings in terms of `median`.
+        for i in 0..3 {
+            strategy.observe_sale(&Sale {
+                id: format!("seed-{platform:?}-{i}"),
                 platform,
                 item: item(),
-                float_bucket: None,
-                price: Money(median + delta),
-                observed_at: now - Duration::hours(i as i64 + 1),
+                price: Money(median),
+                float_value: None,
+                sold_at: now - Duration::hours(i as i64 + 1),
+                verified: true,
             });
         }
     }
@@ -1130,5 +1176,131 @@ mod tests {
             ..PegBidConfig::default()
         })
         .is_err());
+    }
+    fn sale_at(id: &str, price: i64, float_value: Option<f64>, at: DateTime<Utc>) -> Sale {
+        Sale {
+            id: id.into(),
+            platform: Platform::CsFloat,
+            item: item(),
+            price: Money(price),
+            float_value,
+            sold_at: at,
+            verified: true,
+        }
+    }
+
+    fn ask_at(price: i64, bucket: Option<FloatBucket>, at: DateTime<Utc>) -> PriceSnapshot {
+        PriceSnapshot {
+            platform: Platform::CsFloat,
+            item: item(),
+            float_bucket: bucket,
+            price: Money(price),
+            observed_at: at,
+        }
+    }
+
+    #[test]
+    fn asks_above_sales_cannot_raise_the_exit_value_but_asks_below_cap_it() {
+        let now = t(12, 0);
+        let low = Some(FloatBucket::FieldTestedLow);
+        let mut strategy = PegBidStrategy::new(PegBidConfig::default()).unwrap();
+        for i in 0..3 {
+            let at = now - Duration::hours(i + 1);
+            strategy.observe_sale(&sale_at(&format!("s{i}"), 9_000, Some(0.16), at));
+            strategy.observe_snapshot(&ask_at(11_000, low, at));
+        }
+        // Sellers asking 11_000 do not mean buyers pay it; prints say 9_000.
+        let (value, count) = strategy
+            .rolling_median(Platform::CsFloat, &item(), low, now)
+            .unwrap();
+        assert_eq!((value, count), (Money(9_000), 3));
+
+        for i in 0..4 {
+            strategy.observe_snapshot(&ask_at(8_500, low, now - Duration::minutes(i + 1)));
+        }
+        // Seven asks: median 8_500 is under the prints, so sellers are already undercutting.
+        let (value, _) = strategy
+            .rolling_median(Platform::CsFloat, &item(), low, now)
+            .unwrap();
+        assert_eq!(value, Money(8_500));
+    }
+
+    #[test]
+    fn tier_only_bids_are_valued_at_a_lower_quantile_of_every_float_in_the_tier() {
+        let now = t(12, 0);
+        let mut strategy = PegBidStrategy::new(PegBidConfig::default()).unwrap();
+        let prints = [
+            (8_000, 0.37),
+            (9_000, 0.36),
+            (10_000, 0.16),
+            (11_000, 0.17),
+            (12_000, 0.18),
+        ];
+        for (i, (price, float)) in prints.into_iter().enumerate() {
+            let at = now - Duration::hours(i as i64 + 1);
+            strategy.observe_sale(&sale_at(&format!("s{i}"), price, Some(float), at));
+        }
+        // A tier-only bid fills on any float, so its exit is the 25th percentile of all five.
+        let tier = strategy.rolling_median(Platform::CsFloat, &item(), None, now);
+        assert_eq!(tier, Some((Money(9_000), 5)));
+        // A bucket-qualified bid only receives that bucket and keeps its own median.
+        let low = strategy.rolling_median(
+            Platform::CsFloat,
+            &item(),
+            Some(FloatBucket::FieldTestedLow),
+            now,
+        );
+        assert_eq!(low, Some((Money(11_000), 3)));
+    }
+
+    #[test]
+    fn asks_alone_value_an_exit_only_through_an_explicit_haircut() {
+        let now = t(12, 0);
+        let asks = |strategy: &mut PegBidStrategy| {
+            for i in 0..3 {
+                strategy.observe_snapshot(&ask_at(10_000, None, now - Duration::hours(i + 1)));
+            }
+        };
+        let mut strict = PegBidStrategy::new(PegBidConfig::default()).unwrap();
+        asks(&mut strict);
+        assert_eq!(
+            strict.rolling_median(Platform::CsFloat, &item(), None, now),
+            None
+        );
+
+        let mut haircut = PegBidStrategy::new(PegBidConfig {
+            ask_only_exit_haircut_pct: Some(10.0),
+            ..PegBidConfig::default()
+        })
+        .unwrap();
+        asks(&mut haircut);
+        assert_eq!(
+            haircut.rolling_median(Platform::CsFloat, &item(), None, now),
+            Some((Money(9_000), 3))
+        );
+    }
+
+    #[test]
+    fn rejects_out_of_range_exit_valuation_settings() {
+        for config in [
+            PegBidConfig {
+                tier_only_exit_quantile: 0.0,
+                ..PegBidConfig::default()
+            },
+            PegBidConfig {
+                tier_only_exit_quantile: 0.6,
+                ..PegBidConfig::default()
+            },
+            PegBidConfig {
+                ask_only_exit_haircut_pct: Some(100.0),
+                ..PegBidConfig::default()
+            },
+            PegBidConfig {
+                ask_only_exit_haircut_pct: Some(f64::NAN),
+                ..PegBidConfig::default()
+            },
+        ] {
+            assert!(config.validate().is_err(), "{config:?}");
+        }
     }
 }

@@ -136,6 +136,12 @@ min_median_samples = 3
 cooldown_secs = 300
 min_reprice_delta = 2
 lower_to_ceiling = false
+# Exit value comes from verified sales; asks can only lower it. Tier-only bids receive the
+# worst floats sellers route to them, so they are valued at the tier's 25th percentile.
+tier_only_exit_quantile = 0.25
+# Waxpeer has no verified sales feed, so with no haircut configured it places no peg bids.
+# Uncomment to value its exits at the ask median less this percentage (an assumption).
+# ask_only_exit_haircut_pct = 10.0
 
 [relist]
 lookback_days = 7

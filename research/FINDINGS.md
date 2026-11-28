@@ -50,6 +50,35 @@ Rerun the tools to refresh. These are mock results, not forecasts.
   credits the bid with underpriced listings that sniping bots usually take in
   seconds. This is the most important unverified assumption in the engine.
 
+## Update-aware trading (added later on 2026-11-28)
+
+`fetch_updates.py` + `update_study.py`: 202 update days since the CS2 launch
+(229 Steam announcements; 29 supply, 29 Major and 8 trade-rule changes, tagged
+from the patch notes), against 15 clean case series and the 6 steadiest skins.
+
+- **Only trade-rule updates move prices measurably.** Cases fall 2.9% across
+  the release and 3.6% more over the following lock, with no rebound within two
+  weeks. Both intervals exclude the every-day baseline. That is repricing, not
+  a panic to buy. Supply and Major updates show no reliable average move.
+- **No early signal on average:** the four days before an announcement show no
+  move in any category, so watching staging and prerelease builds buys nothing
+  on average. Individual events differ (cases rose 8–11% before the July 2025
+  souvenir and Trade Protection posts).
+- **Buying after item updates loses:** cases −8.2% per trade (interval −12.3% to
+  −4.8%), skins −1.2%.
+- **Dip inside update windows:** cases −10.0% per trade (interval excludes
+  zero; the regime gate turns it into +0.6%). Skins +14.2% on 9 trades in 6
+  weeks, but the same rule **outside** update windows also made +8.5% on 7
+  trades. The update gate is not what makes it work, and 4 of the 9 came from
+  one event: the October 2025 trade-up change, when covert skins rose because
+  they became trade-up material.
+- So the earlier note that the regime gate blocks "the panics dip is designed
+  for" holds for skins only. On cases the gate prevented large losses.
+
+The one lead worth following is the dip rule on liquid, clean skins regardless
+of updates: 16 winning trades over three years on six skins. That is too few to
+trust. A larger universe of clean skins is the next test.
+
 ## Engine issues found
 
 1. `BuyOrderFillSimulator` fills a bid on any verified print at or below it.
@@ -57,7 +86,8 @@ Rerun the tools to refresh. These are mock results, not forecasts.
 2. Percentage fees round to whole cents, so items under about $1 pay 0¢ fees
    (2% of 9¢ rounds to 0). Real venues charge minimums. Keep the universe at
    $1 and above.
-3. The regime gate blocks dip entries in exactly the panics dip is designed for.
+3. The regime gate blocks most skin dip entries in panics, but it saved the dip rule on cases
+   (see the update study above): keep it, and test it per item class.
 4. `max_position_notional = 10000` ($100) excludes most skins above $100.
 
 ## What would change the verdict

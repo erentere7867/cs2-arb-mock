@@ -23,7 +23,12 @@ python3 research/spread_scan.py
 #    Run it again an hour later against the first result to see what persists.
 python3 research/spread_scan.py --out research/data/spread-later --previous research/data/spread/spread_scan.json
 
-# 4. Run the Rust engine itself over the same history (dip, regime, risk, exits).
+# 4. Update-aware trading: every CS2 update since launch, tagged from its patch notes,
+#    then price moves around updates and the dip rule inside real update windows.
+python3 research/fetch_updates.py
+python3 research/update_study.py
+
+# 5. Run the Rust engine itself over the same history (dip, regime, risk, exits).
 #    The exporter also writes replay.toml: the shipped config narrowed to CSFloat.
 python3 research/export_replay.py
 cargo run --release --bin cs2-arb -- --config research/data/replay/replay.toml backtest \
@@ -39,7 +44,22 @@ cargo run --release --bin cs2-arb -- --config research/data/replay/replay.toml b
 | `validate.py` §2 | Does the dip rule beat simply buying every day? Variants with the regime gate and a market-stress proxy. | Prices and daily sale counts | Historical update windows are unavailable; market stress stands in for them. |
 | `validate.py` §3 | What does a peg bid at the margin ceiling earn, given who sells into it? | Dispersion of the latest 40 prints around CSFloat's float-adjusted price | That dispersion is assumed stable; a lot sells on the first day the lock allows. |
 | `spread_scan.py` | How much cross-venue spread exists after fees, at ask prices and at actual sale prices? | Whole live catalogue of both venues | Aggregate prices across floats and stickers, so survivors are upper bounds. |
+| `update_study.py` | Do updates move prices, before or after release, and does the dip rule pay inside real update windows? | Steam update posts with dates and patch notes; prices | Tags come from patterns plus a short reviewed override list; announcement dates stand in for the SteamDB build times. |
 | `export_replay.py` + engine | Does the engine reproduce the harness on the same paths? | Prices, daily sale counts | Individual prints are evenly spaced at the daily average (`recon-` IDs). |
+
+## Running on the VPS
+
+The VPS jobs already read all four venues with the keys in `.env` and record
+every quote, verified sale and buy-book poll in `events.db`. To put this branch's
+fees and rules on them, then replay the recording read-only, run as `ubuntu`:
+
+```sh
+cs2-arb-update claude/lucid-bohr-h3lsqs
+/home/ubuntu/cs2-arb-mock-data/current/cs2-arb --config /home/ubuntu/cs2-arb-mock-data/current/config/default.toml \
+  backtest --history-db /home/ubuntu/cs2-arb-mock-data/events.db --output-dir /home/ubuntu/cs2-arb-mock-data/reports/recorded
+```
+
+The research scripts need no keys and run anywhere with Python 3.11+.
 
 ## Reading the results
 

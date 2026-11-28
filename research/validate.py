@@ -192,76 +192,85 @@ def dip_exit(item: Item, entry: dt.date, cost: int, venue: Venue, dip_cfg: dict)
     return None
 
 
-def dip_study(items: list[Item], index, since: dt.date, venue: Venue, cfg: dict, regime_cfg: dict, min_price: int):
+def dip_signal(item: Item, d: dt.date, venue: Venue, cfg: dict) -> bool:
+    """The engine's robust_log dip rule on day `d`: price at or below the 30-day robust
+    band, within max_drop of the baseline, a verified-volume surge, and a baseline exit
+    that clears the all-in cost. Panic windows and the regime gate are applied by callers."""
     k = float(cfg.get("k_sigma", 2.0))
     lookback = int(cfg.get("lookback_days", 30))
     max_drop = float(cfg.get("max_drop_pct", 30.0)) / 100
-    min_days = 10
     surge = float(cfg.get("volume_multiplier", 1.5))
+    price = item.days[d][0]
+    # Daily log averages of the prior lookback window (the triggering day excluded).
+    prior = [math.log(item.days[p][0]) for p in (d - n * DAY for n in range(1, lookback + 1)) if p in item.days]
+    if len(prior) < int(cfg.get("min_samples", 10)):
+        return False
+    recent = sum(item.days[p][1] for p in (d - n * DAY for n in range(0, 7)) if p in item.days)
+    base = sum(item.days[p][1] for p in (d - n * DAY for n in range(7, 7 + lookback)) if p in item.days)
+    center, sigma = robust(prior)
+    return (
+        sigma > 0
+        and math.log(price) <= center - k * sigma
+        and price >= math.exp(center) * (1 - max_drop)
+        and base > 0
+        and recent >= 10
+        and recent >= surge * base * 7 / lookback
+        and venue.sell_proceeds(int(math.exp(center))) > venue.buy_cost(int(price))
+    )
+
+
+def regime_allows(item: Item, d: dt.date, index, regime_cfg: dict) -> bool:
+    """The engine's market regime gate: broad index above its 24 h and 7-day loss limits,
+    and the item not trailing the index by more than item_underperformance_pct."""
+    one, week = index.get(d, (None, None))
+    if one is None or week is None or d - DAY not in item.days:
+        return False  # The engine fails closed without comparable returns.
+    item_one = math.log(item.days[d][0] / item.days[d - DAY][0])
+    return (
+        one > -float(regime_cfg.get("short_loss_pct", 3.0)) / 100
+        and week > -float(regime_cfg.get("long_loss_pct", 8.0)) / 100
+        and item_one >= one - float(regime_cfg.get("item_underperformance_pct", 5.0)) / 100
+    )
+
+
+class Book:
+    """One open lot per item and variant, as the engine's occupied-key check."""
+
+    def __init__(self, names):
+        self.trades = {name: [] for name in names}
+        self.busy_until: dict[tuple[str, str], dt.date] = {}
+
+    def enter(self, name: str, item: Item, d: dt.date, venue: Venue, cfg: dict) -> None:
+        if d < self.busy_until.get((name, item.name), dt.date.min):
+            return
+        trade = dip_exit(item, d, venue.buy_cost(int(item.days[d][0])), venue, cfg)
+        if trade:
+            self.trades[name].append(trade)
+            self.busy_until[(name, item.name)] = d + trade.hold_days * DAY
+
+
+def dip_study(items: list[Item], index, since: dt.date, venue: Venue, cfg: dict, regime_cfg: dict, min_price: int):
     short_loss = -float(regime_cfg.get("short_loss_pct", 3.0)) / 100
     long_loss = -float(regime_cfg.get("long_loss_pct", 8.0)) / 100
-    lag = float(regime_cfg.get("item_underperformance_pct", 5.0)) / 100
-
-    variants = {name: [] for name in ("control: buy every day", "dip rule", "dip + regime gate", "dip in market stress")}
+    book = Book(("control: buy every day", "dip rule", "dip + regime gate", "dip in market stress"))
     for item in items:
-        busy_until = {name: dt.date.min for name in variants}
         for d in sorted(item.days):
-            if d < since:
+            if d < since or item.days[d][0] < min_price:
                 continue
-            price, _ = item.days[d]
-            if price < min_price:
+            book.enter("control: buy every day", item, d, venue, cfg)
+            if not dip_signal(item, d, venue, cfg):
                 continue
-            cost = venue.buy_cost(int(price))
-            # Daily log averages of the prior lookback window (the triggering day excluded).
-            prior = [math.log(item.days[p][0]) for p in (d - n * DAY for n in range(1, lookback + 1)) if p in item.days]
-            recent = sum(item.days[p][1] for p in (d - n * DAY for n in range(0, 7)) if p in item.days)
-            base = sum(item.days[p][1] for p in (d - n * DAY for n in range(7, 7 + lookback)) if p in item.days)
-            one, week = index.get(d, (None, None))
-            item_one = math.log(price / item.days[d - DAY][0]) if d - DAY in item.days else None
-
-            def enter(name: str):
-                if d < busy_until[name]:
-                    return  # One open lot per item, as the engine's occupied-key check.
-                trade = dip_exit(item, d, cost, venue, cfg)
-                if trade:
-                    variants[name].append(trade)
-                    busy_until[name] = d + trade.hold_days * DAY
-
-            enter("control: buy every day")
-            if len(prior) < min_days:
-                continue
-            center, sigma = robust(prior)
-            signal = (
-                sigma > 0
-                and math.log(price) <= center - k * sigma
-                and price >= math.exp(center) * (1 - max_drop)
-                and base > 0
-                and recent >= 10
-                and recent >= surge * base * 7 / lookback
-                # Entry check: selling at the baseline must clear the all-in cost.
-                and venue.sell_proceeds(int(math.exp(center))) > cost
-            )
-            if not signal:
-                continue
-            enter("dip rule")
-            risk_on = (
-                one is not None
-                and week is not None
-                and one > short_loss
-                and week > long_loss
-                and item_one is not None
-                and item_one >= one - lag
-            )
-            if risk_on:
-                enter("dip + regime gate")
+            book.enter("dip rule", item, d, venue, cfg)
+            if regime_allows(item, d, index, regime_cfg):
+                book.enter("dip + regime gate", item, d, venue, cfg)
             stressed = any(
                 (index.get(d - n * DAY, (None, None))[0] or 0) <= short_loss
                 or (index.get(d - n * DAY, (None, None))[1] or 0) <= long_loss
                 for n in range(0, 4)
             )
             if stressed:
-                enter("dip in market stress")
-    return variants
+                book.enter("dip in market stress", item, d, venue, cfg)
+    return book.trades
 
 
 # --------------------------------------------------------------------------- peg bid

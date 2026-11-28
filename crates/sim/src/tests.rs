@@ -1117,7 +1117,7 @@ fn invalid_configs_are_refused() {
 
 #[test]
 fn default_config_fees_load_into_executor() {
-    let fees = FeeSchedules::from_toml(include_str!("../../../config/default.toml")).unwrap();
+    let fees = FeeSchedules::from_toml(include_str!("../../../data/fixtures/test_fees.toml")).unwrap();
     let clock = Arc::new(ManualClock::new(t0()));
     let exec = MockExecutor::new(SimulationMode, SimConfig::default(), &fees, clock, 0).unwrap();
     assert_eq!(exec.fees().get(Platform::Skinport).seller.rate_ppm, 80_000);

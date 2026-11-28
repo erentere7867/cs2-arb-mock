@@ -1,0 +1,32 @@
+# Frozen fee schedules for unit tests. Tests assert exact cent arithmetic against these
+# values, so they must not follow config/default.toml when real marketplace fees change.
+# These are the pre-2026-11-28 illustrative schedules, not current marketplace fees.
+[fees.skinport]
+buyer_fee_pct = 0.0
+seller_fee_pct = 8.0
+buyer_fixed_fee = 0
+seller_fixed_fee = 0
+
+[fees.csfloat]
+buyer_fee_pct = 0.0
+seller_fee_pct = 2.0
+buyer_fixed_fee = 0
+seller_fixed_fee = 0
+
+[fees.dmarket]
+buyer_fee_pct = 0.0
+seller_fee_pct = 7.0
+buyer_fixed_fee = 0
+seller_fixed_fee = 0
+
+[fees.waxpeer]
+buyer_fee_pct = 0.0 # Assumption for purchases using existing marketplace balance.
+seller_fee_pct = 6.0 # Standard fee: https://faq.waxpeer.com/faq/fees-sell
+buyer_fixed_fee = 0
+seller_fixed_fee = 0
+
+# Examples apply only to Waxpeer. Fixed network / bank fees are assumed zero until configured.
+[fees.waxpeer.funding]
+crypto_deposit = { pct = 1.0, fixed = 0 } # Most coins: https://faq.waxpeer.com/faq/fees-deposit
+crypto_withdrawal = { pct = 1.5, fixed = 0 } # Standard crypto rate excluding network: https://faq.waxpeer.com/faq/fees-withdraw
+bank_cashout = { pct = 0.0, fixed = 0 }

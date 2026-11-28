@@ -466,10 +466,13 @@ mod tests {
         let schedules =
             FeeSchedules::from_toml(include_str!("../../../config/default.toml")).unwrap();
         let fees = PlatformFees::from_schedules(&schedules, RoundingMode::HalfUp).unwrap();
-        // Illustrative config: Skinport 8%, CSFloat 2%, DMarket 7% seller fees.
+        // Shipped schedule: Skinport 8% + 0% payout; CSFloat 2% + 2.5% bank withdrawal;
+        // DMarket 5% + 2% withdrawal. Exact parity with core is checked below.
         assert_eq!(fees.get(Platform::Skinport).seller.rate_ppm, 80_000);
         assert_eq!(fees.get(Platform::CsFloat).seller.rate_ppm, 20_000);
-        assert_eq!(fees.get(Platform::DMarket).seller.rate_ppm, 70_000);
+        assert_eq!(fees.get(Platform::DMarket).seller.rate_ppm, 50_000);
+        assert_eq!(schedules.csfloat.funding.bank_cashout.pct, 2.5);
+        assert_eq!(schedules.dmarket.funding.bank_cashout.pct, 2.0);
         for platform in Platform::ALL {
             let core = schedules.get(platform);
             let ours = fees.get(platform);

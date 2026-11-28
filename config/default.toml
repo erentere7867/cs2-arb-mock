@@ -1,36 +1,64 @@
 markets = ["skinport", "csfloat", "dmarket", "waxpeer"]
 dmarket_if_configured = true
 
-# Illustrative mock fees, NOT verified marketplace schedules unless linked.
-# Percentage points (5.0 = 5%); fixed fees are USD cents.
+# Marketplace fees researched 2026-11-28. Percentage points (5.0 = 5%); fixed fees are USD cents.
+# Funding legs model a real-money round trip on EVERY trade: deposit on entry, withdrawal and
+# bank cash-out on exit. That is deliberately conservative for strategies that recycle balance
+# on one venue, and accurate for spread, whose proceeds must move back to the buying venue.
+# Where sources disagree the higher cost is used. Re-check before relying on any margin.
+
+# Skinport: 8% standard seller fee since 18 Jul 2025 (6% only for listings >= 1,000 USD, not
+# modelled); no buyer fee; bank payout carries no Skinport fee (third-party reviews, e.g.
+# https://steamdb.com/en/markets/skinport). Deposit costs for buyers are UNVERIFIED.
 [fees.skinport]
 buyer_fee_pct = 0.0
 seller_fee_pct = 8.0
 buyer_fixed_fee = 0
 seller_fixed_fee = 0
 
+# CSFloat: 2% seller fee, no buyer fee; bank withdrawal is tiered 2.5% (< $2,500 lifetime sales)
+# down to 0.5% (>= $100k). New accounts pay 2.5%. ACH deposits ~1.5%, cards ~2.8%
+# (third-party reviews, e.g. https://cs2journal.com/markets/csfloat/; csfloat.com/faq is JS-only).
 [fees.csfloat]
 buyer_fee_pct = 0.0
 seller_fee_pct = 2.0
 buyer_fixed_fee = 0
 seller_fixed_fee = 0
 
+[fees.csfloat.funding]
+crypto_deposit = { pct = 1.5, fixed = 0 } # Deposit leg (US ACH rate); name kept for config compatibility.
+crypto_withdrawal = { pct = 0.0, fixed = 0 }
+bank_cashout = { pct = 2.5, fixed = 0 } # Entry tier of the tiered withdrawal fee.
+
+# DMarket: CS2 marketplace sales are 2% for liquid items but up to 10% for low-priced or
+# low-liquidity items (https://dmarket.com/faq "DMarket Fees"); buyers pay no fee. The fee is
+# per item and not exposed by the read API, so 5% is a middle scenario. Withdrawal is 0-2.5%
+# by method in third-party reviews; 2% is used. Deposit costs are UNVERIFIED.
 [fees.dmarket]
 buyer_fee_pct = 0.0
-seller_fee_pct = 7.0
+seller_fee_pct = 5.0
 buyer_fixed_fee = 0
 seller_fixed_fee = 0
 
+[fees.dmarket.funding]
+crypto_deposit = { pct = 0.0, fixed = 0 }
+crypto_withdrawal = { pct = 0.0, fixed = 0 }
+bank_cashout = { pct = 2.0, fixed = 0 }
+
+# Waxpeer: 6% standard seller fee (2% with the mobile app linked, not assumed)
+# https://faq.waxpeer.com/faq/fees-sell ; no separate buyer fee when spending balance.
 [fees.waxpeer]
-buyer_fee_pct = 0.0 # Assumption for purchases using existing marketplace balance.
-seller_fee_pct = 6.0 # Standard fee: https://faq.waxpeer.com/faq/fees-sell
+buyer_fee_pct = 0.0
+seller_fee_pct = 6.0
 buyer_fixed_fee = 0
 seller_fixed_fee = 0
 
-# Examples apply only to Waxpeer. Fixed network / bank fees are assumed zero until configured.
+# 1% deposit for most coins https://faq.waxpeer.com/faq/fees-deposit ; 1.5% + network fee for
+# USDT/USDC withdrawals https://faq.waxpeer.com/faq/fees-withdraw . Sale proceeds sit in an
+# eight-day hold balance before withdrawal https://faq.waxpeer.com/faq/hold-balance .
 [fees.waxpeer.funding]
-crypto_deposit = { pct = 1.0, fixed = 0 } # Most coins: https://faq.waxpeer.com/faq/fees-deposit
-crypto_withdrawal = { pct = 1.5, fixed = 0 } # Standard crypto rate excluding network: https://faq.waxpeer.com/faq/fees-withdraw
+crypto_deposit = { pct = 1.0, fixed = 0 }
+crypto_withdrawal = { pct = 1.5, fixed = 0 }
 bank_cashout = { pct = 0.0, fixed = 0 }
 
 # Both snapshots refresh about every 10s: https://docs.waxpeer.com/api/buy-items/prices-snapshot

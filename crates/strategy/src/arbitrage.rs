@@ -723,7 +723,7 @@ mod tests {
         let quotes: Vec<PriceSnapshot> =
             serde_json::from_str(include_str!("../../../data/fixtures/price_snapshots.json"))
                 .unwrap();
-        let fees = FeeSchedules::from_toml(include_str!("../../../config/default.toml")).unwrap();
+        let fees = FeeSchedules::from_toml(include_str!("../../../data/fixtures/test_fees.toml")).unwrap();
         let config = SpreadConfig {
             min_net_profit: Money(i64::MIN + 1),
             ..SpreadConfig::default()

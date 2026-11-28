@@ -317,7 +317,7 @@ mod tests {
             }],
         };
         let mut fees =
-            FeeSchedules::from_toml(include_str!("../../../config/default.toml")).unwrap();
+            FeeSchedules::from_toml(include_str!("../../../data/fixtures/test_fees.toml")).unwrap();
         fees.waxpeer.funding.crypto_withdrawal.fixed = Money(10);
         fees.dmarket.funding.crypto_deposit.fixed = Money(5);
         rules.validate(&[from, to]).unwrap();

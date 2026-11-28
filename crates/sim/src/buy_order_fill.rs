@@ -731,7 +731,7 @@ mod tests {
     use super::*;
 
     fn fees() -> FeeSchedules {
-        FeeSchedules::from_toml(include_str!("../../../config/default.toml")).unwrap()
+        FeeSchedules::from_toml(include_str!("../../../data/fixtures/test_fees.toml")).unwrap()
     }
 
     fn item() -> ItemId {

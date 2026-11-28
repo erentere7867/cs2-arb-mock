@@ -13,7 +13,8 @@ item_underperformance_pct = 5.0 # Maximum 24h shortfall vs. the broad index, in 
 [relist]
 cross_venue = true
 
-# Illustrative mock fees; not current fee quotes unless linked.
+# Marketplace fees researched 2026-11-28; see config/default.toml for sources and the
+# conservative funding round-trip convention.
 [fees.skinport]
 buyer_fee_pct = 0.0
 seller_fee_pct = 8.0
@@ -27,11 +28,17 @@ seller_fee_pct = 2.0
 buyer_fixed_fee = 0
 seller_fixed_fee = 0
 
+# DMarket lists a 5% marketplace seller fee for Rust (https://dmarket.com/faq "DMarket Fees").
 [fees.dmarket]
 buyer_fee_pct = 0.0
-seller_fee_pct = 7.0
+seller_fee_pct = 5.0
 buyer_fixed_fee = 0
 seller_fixed_fee = 0
+
+[fees.dmarket.funding]
+crypto_deposit = { pct = 0.0, fixed = 0 }
+crypto_withdrawal = { pct = 0.0, fixed = 0 }
+bank_cashout = { pct = 2.0, fixed = 0 } # 0-2.5% by method in third-party reviews.
 
 [fees.waxpeer]
 buyer_fee_pct = 0.0 # Assumption for purchases using existing marketplace balance.
@@ -39,7 +46,7 @@ seller_fee_pct = 6.0 # Standard fee: https://faq.waxpeer.com/faq/fees-sell
 buyer_fixed_fee = 0
 seller_fixed_fee = 0
 
-# Examples apply only to Waxpeer. Fixed network / bank fees are assumed zero until configured.
+# Network fees are assumed zero; add them for the coin you actually use.
 [fees.waxpeer.funding]
 crypto_deposit = { pct = 1.0, fixed = 0 } # Most coins: https://faq.waxpeer.com/faq/fees-deposit
 crypto_withdrawal = { pct = 1.5, fixed = 0 } # Standard crypto rate excluding network: https://faq.waxpeer.com/faq/fees-withdraw

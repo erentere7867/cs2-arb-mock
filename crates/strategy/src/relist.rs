@@ -5,9 +5,13 @@
 //!    exact remaining lock countdown.
 //! 2. Once `now >= locked_until`, the item transitions to `READY_TO_SELL`.
 //! 3. `READY_TO_SELL` items are simulated as ask listings priced at the rolling
-//!    median market price.
-//! 4. Listed asks fill based on observed market volume, crediting proceeds net
-//!    of platform seller fees and recording realized net P&L.
+//!    median market price, or just under the current market when it has fallen below
+//!    that median (a lagged median is not a price anyone pays after a drop).
+//! 4. Listed asks fill on a verified print at or above the ask, or on observed volume
+//!    only while fresh evidence shows the ask is still at or below the current market.
+//!    Fills credit proceeds net of platform seller fees and record realized net P&L.
+//! 5. Unfilled asks are repriced down to the current market after a configurable wait,
+//!    so a falling item is sold at the market instead of resting forever above it.
 
 use std::collections::HashMap;
 
@@ -44,6 +48,18 @@ pub struct RelistConfig {
     pub instant_sale: bool,
     pub maximum_bid_age_seconds: u32,
     pub time_cost_bps_per_day: u32,
+    /// Cents below the current market at which an ask is placed or repriced when the
+    /// market sits below the rolling median. Default 1.
+    pub undercut: Money,
+    /// Maximum age, in seconds, of the lowest-ask snapshot treated as the current market.
+    /// Default 21,600 (six hours).
+    pub max_market_age_secs: i64,
+    /// Window, in hours, of verified sales whose median stands in for the current market
+    /// when no fresh ask snapshot exists. Default 24.
+    pub recent_sales_window_hours: i64,
+    /// Seconds an ask may rest unfilled before it is repriced to the current market.
+    /// `None` disables repricing. Default 86,400 (one day).
+    pub reprice_after_secs: Option<i64>,
 }
 
 impl Default for RelistConfig {
@@ -59,6 +75,10 @@ impl Default for RelistConfig {
             instant_sale: false,
             maximum_bid_age_seconds: 60,
             time_cost_bps_per_day: 0,
+            undercut: Money(1),
+            max_market_age_secs: 21_600,
+            recent_sales_window_hours: 24,
+            reprice_after_secs: Some(86_400),
         }
     }
 }
@@ -77,6 +97,18 @@ impl RelistConfig {
         }
         if self.min_listing_age_secs < 0 {
             return bad("min_listing_age_secs must be >= 0");
+        }
+        if self.undercut.0 < 0 {
+            return bad("undercut must be >= 0");
+        }
+        if self.max_market_age_secs < 0 {
+            return bad("max_market_age_secs must be >= 0");
+        }
+        if self.recent_sales_window_hours <= 0 {
+            return bad("recent_sales_window_hours must be > 0");
+        }
+        if matches!(self.reprice_after_secs, Some(secs) if secs <= 0) {
+            return bad("reprice_after_secs must be > 0");
         }
         Ok(())
     }
@@ -383,7 +415,7 @@ impl RelistEngine {
                         {
                             continue;
                         }
-                        let Some(ask) = self.rolling_median_ask(
+                        let Some(ask) = self.listing_price(
                             platform,
                             &pos.item,
                             pos.float_bucket,
@@ -522,10 +554,50 @@ impl RelistEngine {
                     });
                     let listing_age_ok =
                         (now - listed_at).num_seconds() >= self.config.min_listing_age_secs;
-                    let volume_fill_ok =
-                        trailing_vol >= self.config.min_sales_for_ask_fill && listing_age_ok;
+                    let market = self.current_market(
+                        platform,
+                        &pos.item,
+                        pos.float_bucket,
+                        sales,
+                        snapshots,
+                        now,
+                    );
+                    // Volume says buyers exist, not that they pay our price. Fill on volume
+                    // alone only while fresh evidence puts the ask at or below the market.
+                    let competitive = market.is_some_and(|market| ask_price <= market);
+                    let volume_fill_ok = trailing_vol >= self.config.min_sales_for_ask_fill
+                        && listing_age_ok
+                        && competitive;
 
                     if !has_crossing_print && !volume_fill_ok {
+                        if let Some(new_ask) =
+                            self.reprice_target(ask_price, listed_at, market, now)
+                        {
+                            let oid = order_id(
+                                "relist-ask",
+                                &[platform_slug(platform), &pos.item.market_hash_name],
+                                pos.float_bucket,
+                                now,
+                            );
+                            result.listed_orders.push(Order {
+                                id: oid.clone(),
+                                side: OrderSide::Sell,
+                                platform,
+                                item: pos.item.clone(),
+                                float_bucket: pos.float_bucket,
+                                quantity: pos.quantity,
+                                limit_price: new_ask,
+                                submitted_at: now,
+                            });
+                            if let Some(tracked) = self.items.get_mut(&id) {
+                                tracked.status = InventoryStatus::Listed {
+                                    order_id: oid,
+                                    ask_price: new_ask,
+                                    listed_at: now,
+                                    sell_platform,
+                                };
+                            }
+                        }
                         continue;
                     }
                     (oid, platform, ask_price, listed_at, trailing_vol, None)
@@ -673,6 +745,93 @@ impl RelistEngine {
 
     pub fn total_seller_fees(&self) -> Money {
         self.total_seller_fees
+    }
+
+    /// Ask to post for a newly unlocked lot: the rolling median, capped just below the
+    /// current market when the market has fallen under that median.
+    fn listing_price(
+        &self,
+        platform: Platform,
+        item: &ItemId,
+        bucket: Option<FloatBucket>,
+        sales: &[Sale],
+        snapshots: &[PriceSnapshot],
+        now: DateTime<Utc>,
+    ) -> Option<Money> {
+        let median = self.rolling_median_ask(platform, item, bucket, sales, snapshots, now)?;
+        let under_market = self
+            .current_market(platform, item, bucket, sales, snapshots, now)
+            .filter(|market| *market < median)
+            .map(|market| Money(market.0 - self.config.undercut.0))
+            .filter(|ask| ask.0 > 0);
+        Some(under_market.unwrap_or(median))
+    }
+
+    /// Best evidence of where the item trades right now on `platform`: the lowest ask in
+    /// the newest fresh snapshot, else the median of recent verified sales. `None` when
+    /// neither exists, in which case no volume-only fill is allowed.
+    fn current_market(
+        &self,
+        platform: Platform,
+        item: &ItemId,
+        bucket: Option<FloatBucket>,
+        sales: &[Sale],
+        snapshots: &[PriceSnapshot],
+        now: DateTime<Utc>,
+    ) -> Option<Money> {
+        let oldest = now - Duration::seconds(self.config.max_market_age_secs);
+        let fresh = snapshots.iter().filter(|q| {
+            q.platform == platform
+                && &q.item == item
+                && q.observed_at >= oldest
+                && q.observed_at <= now
+                && q.price.0 > 0
+                && (bucket.is_none() || q.float_bucket == bucket)
+        });
+        // Several buckets can quote at the same instant for a tier-level lot; any of them
+        // is a competing listing, so the cheapest one at the newest instant sets the market.
+        let newest = fresh.clone().map(|q| q.observed_at).max();
+        if let Some(newest) = newest {
+            return fresh
+                .filter(|q| q.observed_at == newest)
+                .map(|q| q.price)
+                .min();
+        }
+        let from = now - Duration::hours(self.config.recent_sales_window_hours);
+        let mut seen_ids = std::collections::HashSet::new();
+        let mut prices: Vec<i64> = sales
+            .iter()
+            .filter(|s| {
+                (!self.config.require_verified_sales || s.verified)
+                    && s.platform == platform
+                    && &s.item == item
+                    && s.sold_at > from
+                    && s.sold_at <= now
+                    && s.price.0 > 0
+                    && matches_bucket(bucket, s.float_value)
+                    && seen_ids.insert((s.platform, s.id.as_str()))
+            })
+            .map(|s| s.price.0)
+            .collect();
+        (prices.len() >= self.config.min_median_samples).then(|| median_cents(&mut prices))
+    }
+
+    /// Lower ask for a listing that has waited `reprice_after_secs` without a fill and now
+    /// sits above the current market. Repricing may go below cost basis: holding a lot
+    /// above a falling market only defers the loss.
+    fn reprice_target(
+        &self,
+        ask: Money,
+        listed_at: DateTime<Utc>,
+        market: Option<Money>,
+        now: DateTime<Utc>,
+    ) -> Option<Money> {
+        let wait = self.config.reprice_after_secs?;
+        if (now - listed_at).num_seconds() < wait {
+            return None;
+        }
+        let target = Money(market?.0 - self.config.undercut.0);
+        (target.0 > 0 && target < ask).then_some(target)
     }
 
     fn rolling_median_ask(
@@ -1129,7 +1288,7 @@ mod tests {
     }
 
     #[test]
-    fn unlock_relists_at_median_ask_even_below_cost() {
+    fn unlock_lists_under_the_cheapest_current_ask_even_below_cost() {
         let mut engine = RelistEngine::new(RelistConfig::default()).unwrap();
         let acquired = t(1, 12);
         let position = make_position(acquired);
@@ -1162,7 +1321,9 @@ mod tests {
             .step(&make_sales(20, 10_000, now), &snapshots, &fees(), now)
             .unwrap();
         assert_eq!(step.unlocked, std::slice::from_ref(&position.id));
-        assert_eq!(step.listed_orders[0].limit_price, Money(8000));
+        // The 7-day median of these asks is 8000, but a buyer takes the 7500 listing first,
+        // so the lot lists one cent under the cheapest current ask rather than at the median.
+        assert_eq!(step.listed_orders[0].limit_price, Money(7499));
 
         let sold_at = now + Duration::seconds(1);
         let settled = engine
@@ -1176,11 +1337,109 @@ mod tests {
         let [sale] = settled.realized_sales.as_slice() else {
             panic!("crossing print should settle the listed lot");
         };
-        assert_eq!(sale.net_proceeds, Money(7840));
-        assert_eq!(sale.realized_net_pnl, Money(7840 - position.cost_basis.0));
+        // 7499 less the 2% CSFloat seller fee (149.98 rounds to 150).
+        assert_eq!(sale.net_proceeds, Money(7349));
+        assert_eq!(sale.realized_net_pnl, Money(7349 - position.cost_basis.0));
         assert!(matches!(
             engine.get(&position.id).unwrap().status,
             InventoryStatus::Sold { .. }
         ));
+    }
+    fn ask_snapshot(price: i64, observed_at: DateTime<Utc>) -> PriceSnapshot {
+        PriceSnapshot {
+            platform: Platform::CsFloat,
+            item: item(),
+            float_bucket: None,
+            price: Money(price),
+            observed_at,
+        }
+    }
+
+    #[test]
+    fn volume_does_not_fill_an_ask_above_a_fallen_market_until_it_is_repriced() {
+        let acquired = t(1, 12);
+        let unlock = t(8, 12);
+        let mut engine = RelistEngine::new(RelistConfig::default()).unwrap();
+        let mut position = make_position(acquired);
+        position.cost_basis = Money(9_000);
+        engine.track_position(position, acquired);
+        let sales = make_sales(20, 10_000, unlock);
+
+        let listed = engine.step(&sales, &[], &fees(), unlock).unwrap();
+        assert_eq!(listed.listed_orders[0].limit_price, Money(10_000));
+
+        // The market drops to 8000 while the lot rests at its lagged 10_000 median. The old
+        // model filled it on trailing volume alone; nobody pays 10_000 next to an 8000 ask.
+        let dropped = unlock + Duration::hours(2);
+        let step = engine
+            .step(&sales, &[ask_snapshot(8_000, dropped)], &fees(), dropped)
+            .unwrap();
+        assert!(step.realized_sales.is_empty());
+        assert!(step.listed_orders.is_empty(), "reprice waits a full day");
+
+        let next_day = unlock + Duration::hours(25);
+        let step = engine
+            .step(&sales, &[ask_snapshot(8_000, next_day)], &fees(), next_day)
+            .unwrap();
+        assert!(step.realized_sales.is_empty());
+        assert_eq!(step.listed_orders[0].limit_price, Money(7_999));
+
+        let later = next_day + Duration::hours(2);
+        let step = engine
+            .step(&sales, &[ask_snapshot(8_000, later)], &fees(), later)
+            .unwrap();
+        let [sale] = step.realized_sales.as_slice() else {
+            panic!("a competitive ask on a liquid item fills on volume");
+        };
+        assert_eq!(sale.ask_price, Money(7_999));
+        // 7999 less 2% (159.98 rounds to 160) against a 9000 cost basis.
+        assert_eq!(sale.realized_net_pnl, Money(7_839 - 9_000));
+    }
+
+    #[test]
+    fn volume_fill_requires_fresh_market_evidence() {
+        let acquired = t(1, 12);
+        let unlock = t(8, 12);
+        let mut engine = RelistEngine::new(RelistConfig::default()).unwrap();
+        engine.track_position(make_position(acquired), acquired);
+        let sales = make_sales(20, 10_000, unlock);
+        engine.step(&sales, &[], &fees(), unlock).unwrap();
+
+        // 30 hours later the 7-day volume is still 20, but no ask snapshot is fresh and no
+        // sale is in the last 24 hours, so nothing shows the ask would still clear.
+        let stale = unlock + Duration::hours(30);
+        let step = engine.step(&sales, &[], &fees(), stale).unwrap();
+        assert!(step.realized_sales.is_empty());
+        assert!(matches!(
+            engine.get("peg-bid-1#pos").unwrap().status,
+            InventoryStatus::Listed {
+                ask_price: Money(10_000),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn rejects_negative_or_zero_market_settings() {
+        for config in [
+            RelistConfig {
+                undercut: Money(-1),
+                ..RelistConfig::default()
+            },
+            RelistConfig {
+                max_market_age_secs: -1,
+                ..RelistConfig::default()
+            },
+            RelistConfig {
+                recent_sales_window_hours: 0,
+                ..RelistConfig::default()
+            },
+            RelistConfig {
+                reprice_after_secs: Some(0),
+                ..RelistConfig::default()
+            },
+        ] {
+            assert!(config.validate().is_err(), "{config:?}");
+        }
     }
 }

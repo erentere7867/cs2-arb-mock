@@ -144,6 +144,14 @@ volume_window_days = 7
 min_sales_for_ask_fill = 15
 min_listing_age_secs = 3600
 require_verified_sales = true
+# A listing fills on volume alone only while a fresh lowest ask (<= 6 h old) or the median
+# of the last 24 h of verified sales is at or above it; without that evidence it waits.
+max_market_age_secs = 21600
+recent_sales_window_hours = 24
+# List 1 cent under the current market when it is below the rolling median, and reprice an
+# unfilled ask down to that level after a day instead of resting above a falling market.
+undercut = 1
+reprice_after_secs = 86400
 
 # Days of live quotes, verified sales and book polls kept in events.db for the
 # regime gate and `backtest --history-db`; 40 covers the dip's 30-day lookback
